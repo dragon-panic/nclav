@@ -8,7 +8,8 @@ use std::path::PathBuf;
     version
 )]
 pub struct Cli {
-    /// Connect to a remote nclav server instead of running in-process.
+    /// nclav server URL (default: http://localhost:8080).
+    /// All non-bootstrap commands talk to this server. Env: NCLAV_URL
     #[arg(long, env = "NCLAV_URL", global = true)]
     pub remote: Option<String>,
 
@@ -18,11 +19,29 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Initialize and start the nclav server (local only for now).
+    /// Initialize and start the nclav server.
     Bootstrap {
         /// Cloud target to initialise for.
         #[arg(long, default_value = "local")]
         cloud: CloudArg,
+
+        /// GCP parent resource ("folders/123" or "organizations/456").
+        /// Required when --cloud gcp. Env: NCLAV_GCP_PARENT
+        #[arg(long, env = "NCLAV_GCP_PARENT")]
+        gcp_parent: Option<String>,
+
+        /// GCP billing account ("billingAccounts/XXXX-YYYY-ZZZZ").
+        /// Required when --cloud gcp. Env: NCLAV_GCP_BILLING_ACCOUNT
+        #[arg(long, env = "NCLAV_GCP_BILLING_ACCOUNT")]
+        gcp_billing_account: Option<String>,
+
+        /// Default GCP region. Env: NCLAV_GCP_DEFAULT_REGION
+        #[arg(long, env = "NCLAV_GCP_DEFAULT_REGION", default_value = "us-central1")]
+        gcp_default_region: String,
+
+        /// TCP port to bind the HTTP API server on. Env: NCLAV_PORT
+        #[arg(long, env = "NCLAV_PORT", default_value = "8080")]
+        port: u16,
     },
 
     /// Reconcile and apply all changes.
@@ -40,11 +59,8 @@ pub enum Command {
     /// Show enclave health summary.
     Status,
 
-    /// Render the dependency graph.
+    /// Render the dependency graph from the running server.
     Graph {
-        /// Path to the enclaves directory.
-        enclaves_dir: PathBuf,
-
         /// Output format.
         #[arg(long, default_value = "text")]
         output: GraphOutput,
@@ -58,6 +74,7 @@ pub enum Command {
 #[derive(Debug, Clone, ValueEnum)]
 pub enum CloudArg {
     Local,
+    Gcp,
     Azure,
 }
 

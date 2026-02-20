@@ -30,6 +30,7 @@ reqwest        = { version = "0.12", features = ["json"] }
 chrono         = { version = "0.4", features = ["serde"] }
 tower          = { version = "0.5", features = ["util"] }
 sha2           = "0.10"
+gcp_auth       = "0.12"
 
 nclav-domain     = { path = "crates/nclav-domain" }
 nclav-config     = { path = "crates/nclav-config" }

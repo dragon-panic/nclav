@@ -90,6 +90,40 @@ nclav graph ./enclaves --enclave product-a-dev
 
 Starts the nclav HTTP API server on `http://0.0.0.0:8080` with an in-memory store. Use this when you want to run the server and drive it via the REST API or `--remote` flag.
 
+### `nclav bootstrap --cloud gcp`
+
+Starts the server backed by the GCP driver. Authenticates via [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials) (`gcloud auth application-default login` or a service account key).
+
+**Required flags / env vars:**
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--gcp-parent` | `NCLAV_GCP_PARENT` | Resource parent for new GCP Projects, e.g. `folders/123` or `organizations/456` |
+| `--gcp-billing-account` | `NCLAV_GCP_BILLING_ACCOUNT` | Billing account to attach, e.g. `billingAccounts/XXXX-YYYY-ZZZZ` |
+| `--gcp-default-region` | `NCLAV_GCP_DEFAULT_REGION` | Default region (default: `us-central1`) |
+
+```bash
+export NCLAV_GCP_PARENT="folders/123456789"
+export NCLAV_GCP_BILLING_ACCOUNT="billingAccounts/ABCD-1234-EFGH-5678"
+
+cargo run -p nclav-cli -- bootstrap --cloud gcp
+# or with flags:
+cargo run -p nclav-cli -- bootstrap --cloud gcp \
+  --gcp-parent folders/123456789 \
+  --gcp-billing-account billingAccounts/ABCD-1234-EFGH-5678 \
+  --gcp-default-region us-east1
+```
+
+**Partition type mapping:**
+
+| Partition `produces` | GCP resource provisioned |
+|---|---|
+| `http` | Cloud Run service |
+| `tcp` | Cloud SQL instance |
+| `queue` | Pub/Sub topic + subscription |
+
+**Teardown:** removing an enclave from YAML and re-running `nclav apply` will delete the corresponding GCP Project (and all resources inside it).
+
 ### `nclav status`
 
 Prints a summary of enclave health from the server (requires `--remote`).
@@ -151,7 +185,7 @@ enclaves/
 ```yaml
 id: product-a-dev
 name: Product A (Development)
-cloud: local          # local | azure
+cloud: local          # local | gcp | azure  (operator-level; sets driver for bootstrap)
 region: local-1
 identity: product-a-dev-identity
 
@@ -222,7 +256,7 @@ crates/
   nclav-config/       YAML parsing, Raw* -> domain conversion
   nclav-graph/        Petgraph validation: dangling imports, access control, cycles, topo sort
   nclav-store/        StateStore trait + InMemoryStore
-  nclav-driver/       Driver trait + LocalDriver (stub, no real I/O)
+  nclav-driver/       Driver trait + LocalDriver (stub) + GcpDriver
   nclav-reconciler/   Reconcile loop: diff -> provision -> persist
   nclav-api/          Axum HTTP server
   nclav-cli/          Clap binary
@@ -251,5 +285,5 @@ RUST_LOG=nclav_reconciler=info cargo run -p nclav-cli -- apply ./enclaves
 
 - **Azure driver** — the `Driver` trait is defined; the Azure implementation is deferred
 - **Postgres store** — `StateStore` is designed for it; feature-flag planned
-- **AWS / GCP drivers**
+- **AWS driver**
 - **Web UI**

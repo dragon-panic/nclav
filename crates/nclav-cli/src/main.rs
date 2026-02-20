@@ -17,12 +17,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Bootstrap { cloud } => commands::bootstrap(cloud, cli.remote).await,
+        Command::Bootstrap { cloud, gcp_parent, gcp_billing_account, gcp_default_region, port } => {
+            commands::bootstrap(cloud, cli.remote, gcp_parent, gcp_billing_account, gcp_default_region, port).await
+        }
         Command::Apply { enclaves_dir } => commands::apply(enclaves_dir, cli.remote).await,
         Command::Diff { enclaves_dir } => commands::diff(enclaves_dir, cli.remote).await,
         Command::Status => commands::status(cli.remote).await,
-        Command::Graph { enclaves_dir, output, enclave } => {
-            commands::graph(enclaves_dir, output, enclave, cli.remote).await
+        Command::Graph { output, enclave } => {
+            commands::graph(output, enclave, cli.remote).await
         }
     }
 }

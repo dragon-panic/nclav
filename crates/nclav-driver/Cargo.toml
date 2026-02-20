@@ -11,3 +11,9 @@ serde_json   = { workspace = true }
 thiserror    = { workspace = true }
 tokio        = { workspace = true }
 tracing      = { workspace = true }
+reqwest      = { workspace = true }
+gcp_auth     = { workspace = true }
+
+[dev-dependencies]
+wiremock     = "0.6"
+tokio        = { workspace = true }
