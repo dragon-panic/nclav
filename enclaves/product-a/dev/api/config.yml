@@ -1,0 +1,14 @@
+id: api
+name: API Service
+produces: http
+imports:
+  - from: product-a-dev
+    export_name: db-tcp
+    alias: database
+inputs:
+  db_host: "{{ database.hostname }}"
+  db_port: "{{ database.port }}"
+declared_outputs:
+  - hostname
+  - port
+exports: []

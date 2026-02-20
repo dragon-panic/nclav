@@ -1,0 +1,22 @@
+[package]
+name = "nclav-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nclav-domain     = { workspace = true }
+nclav-store      = { workspace = true }
+nclav-driver     = { workspace = true }
+nclav-reconciler = { workspace = true }
+nclav-graph      = { workspace = true }
+nclav-config     = { workspace = true }
+axum             = { workspace = true }
+tower-http       = { workspace = true }
+tokio            = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+thiserror        = { workspace = true }
+tracing          = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }

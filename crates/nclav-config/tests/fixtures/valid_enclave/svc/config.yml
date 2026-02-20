@@ -1,0 +1,9 @@
+id: svc
+name: Service
+produces: http
+imports: []
+inputs: {}
+declared_outputs:
+  - hostname
+  - port
+exports: []

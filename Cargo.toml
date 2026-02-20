@@ -1,0 +1,39 @@
+[workspace]
+members = [
+    "crates/nclav-domain",
+    "crates/nclav-config",
+    "crates/nclav-graph",
+    "crates/nclav-store",
+    "crates/nclav-driver",
+    "crates/nclav-reconciler",
+    "crates/nclav-api",
+    "crates/nclav-cli",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio          = { version = "1", features = ["full"] }
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+serde_yaml     = "0.9"
+thiserror      = "2"
+anyhow         = "1"
+tracing        = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+async-trait    = "0.1"
+uuid           = { version = "1", features = ["v4", "serde"] }
+petgraph       = "0.6"
+axum           = { version = "0.7", features = ["macros"] }
+tower-http     = { version = "0.5", features = ["trace"] }
+clap           = { version = "4", features = ["derive", "env"] }
+reqwest        = { version = "0.12", features = ["json"] }
+chrono         = { version = "0.4", features = ["serde"] }
+tower          = { version = "0.5", features = ["util"] }
+
+nclav-domain     = { path = "crates/nclav-domain" }
+nclav-config     = { path = "crates/nclav-config" }
+nclav-graph      = { path = "crates/nclav-graph" }
+nclav-store      = { path = "crates/nclav-store" }
+nclav-driver     = { path = "crates/nclav-driver" }
+nclav-reconciler = { path = "crates/nclav-reconciler" }
+nclav-api        = { path = "crates/nclav-api" }

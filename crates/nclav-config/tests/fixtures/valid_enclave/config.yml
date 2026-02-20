@@ -1,0 +1,11 @@
+id: test-enclave
+name: Test Enclave
+cloud: local
+region: local-1
+exports:
+  - name: svc-http
+    target_partition: svc
+    type: http
+    to: any_enclave
+    auth: token
+imports: []

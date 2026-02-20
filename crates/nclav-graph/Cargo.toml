@@ -1,0 +1,11 @@
+[package]
+name = "nclav-graph"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nclav-domain = { workspace = true }
+petgraph     = { workspace = true }
+thiserror    = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
