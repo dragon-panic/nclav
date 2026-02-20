@@ -182,6 +182,11 @@ DriverInterface
 
 The domain model describes intent. Drivers produce cloud-specific handles — opaque receipts stored in state so the driver can locate its resources on subsequent reconciles. The reconciler never reads inside handles. Only the driver that produced them reads them.
 
+Drivers implement two categories of methods:
+
+- **Mutating** (`provision_*`, `teardown_*`) — create, update, or delete cloud resources; called by the reconcile loop
+- **Reading** (`observe_*`) — read current cloud state without modifying anything; called for drift detection
+
 ```
 # Domain — cloud agnostic
 Enclave
@@ -195,9 +200,15 @@ Partition
   exports: [Export]
 
 # Driver output — opaque to domain
-ProvisionedEnclave
-  enclave: Enclave
-  handles: AzureHandles | AwsHandles | LocalHandles
+ProvisionResult
+  handle:  Handle                    // opaque cloud ID receipt
+  outputs: HashMap<String, String>   // resolved output values
+
+ObservedState
+  exists:   bool
+  healthy:  bool
+  outputs:  HashMap<String, String>  // current values from cloud
+  raw:      Handle                   // full cloud response, for debugging
 ```
 
 ### Local Driver
@@ -326,11 +337,20 @@ pipeline runs
   │
 POST /reconcile ───────────────────► parse + validate YAML
                                      resolve import/export graph
-                                     diff desired → actual state
-                                     invoke driver (azure or local)
-                                     store state + handles
+                                     hash desired config per resource
+                                     diff desired_hash → stored_hash
+                                     skip unchanged resources
+                                     invoke driver for changes
+                                       set status = Provisioning/Updating
+                                       on success: status = Active
+                                                   update timestamps + hash
+                                       on failure: status = Error
+                                                   persist last_error
+                                     store handles + resolved_outputs
+                                     increment generation
+                                     append audit event
                                      ◄──────────────────────────
-{ status, changes } ◄───────────────┘
+{ status, changes, errors } ◄───────┘
   │
 exit 0 / 1
 ```
@@ -339,13 +359,118 @@ nclav does not poll git. The pipeline owns the trigger.
 
 ---
 
+## State Model
+
+nclav tracks three distinct layers of state for every enclave and partition.
+Understanding the difference between them is important — conflating them is
+how state management goes wrong.
+
+| Layer | What it is | Where it lives |
+|---|---|---|
+| **Desired** | What the YAML says right now | Loaded fresh on every reconcile from the GitOps directory |
+| **Applied** | What the driver last successfully provisioned | Persisted: `Handle` (cloud ID receipt) + `resolved_outputs` |
+| **Observed** | What actually exists in the cloud right now | Fetched on demand via `Driver::observe()`; not cached permanently |
+
+The reconciler diffs **desired vs applied** to decide what to change. The
+observer diffs **observed vs applied** to detect cloud drift. These are separate
+concerns and run on separate schedules.
+
+### Resource metadata
+
+Every enclave and partition in the store carries a `ResourceMeta` block:
+
+```
+ResourceMeta {
+    status:        ProvisioningStatus   // lifecycle state (see below)
+    created_at:    DateTime<Utc>?       // first successful provision
+    updated_at:    DateTime<Utc>?       // last successful update
+    last_seen_at:  DateTime<Utc>?       // last Driver::observe() confirmed it exists
+    last_error:    ResourceError?       // most recent failure, if any
+    desired_hash:  String?              // SHA-256 of desired config at last apply
+    generation:    u64                  // monotonically increasing; for optimistic concurrency
+}
+```
+
+`desired_hash` is what makes the common case cheap: before diffing the full
+config struct, compare hashes. If they match, the config hasn't changed since
+the last apply and provisioning can be skipped without further work.
+
+`last_error` is persisted — not just returned from the API call — so that
+`nclav status` can surface it without re-running anything. An error from three
+hours ago should be visible without waiting for the next reconcile.
+
+`generation` increments on every successful write. When two reconcile runs
+overlap (pipeline triggered twice, manual run while CI is in-flight), the
+second write will fail if its generation is stale. The loser retries from
+scratch rather than silently clobbering the winner's state.
+
+### Lifecycle states
+
+```
+              ┌─────────────────────────────────────────────────┐
+              │                                                 │
+  (YAML seen) │                                                 ▼
+   Pending ──► Provisioning ──► Active ──► Updating ──► Active
+                    │                         │
+                    ▼                         ▼
+                  Error ◄────────────────── Error
+                    │
+                    │  (YAML removed)
+              Active ──► Deleting ──► Deleted
+```
+
+| Status | Meaning |
+|---|---|
+| `Pending` | Resource is in desired config but provision has not started |
+| `Provisioning` | Driver call in-flight for initial creation |
+| `Active` | Last provision/update succeeded; resource should exist |
+| `Updating` | Driver call in-flight for an update |
+| `Degraded` | `observe()` returned success but reported unhealthy state |
+| `Error` | Last driver call failed; `last_error` is populated |
+| `Deleting` | Driver teardown call in-flight |
+| `Deleted` | Teardown confirmed; record retained briefly for audit |
+
+Only `Active` resources are included in drift detection and graph rendering.
+`Error` resources appear in `nclav status` with their error message and
+timestamp. A failed resource does not block the rest of the reconcile unless
+other resources depend on its outputs.
+
+### Two kinds of drift
+
+**Config drift** — the YAML changed since the last apply. Detected cheaply by
+comparing `ResourceMeta.desired_hash` against a hash of the current YAML.
+Resolved by running `nclav apply`.
+
+**Cloud drift** — the cloud resource diverged from what was applied (manual
+change, cloud-side event, resource deleted outside nclav). Detected by calling
+`Driver::observe()` and comparing the result against the stored `Handle` and
+`resolved_outputs`. Observable on demand via `GET /enclaves/{id}` with
+`?observe=true`, or on a background schedule when running as a server.
+
+Neither type of drift is auto-corrected. nclav reports drift; the operator
+decides when to apply. This is intentional — silent auto-correction can
+destroy in-flight changes during a deployment.
+
+### What nclav does NOT store
+
+- Full cloud resource attribute maps (that is the driver's concern via the Handle)
+- Terraform state (Terraform manages its own state; nclav stores the outputs)
+- Historical versions of desired config (the Git log is the history)
+- Credentials or secrets (injected at runtime, never persisted)
+
+---
+
 ## Storage
 
 Postgres stores:
-- Enclave and partition desired state
-- Driver handles (cloud-specific, opaque to domain)
-- Terraform state per partition
-- Event log (append-only) for audit and drift detection
+- Enclave and partition state records (`ResourceMeta` + `Handle` + `resolved_outputs`)
+- Export and import handles (wiring receipts, keyed by name and alias)
+- Append-only audit event log (reconcile runs, provision outcomes, drift events)
+
+The in-memory store (`InMemoryStore`) implements the same `StateStore` trait
+and is used for local mode and all tests. Postgres is the production backend.
+State is never stored in the YAML directory — the GitOps directory is read-only
+from nclav's perspective.
 
 ---
 
