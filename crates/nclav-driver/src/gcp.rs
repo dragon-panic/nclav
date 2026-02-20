@@ -22,6 +22,14 @@ pub struct GcpDriverConfig {
     pub billing_account: String,
     /// Default region used when `enclave.region` is not otherwise specified.
     pub default_region: String,
+    /// Optional namespace prefix prepended to every GCP project ID derived from an enclave ID.
+    ///
+    /// GCP project IDs are globally unique across all of Google Cloud.  Setting a prefix
+    /// scopes them to your organisation without requiring ugly IDs in the enclave YAML.
+    ///
+    /// Example: prefix `"acme"` + enclave `"product-a-dev"` → project `"acme-product-a-dev"`.
+    /// If unset, the enclave ID is used directly (with GCP-constraint sanitization applied).
+    pub project_prefix: Option<String>,
 }
 
 // ── Base URLs (overridden in tests to point at a mock server) ─────────────────
@@ -33,7 +41,6 @@ struct BaseUrls {
     run:             String,
     iam:             String,
     pubsub:          String,
-    sqladmin:        String,
     serviceusage:    String,
     cloudbilling:    String,
 }
@@ -46,7 +53,6 @@ impl Default for BaseUrls {
             run:             "https://run.googleapis.com".into(),
             iam:             "https://iam.googleapis.com".into(),
             pubsub:          "https://pubsub.googleapis.com".into(),
-            sqladmin:        "https://sqladmin.googleapis.com".into(),
             serviceusage:    "https://serviceusage.googleapis.com".into(),
             cloudbilling:    "https://cloudbilling.googleapis.com".into(),
         }
@@ -71,7 +77,10 @@ impl TokenProvider for AdcTokenProvider {
     async fn token(&self) -> Result<String, DriverError> {
         let token = self
             .inner
-            .token(&["https://www.googleapis.com/auth/cloud-platform"])
+            .token(&[
+                "https://www.googleapis.com/auth/cloud-platform",
+                "https://www.googleapis.com/auth/cloud-billing",
+            ])
             .await
             .map_err(|e| DriverError::Internal(format!("GCP auth failed: {}", e)))?;
         Ok(token.as_str().to_string())
@@ -118,7 +127,46 @@ impl GcpDriver {
     /// 1. `GOOGLE_APPLICATION_CREDENTIALS` env var (service account JSON key)
     /// 2. Workload Identity (when running on GCP)
     /// 3. `gcloud auth application-default login` for local dev
-    pub async fn from_adc(config: GcpDriverConfig) -> Result<Self, DriverError> {
+    pub async fn from_adc(mut config: GcpDriverConfig) -> Result<Self, DriverError> {
+        // Validate parent format before any API calls
+        let parent = &config.parent;
+        let parent_ok = (parent.starts_with("folders/") || parent.starts_with("organizations/"))
+            && parent.splitn(2, '/').nth(1).map_or(false, |id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()));
+        if !parent_ok {
+            return Err(DriverError::Internal(format!(
+                "GCP parent must be 'folders/NUMERIC_ID' or 'organizations/NUMERIC_ID', got: {:?}. \
+                 Run `gcloud resource-manager folders list --organization=NUMERIC_ORG_ID` to find the numeric ID.",
+                parent
+            )));
+        }
+
+        // Normalize and validate billing account.
+        // Accept any casing of the prefix (billingaccounts/, billingAccounts/, etc.)
+        // and canonicalise to the form GCP requires: "billingAccounts/XXXXXX-YYYYYY-ZZZZZZ".
+        {
+            let billing = &config.billing_account;
+            let billing_id = if billing.to_lowercase().starts_with("billingaccounts/") {
+                billing[billing.find('/').unwrap() + 1..].to_string()
+            } else {
+                billing.clone()
+            };
+            let billing_id_ok = {
+                let parts: Vec<&str> = billing_id.split('-').collect();
+                parts.len() == 3
+                    && parts.iter().all(|p| {
+                        p.len() == 6 && p.chars().all(|c| c.is_ascii_alphanumeric())
+                    })
+            };
+            if !billing_id_ok {
+                return Err(DriverError::Internal(format!(
+                    "GCP billing account must be 'billingAccounts/XXXXXX-YYYYYY-ZZZZZZ', got: {:?}. \
+                     Run `gcloud billing accounts list` to find your billing account ID.",
+                    billing
+                )));
+            }
+            config.billing_account = format!("billingAccounts/{}", billing_id);
+        }
+
         let inner = gcp_auth::provider()
             .await
             .map_err(|e| DriverError::Internal(format!("Failed to initialise GCP ADC: {}", e)))?;
@@ -128,6 +176,36 @@ impl GcpDriver {
             token:  Box::new(AdcTokenProvider { inner }),
             base:   BaseUrls::default(),
         })
+    }
+
+    /// Sanitize an enclave name for use as a GCP project display name.
+    ///
+    /// GCP allows: letters, digits, spaces, `-`, `'`, `"`, `!`.
+    /// Any other character (e.g. parentheses) is replaced with a space.
+    fn sanitize_display_name(name: &str) -> String {
+        let sanitized: String = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || " -'\"!".contains(c) { c } else { ' ' })
+            .collect();
+        // Collapse runs of spaces and trim edges
+        sanitized.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Derive the GCP project ID for an enclave.
+    ///
+    /// If `project_prefix` is configured, prepends it: `{prefix}-{enclave_id}`.
+    /// The combined string is then sanitized to comply with GCP project ID rules:
+    /// lowercase letters, digits, and hyphens only; starts with a letter; 6–30 chars.
+    fn gcp_project_id(&self, enclave_id: &str) -> String {
+        let raw = match &self.config.project_prefix {
+            Some(prefix) if !prefix.is_empty() => format!("{}-{}", prefix, enclave_id),
+            _ => enclave_id.to_string(),
+        };
+        let project_id = sanitize_project_id(&raw);
+        if project_id != enclave_id {
+            info!(enclave_id, %project_id, "derived GCP project ID");
+        }
+        project_id
     }
 
     /// Create a `GcpDriver` with a static bearer token and custom base URLs.
@@ -152,39 +230,62 @@ impl GcpDriver {
 
     // ── GCP error parsing ─────────────────────────────────────────────────────
 
-    /// Convert a GCP REST error envelope into a human-readable message:
-    ///   `"PERMISSION_DENIED: The caller does not have permission [IAM_PERMISSION_DENIED — compute.networks.create]"`
+    /// Convert a GCP REST error envelope into a human-readable message.
+    ///
+    /// Handles two common detail types:
+    /// - `ErrorInfo`:   `"PERMISSION_DENIED: … [IAM_PERMISSION_DENIED — compute.networks.create]"`
+    /// - `BadRequest`:  `"INVALID_ARGUMENT: … (field 'project.parent': must be 'folders/…')"`
     fn extract_gcp_error(body: &Value) -> String {
         let err = &body["error"];
         let status  = err["status"].as_str().unwrap_or("UNKNOWN");
         let message = err["message"].as_str().unwrap_or("unknown error");
 
-        let detail_suffix = err["details"]
-            .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|d| {
-                let reason = d["reason"].as_str()?;
-                let meta_vals: Vec<&str> = d["metadata"]
-                    .as_object()
-                    .map(|m| m.values().filter_map(|v| v.as_str()).collect())
-                    .unwrap_or_default();
-                Some(format!(" [{} — {}]", reason, meta_vals.join(", ")))
-            })
-            .unwrap_or_default();
+        let mut parts: Vec<String> = Vec::new();
 
-        format!("{}: {}{}", status, message, detail_suffix)
+        if let Some(details) = err["details"].as_array() {
+            for d in details {
+                // ErrorInfo — has `reason` + optional `metadata`
+                if let Some(reason) = d["reason"].as_str() {
+                    let meta: Vec<&str> = d["metadata"]
+                        .as_object()
+                        .map(|m| m.values().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+                    parts.push(if meta.is_empty() {
+                        reason.to_string()
+                    } else {
+                        format!("{} — {}", reason, meta.join(", "))
+                    });
+                }
+                // BadRequest — has `fieldViolations`
+                if let Some(violations) = d["fieldViolations"].as_array() {
+                    for v in violations {
+                        let field = v["field"].as_str().unwrap_or("?");
+                        let desc  = v["description"].as_str().unwrap_or("invalid");
+                        parts.push(format!("field '{}': {}", field, desc));
+                    }
+                }
+            }
+        }
+
+        if parts.is_empty() {
+            format!("{}: {}", status, message)
+        } else {
+            format!("{}: {} ({})", status, message, parts.join("; "))
+        }
     }
 
     // ── Long-running operation polling ────────────────────────────────────────
 
     /// Poll a GCP long-running operation URL until it completes or times out.
     ///
-    /// Backoff: 1 s, 2 s, 4 s, 8 s, 16 s, 30 s, 30 s, … (max 30 polls ≈ ~10 min).
+    /// Backoff: 1 s, 2 s, 4 s, 8 s, 16 s, 30 s, 30 s, … (max 120 polls ≈ ~58 min).
+    /// Progress is logged at INFO every 10 polls so operators can follow along.
     async fn wait_for_operation(&self, op_url: &str) -> Result<Value, DriverError> {
         let token = self.bearer().await?;
         let delays = [1u64, 2, 4, 8, 16, 30];
+        let max_polls = 120;
 
-        for &delay in delays.iter().cycle().take(30) {
+        for (i, &delay) in delays.iter().cycle().take(max_polls).enumerate() {
             let resp: Value = self
                 .client
                 .get(op_url)
@@ -206,12 +307,19 @@ impl GcpDriver {
                 return Ok(resp["response"].clone());
             }
 
+            let poll = i + 1;
+            if poll % 10 == 0 {
+                info!(poll, op_url, "still waiting for GCP operation");
+            } else {
+                debug!(poll, op_url, delay, "GCP operation pending, waiting");
+            }
             tokio::time::sleep(Duration::from_secs(delay)).await;
         }
 
-        Err(DriverError::ProvisionFailed(
-            "GCP operation timed out after 30 polls".into(),
-        ))
+        Err(DriverError::ProvisionFailed(format!(
+            "GCP operation timed out after {} polls: {}",
+            max_polls, op_url
+        )))
     }
 
     // ── JSON helper ───────────────────────────────────────────────────────────
@@ -222,6 +330,7 @@ impl GcpDriver {
         token: &str,
         body: &Value,
     ) -> Result<Value, DriverError> {
+        debug!(url, "GCP POST");
         let resp: Value = self
             .client
             .post(url)
@@ -229,15 +338,51 @@ impl GcpDriver {
             .json(body)
             .send()
             .await
-            .map_err(|e| DriverError::ProvisionFailed(e.to_string()))?
+            .map_err(|e| DriverError::ProvisionFailed(format!("POST {url}: {e}")))?
             .json()
             .await
-            .map_err(|e| DriverError::Internal(e.to_string()))?;
+            .map_err(|e| DriverError::Internal(format!("POST {url} decode: {e}")))?;
         if resp.get("error").is_some() {
-            return Err(DriverError::ProvisionFailed(Self::extract_gcp_error(&resp)));
+            debug!(url, body = %resp, "GCP error response");
+            return Err(DriverError::ProvisionFailed(
+                format!("POST {url}: {}", Self::extract_gcp_error(&resp)),
+            ));
         }
         Ok(resp)
     }
+}
+
+// ── Project ID sanitization ───────────────────────────────────────────────────
+
+/// Sanitize a raw string into a valid GCP project ID.
+///
+/// GCP rules: 6–30 chars, lowercase letters/digits/hyphens, starts with a letter,
+/// does not end with a hyphen.  Invalid characters are replaced with hyphens;
+/// consecutive hyphens are collapsed to one.
+fn sanitize_project_id(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    let mut out = String::with_capacity(lower.len().min(30));
+    let mut prev_hyphen = true; // suppress leading hyphens / consecutive hyphens
+
+    for c in lower.chars() {
+        if out.len() == 30 {
+            break;
+        }
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            out.push(c);
+            prev_hyphen = false;
+        } else if !prev_hyphen && !out.is_empty() {
+            out.push('-');
+            prev_hyphen = true;
+        }
+    }
+
+    // strip trailing hyphen that may appear after truncation
+    if out.ends_with('-') {
+        out.pop();
+    }
+
+    out
 }
 
 // ── Driver impl ───────────────────────────────────────────────────────────────
@@ -256,70 +401,106 @@ impl Driver for GcpDriver {
         existing: Option<&Handle>,
     ) -> Result<ProvisionResult, DriverError> {
         let token      = self.bearer().await?;
-        let project_id = enclave.id.as_str();
+        let project_id = self.gcp_project_id(enclave.id.as_str());
+        let project_id = project_id.as_str();
         let region     = self.region(enclave);
 
-        // Idempotency: if we already have a handle with a project_id, check if
-        // it still exists and return early rather than trying to re-create.
+        // Idempotency: only skip the full provisioning sequence when the previous
+        // run stamped `provisioning_complete: true` on the handle, meaning every
+        // step (project, billing, APIs, SA, VPC) finished successfully.
+        //
+        // If `provisioning_complete` is absent or false the previous run timed out
+        // or failed mid-flight.  In that case we fall through so each step can
+        // resume — every step below handles the ALREADY_EXISTS case individually.
         if let Some(handle) = existing {
-            if let Some(pid) = handle["project_id"].as_str() {
-                let url = format!("{}/v3/projects/{}", self.base.resourcemanager, pid);
-                let resp = self
-                    .client
-                    .get(&url)
-                    .bearer_auth(&token)
-                    .send()
-                    .await
-                    .map_err(|e| DriverError::Internal(e.to_string()))?;
-                if resp.status().is_success() {
-                    debug!(project_id = pid, "GCP project already exists, skipping creation");
-                    return Ok(ProvisionResult {
-                        handle:  handle.clone(),
-                        outputs: HashMap::new(),
-                    });
+            if handle["provisioning_complete"].as_bool().unwrap_or(false) {
+                if let Some(pid) = handle["project_id"].as_str() {
+                    let url = format!("{}/v3/projects/{}", self.base.resourcemanager, pid);
+                    let resp = self
+                        .client
+                        .get(&url)
+                        .bearer_auth(&token)
+                        .send()
+                        .await
+                        .map_err(|e| DriverError::Internal(e.to_string()))?;
+                    if resp.status().is_success() {
+                        debug!(project_id = pid, "GCP enclave fully provisioned, skipping");
+                        return Ok(ProvisionResult {
+                            handle:  handle.clone(),
+                            outputs: HashMap::new(),
+                        });
+                    }
                 }
+            } else if existing.is_some() {
+                info!(project_id, "resuming incomplete GCP enclave provisioning");
             }
         }
 
-        // 1. Create project → returns a long-running operation
+        // 1. Create project → returns a long-running operation.
+        //    If the project already exists (e.g. server restarted with in-memory store,
+        //    or a partial previous run), fetch it instead of failing.
         info!(project_id, "Creating GCP project");
         let create_url = format!("{}/v3/projects", self.base.resourcemanager);
-        let op = self
+        let project_number = match self
             .post_json(
                 &create_url,
                 &token,
                 &json!({
                     "projectId":   project_id,
-                    "displayName": enclave.name,
+                    "displayName": Self::sanitize_display_name(&enclave.name),
                     "parent":      self.config.parent,
                 }),
             )
-            .await?;
-
-        let op_name = op["name"]
-            .as_str()
-            .ok_or_else(|| DriverError::ProvisionFailed("create project: no operation name".into()))?;
-        let op_url = format!("{}/v3/{}", self.base.resourcemanager, op_name);
-        let project_resp = self.wait_for_operation(&op_url).await?;
-        let project_number = project_resp["projectNumber"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+            .await
+        {
+            Ok(op) => {
+                let op_name = op["name"]
+                    .as_str()
+                    .ok_or_else(|| DriverError::ProvisionFailed("create project: no operation name".into()))?;
+                let op_url = format!("{}/v3/{}", self.base.resourcemanager, op_name);
+                let project_resp = self.wait_for_operation(&op_url).await?;
+                project_resp["projectNumber"].as_str().unwrap_or("").to_string()
+            }
+            Err(e) if e.to_string().to_lowercase().contains("already exists") => {
+                info!(project_id, "GCP project already exists, fetching existing project");
+                let get_url = format!("{}/v3/projects/{}", self.base.resourcemanager, project_id);
+                let project: Value = self
+                    .client
+                    .get(&get_url)
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .map_err(|e| DriverError::Internal(e.to_string()))?
+                    .json()
+                    .await
+                    .map_err(|e| DriverError::Internal(e.to_string()))?;
+                project["projectNumber"].as_str().unwrap_or("").to_string()
+            }
+            Err(e) => return Err(e),
+        };
 
         // 2. Link billing account
+        info!(project_id, billing_account = %self.config.billing_account, "Linking billing account");
         let billing_url = format!(
             "{}/v1/projects/{}/billingInfo",
             self.base.cloudbilling, project_id
         );
-        self.client
+        let billing_resp = self.client
             .put(&billing_url)
             .bearer_auth(&token)
             .json(&json!({ "billingAccountName": self.config.billing_account }))
             .send()
             .await
-            .map_err(|e| DriverError::ProvisionFailed(format!("billing link: {}", e)))?;
+            .map_err(|e| DriverError::ProvisionFailed(format!("PUT {billing_url}: {e}")))?;
+        if !billing_resp.status().is_success() {
+            let body: Value = billing_resp.json().await.unwrap_or_default();
+            return Err(DriverError::ProvisionFailed(
+                format!("PUT {billing_url}: {}", Self::extract_gcp_error(&body)),
+            ));
+        }
 
         // 3. Enable required APIs
+        info!(project_id, "Enabling required GCP APIs");
         let enable_url = format!(
             "{}/v1/projects/{}/services:batchEnable",
             self.base.serviceusage, project_id
@@ -332,10 +513,11 @@ impl Driver for GcpDriver {
             self.wait_for_operation(&op_url).await?;
         }
 
-        // 4. Create enclave service account
+        // 4. Create enclave service account (idempotent — ALREADY_EXISTS is fine)
         let sa_id  = enclave.identity.as_deref().unwrap_or(project_id);
+        info!(project_id, sa_id, "Creating service account");
         let sa_url = format!("{}/v1/projects/{}/serviceAccounts", self.base.iam, project_id);
-        let sa_resp = self
+        let sa_email = match self
             .post_json(
                 &sa_url,
                 &token,
@@ -344,33 +526,51 @@ impl Driver for GcpDriver {
                     "serviceAccount": { "displayName": enclave.name },
                 }),
             )
-            .await?;
-        let sa_email = sa_resp["email"]
-            .as_str()
-            .unwrap_or(&format!("{}@{}.iam.gserviceaccount.com", sa_id, project_id))
-            .to_string();
+            .await
+        {
+            Ok(sa_resp) => sa_resp["email"]
+                .as_str()
+                .unwrap_or(&format!("{}@{}.iam.gserviceaccount.com", sa_id, project_id))
+                .to_string(),
+            Err(e) if e.to_string().to_lowercase().contains("already exists") => {
+                info!(project_id, sa_id, "Service account already exists");
+                format!("{}@{}.iam.gserviceaccount.com", sa_id, project_id)
+            }
+            Err(e) => return Err(e),
+        };
 
         // 5. Create VPC network (if network config is present)
         let mut vpc_self_link = String::new();
         if enclave.network.is_some() {
+            info!(project_id, "Creating VPC network");
             let vpc_url = format!(
                 "{}/compute/v1/projects/{}/global/networks",
                 self.base.compute, project_id
             );
-            let vpc_op = self
+            let vpc_op = match self
                 .post_json(
                     &vpc_url,
                     &token,
                     &json!({ "name": "nclav-vpc", "autoCreateSubnetworks": false }),
                 )
-                .await?;
-            if let Some(op_name) = vpc_op["name"].as_str() {
-                // Compute operation URLs are project-scoped
-                let op_url = format!(
-                    "{}/compute/v1/projects/{}/global/operations/{}",
-                    self.base.compute, project_id, op_name
-                );
-                self.wait_for_operation(&op_url).await?;
+                .await
+            {
+                Ok(op) => Some(op),
+                Err(e) if e.to_string().to_lowercase().contains("already exists") => {
+                    info!(project_id, "VPC network already exists");
+                    None
+                }
+                Err(e) => return Err(e),
+            };
+            if let Some(op) = vpc_op {
+                if let Some(op_name) = op["name"].as_str() {
+                    // Compute operation URLs are project-scoped
+                    let op_url = format!(
+                        "{}/compute/v1/projects/{}/global/operations/{}",
+                        self.base.compute, project_id, op_name
+                    );
+                    self.wait_for_operation(&op_url).await?;
+                }
             }
             vpc_self_link = format!(
                 "https://www.googleapis.com/compute/v1/projects/{}/global/networks/nclav-vpc",
@@ -378,6 +578,7 @@ impl Driver for GcpDriver {
             );
         }
 
+        // All steps completed — stamp the handle so future calls can skip re-provisioning.
         let handle = json!({
             "driver":                "gcp",
             "kind":                  "enclave",
@@ -386,6 +587,7 @@ impl Driver for GcpDriver {
             "service_account_email": sa_email,
             "vpc_self_link":         vpc_self_link,
             "region":                region,
+            "provisioning_complete": true,
         });
 
         Ok(ProvisionResult { handle, outputs: HashMap::new() })
@@ -398,9 +600,10 @@ impl Driver for GcpDriver {
         enclave: &Enclave,
         _handle: &Handle,
     ) -> Result<(), DriverError> {
-        let token      = self.bearer().await?;
-        let project_id = enclave.id.as_str();
-        let url        = format!("{}/v3/projects/{}", self.base.resourcemanager, project_id);
+        let token          = self.bearer().await?;
+        let project_id_buf = self.gcp_project_id(enclave.id.as_str());
+        let project_id     = project_id_buf.as_str();
+        let url            = format!("{}/v3/projects/{}", self.base.resourcemanager, project_id);
 
         let resp = self
             .client
@@ -429,39 +632,39 @@ impl Driver for GcpDriver {
         resolved_inputs: &HashMap<String, String>,
         _existing: Option<&Handle>,
     ) -> Result<ProvisionResult, DriverError> {
-        let token        = self.bearer().await?;
-        let project_id   = enclave.id.as_str();
-        let region       = self.region(enclave);
-        let partition_id = partition.id.as_str();
+        let token          = self.bearer().await?;
+        let project_id_buf = self.gcp_project_id(enclave.id.as_str());
+        let project_id     = project_id_buf.as_str();
+        let region         = self.region(enclave);
+        let partition_id   = partition.id.as_str();
 
         match &partition.produces {
             // ── Cloud Run (http) ─────────────────────────────────────────────
             Some(ProducesType::Http) => {
+                info!(project_id, partition_id, region, "Provisioning Cloud Run service");
                 let image = resolved_inputs
                     .get("image")
                     .cloned()
                     .unwrap_or_else(|| "gcr.io/cloudrun/hello".into());
-                let sa_email = format!("{}@{}.iam.gserviceaccount.com", project_id, project_id);
+                // Derive SA email using the same identity field as provision_enclave used.
+                let sa_id    = enclave.identity.as_deref().unwrap_or(project_id);
+                let sa_email = format!("{}@{}.iam.gserviceaccount.com", sa_id, project_id);
                 let env: Vec<Value> = resolved_inputs
                     .iter()
                     .filter(|(k, _)| *k != "image")
                     .map(|(k, v)| json!({ "name": k, "value": v }))
                     .collect();
 
-                let service_name = format!(
-                    "projects/{}/locations/{}/services/{}",
-                    project_id, region, partition_id
-                );
+                // Cloud Run v2: service ID goes as a query param; body `name` must be empty.
                 let url = format!(
-                    "{}/v2/projects/{}/locations/{}/services",
-                    self.base.run, project_id, region
+                    "{}/v2/projects/{}/locations/{}/services?serviceId={}",
+                    self.base.run, project_id, region, partition_id
                 );
                 let op = self
                     .post_json(
                         &url,
                         &token,
                         &json!({
-                            "name": service_name,
                             "template": {
                                 "serviceAccount": sa_email,
                                 "containers": [{ "image": image, "env": env }],
@@ -499,6 +702,10 @@ impl Driver for GcpDriver {
                 let service_url = svc["uri"].as_str().unwrap_or("").to_string();
                 let hostname    = service_url.trim_start_matches("https://").to_string();
 
+                let service_name = format!(
+                    "projects/{}/locations/{}/services/{}",
+                    project_id, region, partition_id
+                );
                 let handle = json!({
                     "driver":       "gcp",
                     "kind":         "partition",
@@ -515,83 +722,43 @@ impl Driver for GcpDriver {
                 Ok(ProvisionResult { handle, outputs })
             }
 
-            // ── Cloud SQL (tcp) ──────────────────────────────────────────────
+            // ── TCP passthrough ──────────────────────────────────────────────
+            //
+            // nclav does not provision backing TCP services (databases, etc.).
+            // Provisioning those resources is out of scope — use Terraform or
+            // another IaC tool for that.  nclav's job here is to validate the
+            // wiring and propagate `hostname`/`port` from the partition's inputs
+            // through the graph so importers can consume them.
             Some(ProducesType::Tcp) => {
-                let url = format!(
-                    "{}/v1/projects/{}/instances",
-                    self.base.sqladmin, project_id
-                );
-                let vpc_link = format!("projects/{}/global/networks/nclav-vpc", project_id);
-                let op = self
-                    .post_json(
-                        &url,
-                        &token,
-                        &json!({
-                            "name":            partition_id,
-                            "databaseVersion": "POSTGRES_16",
-                            "region":          region,
-                            "settings": {
-                                "tier": "db-f1-micro",
-                                "ipConfiguration": {
-                                    "ipv4Enabled":    false,
-                                    "privateNetwork": vpc_link,
-                                },
-                            },
-                        }),
-                    )
-                    .await?;
+                let hostname = resolved_inputs.get("hostname").cloned().unwrap_or_default();
+                let port     = resolved_inputs.get("port").cloned().unwrap_or_default();
 
-                if let Some(op_name) = op["name"].as_str() {
-                    let op_url = format!(
-                        "{}/v1/projects/{}/operations/{}",
-                        self.base.sqladmin, project_id, op_name
-                    );
-                    self.wait_for_operation(&op_url).await?;
+                if hostname.is_empty() {
+                    warn!(project_id, partition_id,
+                        "tcp partition has no 'hostname' input — \
+                         provision the backing service externally and set it in inputs");
                 }
 
-                // Fetch instance to read private IP
-                let get_url = format!(
-                    "{}/v1/projects/{}/instances/{}",
-                    self.base.sqladmin, project_id, partition_id
-                );
-                let instance: Value = self
-                    .client
-                    .get(&get_url)
-                    .bearer_auth(&token)
-                    .send()
-                    .await
-                    .map_err(|e| DriverError::Internal(e.to_string()))?
-                    .json()
-                    .await
-                    .map_err(|e| DriverError::Internal(e.to_string()))?;
+                info!(project_id, partition_id, "TCP partition registered (externally managed)");
 
-                let hostname = instance["ipAddresses"]
-                    .as_array()
-                    .and_then(|arr| {
-                        arr.iter()
-                            .find(|ip| ip["type"].as_str() == Some("PRIVATE"))
-                            .and_then(|ip| ip["ipAddress"].as_str())
-                    })
-                    .unwrap_or("127.0.0.1")
-                    .to_string();
+                let mut outputs = HashMap::new();
+                if !hostname.is_empty() { outputs.insert("hostname".into(), hostname); }
+                if !port.is_empty()     { outputs.insert("port".into(), port); }
 
                 let handle = json!({
-                    "driver":        "gcp",
-                    "kind":          "partition",
-                    "type":          "cloud_sql",
-                    "project_id":    project_id,
-                    "instance_name": partition_id,
-                    "region":        region,
+                    "driver":     "gcp",
+                    "kind":       "partition",
+                    "type":       "tcp_passthrough",
+                    "project_id": project_id,
+                    "outputs":    outputs,
                 });
-                let mut outputs = HashMap::new();
-                outputs.insert("hostname".into(), hostname);
-                outputs.insert("port".into(), "5432".into());
 
                 Ok(ProvisionResult { handle, outputs })
             }
 
             // ── Pub/Sub topic (queue) ────────────────────────────────────────
             Some(ProducesType::Queue) => {
+                info!(project_id, partition_id, "Provisioning Pub/Sub topic");
                 let url = format!(
                     "{}/v1/projects/{}/topics/{}",
                     self.base.pubsub, project_id, partition_id
@@ -641,24 +808,26 @@ impl Driver for GcpDriver {
         partition: &Partition,
         handle: &Handle,
     ) -> Result<(), DriverError> {
-        let token        = self.bearer().await?;
-        let project_id   = enclave.id.as_str();
-        let partition_id = partition.id.as_str();
-        let region       = self.region(enclave);
+        let token          = self.bearer().await?;
+        let project_id_buf = self.gcp_project_id(enclave.id.as_str());
+        let project_id     = project_id_buf.as_str();
+        let partition_id   = partition.id.as_str();
+        let region         = self.region(enclave);
 
         let url = match handle["type"].as_str().unwrap_or("") {
             "cloud_run"    => format!(
                 "{}/v2/projects/{}/locations/{}/services/{}",
                 self.base.run, project_id, region, partition_id
             ),
-            "cloud_sql"    => format!(
-                "{}/v1/projects/{}/instances/{}",
-                self.base.sqladmin, project_id, partition_id
-            ),
             "pubsub_topic" => format!(
                 "{}/v1/projects/{}/topics/{}",
                 self.base.pubsub, project_id, partition_id
             ),
+            // tcp_passthrough: externally managed, nothing to tear down.
+            "tcp_passthrough" => {
+                debug!(partition_id, "tcp_passthrough teardown is a no-op");
+                return Ok(());
+            }
             other => {
                 warn!(kind = other, "teardown_partition: unknown partition type, skipping");
                 return Ok(());
@@ -690,9 +859,10 @@ impl Driver for GcpDriver {
         partition_outputs: &HashMap<String, String>,
         _existing: Option<&Handle>,
     ) -> Result<ProvisionResult, DriverError> {
-        let token      = self.bearer().await?;
-        let project_id = enclave.id.as_str();
-        let region     = self.region(enclave);
+        let token          = self.bearer().await?;
+        let project_id_buf = self.gcp_project_id(enclave.id.as_str());
+        let project_id     = project_id_buf.as_str();
+        let region         = self.region(enclave);
 
         match export.export_type {
             ExportType::Http => {
@@ -774,9 +944,10 @@ impl Driver for GcpDriver {
         export_handle: &Handle,
         _existing: Option<&Handle>,
     ) -> Result<ProvisionResult, DriverError> {
-        let token            = self.bearer().await?;
-        let importer_project = importer.id.as_str();
-        let export_type      = export_handle["type"].as_str().unwrap_or("");
+        let token                = self.bearer().await?;
+        let importer_project_buf = self.gcp_project_id(importer.id.as_str());
+        let importer_project     = importer_project_buf.as_str();
+        let export_type          = export_handle["type"].as_str().unwrap_or("");
         let mut outputs      = HashMap::new();
 
         match export_type {
@@ -981,52 +1152,20 @@ impl Driver for GcpDriver {
                 Ok(ObservedState { exists: true, healthy, outputs, raw: svc })
             }
 
-            // ── Cloud SQL ────────────────────────────────────────────────────
-            "cloud_sql" => {
-                let url = format!(
-                    "{}/v1/projects/{}/instances/{}",
-                    self.base.sqladmin, project_id, partition_id
-                );
-                let resp = self
-                    .client
-                    .get(&url)
-                    .bearer_auth(&token)
-                    .send()
-                    .await
-                    .map_err(|e| DriverError::Internal(e.to_string()))?;
-
-                if resp.status().as_u16() == 404 {
-                    return Ok(ObservedState {
-                        exists: false, healthy: false,
-                        outputs: HashMap::new(), raw: json!({}),
-                    });
-                }
-
-                let instance: Value = resp
-                    .json()
-                    .await
-                    .map_err(|e| DriverError::Internal(e.to_string()))?;
-
-                let state   = instance["state"].as_str().unwrap_or("");
-                let healthy = state == "RUNNABLE";
-
-                let hostname = instance["ipAddresses"]
-                    .as_array()
-                    .and_then(|arr| {
-                        arr.iter()
-                            .find(|ip| ip["type"].as_str() == Some("PRIVATE"))
-                            .and_then(|ip| ip["ipAddress"].as_str())
-                    })
-                    .unwrap_or("")
-                    .to_string();
-
+            // ── TCP passthrough ──────────────────────────────────────────────
+            // Externally managed — always reports healthy; outputs come from
+            // the stored handle (set at provision time from the partition inputs).
+            "tcp_passthrough" => {
                 let mut outputs = HashMap::new();
-                if !hostname.is_empty() {
-                    outputs.insert("hostname".into(), hostname);
-                    outputs.insert("port".into(), "5432".into());
+                if let Some(obj) = handle["outputs"].as_object() {
+                    for (k, v) in obj {
+                        if let Some(s) = v.as_str() {
+                            outputs.insert(k.clone(), s.to_string());
+                        }
+                    }
                 }
-
-                Ok(ObservedState { exists: true, healthy, outputs, raw: instance })
+                let healthy = !outputs.is_empty();
+                Ok(ObservedState { exists: true, healthy, outputs, raw: json!({}) })
             }
 
             // ── Pub/Sub topic ────────────────────────────────────────────────
@@ -1090,10 +1229,55 @@ mod tests {
 
     fn test_config() -> GcpDriverConfig {
         GcpDriverConfig {
-            parent:         "folders/123456".into(),
+            parent:          "folders/123456".into(),
             billing_account: "billingAccounts/AAAAAA-BBBBBB-CCCCCC".into(),
             default_region:  "us-central1".into(),
+            project_prefix:  None,
         }
+    }
+
+    // ── sanitize_project_id (pure) ────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_project_id_passthrough() {
+        assert_eq!(sanitize_project_id("product-a-dev"), "product-a-dev");
+    }
+
+    #[test]
+    fn sanitize_project_id_with_prefix() {
+        assert_eq!(sanitize_project_id("acme-product-a-dev"), "acme-product-a-dev");
+    }
+
+    #[test]
+    fn sanitize_project_id_uppercase_lowercased() {
+        assert_eq!(sanitize_project_id("ACME-Prod"), "acme-prod");
+    }
+
+    #[test]
+    fn sanitize_project_id_invalid_chars_become_hyphens() {
+        // underscores and dots are not allowed; collapsed to single hyphens
+        assert_eq!(sanitize_project_id("my_org.product"), "my-org-product");
+    }
+
+    #[test]
+    fn sanitize_project_id_no_consecutive_hyphens() {
+        assert_eq!(sanitize_project_id("a--b"), "a-b");
+    }
+
+    #[test]
+    fn sanitize_project_id_truncates_at_30() {
+        let long = "a".repeat(40);
+        let result = sanitize_project_id(&long);
+        assert!(result.len() <= 30);
+    }
+
+    #[test]
+    fn sanitize_project_id_no_trailing_hyphen_after_truncation() {
+        // 29 'a's + '-' + 'b' = 31 chars → truncated to 30 = 29 'a's + '-' → trailing hyphen stripped
+        let input = format!("{}-b", "a".repeat(29));
+        let result = sanitize_project_id(&input);
+        assert!(!result.ends_with('-'), "got: {result}");
+        assert!(result.len() <= 30);
     }
 
     /// All base URLs point at the same mock server — the paths distinguish them.
@@ -1104,7 +1288,6 @@ mod tests {
             run:             url.to_string(),
             iam:             url.to_string(),
             pubsub:          url.to_string(),
-            sqladmin:        url.to_string(),
             serviceusage:    url.to_string(),
             cloudbilling:    url.to_string(),
         }
@@ -1392,25 +1575,19 @@ mod tests {
         assert!(!obs.exists);
     }
 
-    // ── observe_partition: Cloud SQL ──────────────────────────────────────────
+    // ── observe_partition: TCP passthrough ───────────────────────────────────
 
     #[tokio::test]
-    async fn observe_partition_cloud_sql_runnable() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/projects/test-proj/instances/db"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "state": "RUNNABLE",
-                "ipAddresses": [{ "type": "PRIVATE", "ipAddress": "10.0.0.5" }],
-            })))
-            .mount(&server)
-            .await;
-
-        let obs = driver(&server)
+    async fn observe_partition_tcp_passthrough_with_outputs_is_healthy() {
+        let obs = driver(&MockServer::start().await)
             .observe_partition(
                 &dummy_enclave(),
                 &tcp_partition(),
-                &json!({ "type": "cloud_sql", "project_id": "test-proj" }),
+                &json!({
+                    "type":       "tcp_passthrough",
+                    "project_id": "test-proj",
+                    "outputs":    { "hostname": "10.0.0.5", "port": "5432" },
+                }),
             )
             .await
             .unwrap();
@@ -1422,49 +1599,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observe_partition_cloud_sql_failed_is_unhealthy() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/projects/test-proj/instances/db"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "state": "FAILED",
-                "ipAddresses": [],
-            })))
-            .mount(&server)
-            .await;
-
-        let obs = driver(&server)
+    async fn observe_partition_tcp_passthrough_no_outputs_is_unhealthy() {
+        let obs = driver(&MockServer::start().await)
             .observe_partition(
                 &dummy_enclave(),
                 &tcp_partition(),
-                &json!({ "type": "cloud_sql", "project_id": "test-proj" }),
+                &json!({ "type": "tcp_passthrough", "project_id": "test-proj", "outputs": {} }),
             )
             .await
             .unwrap();
 
         assert!(obs.exists);
-        assert!(!obs.healthy);
-    }
-
-    #[tokio::test]
-    async fn observe_partition_cloud_sql_not_found() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/projects/test-proj/instances/db"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-
-        let obs = driver(&server)
-            .observe_partition(
-                &dummy_enclave(),
-                &tcp_partition(),
-                &json!({ "type": "cloud_sql", "project_id": "test-proj" }),
-            )
-            .await
-            .unwrap();
-
-        assert!(!obs.exists);
+        assert!(!obs.healthy, "no outputs → not healthy");
     }
 
     // ── observe_partition: Pub/Sub ────────────────────────────────────────────
@@ -1645,51 +1791,34 @@ mod tests {
         assert_eq!(result.outputs["hostname"], "api-hash-uc.a.run.app");
     }
 
-    // ── provision_partition: Cloud SQL ────────────────────────────────────────
+    // ── provision_partition: TCP passthrough ─────────────────────────────────
 
     #[tokio::test]
-    async fn provision_partition_tcp_returns_hostname_and_port() {
-        let server = MockServer::start().await;
+    async fn provision_partition_tcp_passthrough_propagates_inputs() {
+        // No GCP API calls should be made — the server mock is intentionally empty.
+        let mut inputs = HashMap::new();
+        inputs.insert("hostname".into(), "10.0.1.10".into());
+        inputs.insert("port".into(), "5432".into());
 
-        // POST /instances → operation
-        Mock::given(method("POST"))
-            .and(path("/v1/projects/test-proj/instances"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "sql-create-op-001",
-                "done": true,
-                "response": {},
-            })))
-            .mount(&server)
-            .await;
+        let result = driver(&MockServer::start().await)
+            .provision_partition(&dummy_enclave(), &tcp_partition(), &inputs, None)
+            .await
+            .unwrap();
 
-        // Operation poll
-        Mock::given(method("GET"))
-            .and(path("/v1/projects/test-proj/operations/sql-create-op-001"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "done": true,
-                "response": {},
-            })))
-            .mount(&server)
-            .await;
+        assert_eq!(result.handle["type"], "tcp_passthrough");
+        assert_eq!(result.outputs["hostname"], "10.0.1.10");
+        assert_eq!(result.outputs["port"], "5432");
+    }
 
-        // GET instance for private IP
-        Mock::given(method("GET"))
-            .and(path("/v1/projects/test-proj/instances/db"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "state":       "RUNNABLE",
-                "ipAddresses": [{ "type": "PRIVATE", "ipAddress": "10.0.1.10" }],
-            })))
-            .mount(&server)
-            .await;
-
-        let result = driver(&server)
+    #[tokio::test]
+    async fn provision_partition_tcp_passthrough_no_inputs_returns_empty_outputs() {
+        let result = driver(&MockServer::start().await)
             .provision_partition(&dummy_enclave(), &tcp_partition(), &HashMap::new(), None)
             .await
             .unwrap();
 
-        assert_eq!(result.handle["type"], "cloud_sql");
-        assert_eq!(result.outputs["hostname"], "10.0.1.10");
-        assert_eq!(result.outputs["port"], "5432");
+        assert_eq!(result.handle["type"], "tcp_passthrough");
+        assert!(result.outputs.is_empty());
     }
 
     // ── provision_import: queue subscription ──────────────────────────────────
@@ -1814,6 +1943,83 @@ mod tests {
             result.handle["service_account_email"],
             "test-proj@test-proj.iam.gserviceaccount.com"
         );
+        assert_eq!(result.handle["provisioning_complete"], true,
+            "handle must be stamped on success so future calls can skip re-provisioning");
+    }
+
+    #[tokio::test]
+    async fn provision_enclave_resumes_when_provisioning_incomplete() {
+        // A handle without provisioning_complete (e.g. previous run timed out)
+        // must fall through and re-run all steps rather than returning early.
+        let server = MockServer::start().await;
+
+        // POST project → ALREADY_EXISTS (project was created in the previous run)
+        Mock::given(method("POST"))
+            .and(path("/v3/projects"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": { "code": 409, "status": "ALREADY_EXISTS", "message": "already exists" },
+            })))
+            .mount(&server)
+            .await;
+
+        // GET project (fallback for ALREADY_EXISTS)
+        Mock::given(method("GET"))
+            .and(path("/v3/projects/test-proj"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "projectId":     "test-proj",
+                "projectNumber": "999",
+            })))
+            .mount(&server)
+            .await;
+
+        // PUT billing
+        Mock::given(method("PUT"))
+            .and(path("/v1/projects/test-proj/billingInfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        // POST batchEnable → in-progress operation
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/test-proj/services:batchEnable"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "operations/enable-op", "done": false,
+            })))
+            .mount(&server)
+            .await;
+
+        // Poll operation → done
+        Mock::given(method("GET"))
+            .and(path("/v1/operations/enable-op"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "operations/enable-op", "done": true, "response": {},
+            })))
+            .mount(&server)
+            .await;
+
+        // POST SA → ALREADY_EXISTS
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/test-proj/serviceAccounts"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": { "code": 409, "status": "ALREADY_EXISTS", "message": "already exists" },
+            })))
+            .mount(&server)
+            .await;
+
+        // Incomplete handle from a previous timed-out run (no provisioning_complete)
+        let incomplete_handle = json!({
+            "driver":     "gcp",
+            "kind":       "enclave",
+            "project_id": "test-proj",
+        });
+
+        let result = driver(&server)
+            .provision_enclave(&dummy_enclave(), Some(&incomplete_handle))
+            .await
+            .unwrap();
+
+        assert_eq!(result.handle["provisioning_complete"], true);
+        assert_eq!(result.handle["project_id"], "test-proj");
     }
 
     #[tokio::test]
@@ -1831,9 +2037,10 @@ mod tests {
             .await;
 
         let existing_handle = json!({
-            "driver":     "gcp",
-            "kind":       "enclave",
-            "project_id": "test-proj",
+            "driver":                "gcp",
+            "kind":                  "enclave",
+            "project_id":            "test-proj",
+            "provisioning_complete": true,
         });
 
         let result = driver(&server)

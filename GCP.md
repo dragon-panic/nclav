@@ -1,7 +1,7 @@
-# GCP Driver Implementation Plan
+# GCP Driver Reference
 
 This document maps every nclav concept to a concrete GCP primitive, specifies
-the exact API calls needed at each driver method, and defines what the opaque
+the exact API calls the driver makes at each method, and defines what the opaque
 `Handle` and output map look like for GCP resources.
 
 ---
@@ -15,7 +15,7 @@ the exact API calls needed at each driver method, and defines what the opaque
 | `Enclave.network` | **VPC network + subnets** | Custom-mode VPC; one subnet per entry in `subnets` list |
 | `Enclave.dns.zone` | **Cloud DNS managed zone** | Private zone, visible only within the VPC |
 | `Partition` (http) | **Cloud Run service** | Serverless; region from enclave |
-| `Partition` (tcp) | **Cloud SQL instance** or **Cloud Run** | Cloud SQL for databases; Cloud Run for custom TCP |
+| `Partition` (tcp) | **externally managed** | nclav validates wiring; hostname/port read from partition `inputs:` |
 | `Partition` (queue) | **Pub/Sub topic** | One topic per partition; subscriptions created at import time |
 | `Export` (http) | **Cloud Run IAM binding** + URL | IAM: `roles/run.invoker` on the service |
 | `Export` (tcp) | **Private Service Connect** endpoint | Exposes a service across project boundaries without VPC peering |
@@ -50,7 +50,6 @@ iam.googleapis.com              # Service accounts, bindings
 cloudresourcemanager.googleapis.com  # Project operations
 dns.googleapis.com              # Cloud DNS
 pubsub.googleapis.com           # Pub/Sub topics and subscriptions
-sqladmin.googleapis.com         # Cloud SQL (tcp partitions backed by SQL)
 servicenetworking.googleapis.com # Private service access / PSC
 cloudbilling.googleapis.com     # Billing account linkage
 ```
@@ -152,14 +151,17 @@ Creates the GCP project that backs this enclave.
 {
   "driver": "gcp",
   "kind": "enclave",
-  "project_id": "product-a-dev",
+  "project_id": "acme-product-a-dev",
   "project_number": "123456789012",
-  "service_account_email": "product-a-dev@product-a-dev.iam.gserviceaccount.com",
+  "service_account_email": "product-a-dev-sa@acme-product-a-dev.iam.gserviceaccount.com",
   "vpc_self_link": "https://www.googleapis.com/compute/v1/projects/.../networks/nclav-vpc",
   "dns_zone_name": "nclav-zone",
-  "region": "us-central1"
+  "region": "us-central1",
+  "provisioning_complete": true
 }
 ```
+
+> **`provisioning_complete` flag:** This field is only written after all five setup steps (project, billing, APIs, SA, VPC) complete successfully. The idempotency early-return requires this flag to be present and `true`. If a previous run timed out partway through, the flag will be absent and all steps will be re-executed on the next apply (each step is itself idempotent — ALREADY_EXISTS responses are treated as success).
 
 ---
 
@@ -183,9 +185,8 @@ Behavior depends on `partition.produces`:
 #### `produces: http` → Cloud Run service
 
 ```
-POST https://run.googleapis.com/v2/projects/<project-id>/locations/<region>/services
+POST https://run.googleapis.com/v2/projects/<project-id>/locations/<region>/services?serviceId=<partition-id>
 {
-  "name": "projects/<p>/locations/<r>/services/<partition-id>",
   "template": {
     "serviceAccount": "<enclave-sa-email>",
     "containers": [{
@@ -197,36 +198,54 @@ POST https://run.googleapis.com/v2/projects/<project-id>/locations/<region>/serv
 }
 ```
 
+> **Note:** The Cloud Run v2 API requires the service ID to be passed as a `?serviceId=` query parameter. The `name` field must be **absent** (or empty) in the request body — the API returns an error if it is set on create. The full resource name is derived locally after creation as `projects/<p>/locations/<r>/services/<partition-id>`.
+
 **Outputs:**
 ```
 hostname  →  <service-hash>-<project-hash>.<region>.run.app
 port      →  443
 ```
 
-#### `produces: tcp` → Cloud SQL (Postgres default)
+#### `produces: tcp` → externally managed (passthrough)
 
-```
-POST https://sqladmin.googleapis.com/v1/projects/<project-id>/instances
-{
-  "name": "<partition-id>",
-  "databaseVersion": "POSTGRES_16",
-  "region": "<region>",
-  "settings": {
-    "tier": "db-f1-micro",
-    "ipConfiguration": {
-      "ipv4Enabled": false,
-      "privateNetwork": "projects/<p>/global/networks/nclav-vpc"
-    }
-  }
-}
-```
+nclav does not provision TCP backing services (databases, caches, etc.). The choice
+of database engine, instance tier, HA topology, and backup policy is an
+application-level concern outside nclav's scope.
 
-→ Poll `operations/{name}` until `status == DONE`.
+For a `tcp` partition, nclav:
+1. Validates all consumers can reach this partition (access-control graph check)
+2. Reads `hostname` and `port` from the partition's `inputs:` block at provision time
+3. Stores those values in the handle so subsequent `observe_partition` calls work without a live cloud call
+
+**Partition `config.yml` example:**
+```yaml
+id: db
+name: Database
+produces: tcp
+inputs:
+  hostname: "10.10.5.3"
+  port: "5432"
+declared_outputs:
+  - hostname
+  - port
+```
 
 **Outputs:**
 ```
-hostname  →  <private-ip>     (from instance.ipAddresses where type=PRIVATE)
-port      →  5432
+hostname  →  inputs["hostname"]   (empty string if not set — warning logged)
+port      →  inputs["port"]       (empty string if not set)
+```
+
+**Handle shape:**
+```json
+{
+  "driver": "gcp",
+  "kind": "partition",
+  "type": "tcp_passthrough",
+  "project_id": "acme-product-a-dev",
+  "hostname": "10.10.5.3",
+  "port": "5432"
+}
 ```
 
 #### `produces: queue` → Pub/Sub topic
@@ -247,9 +266,9 @@ queue_url  →  projects/<project-id>/topics/<partition-id>
   "driver": "gcp",
   "kind": "partition",
   "type": "cloud_run",
-  "project_id": "product-a-dev",
+  "project_id": "acme-product-a-dev",
   "region": "us-central1",
-  "service_name": "projects/product-a-dev/locations/us-central1/services/api",
+  "service_name": "projects/acme-product-a-dev/locations/us-central1/services/api",
   "service_url": "https://api-abc123-uc.a.run.app"
 }
 ```
@@ -426,10 +445,12 @@ pub struct GcpDriverConfig {
     pub parent: String,           // "folders/123" or "organizations/456"
     /// Billing account to attach to every new project.
     pub billing_account: String,  // "billingAccounts/XXXXXX-YYYYYY-ZZZZZZ"
-    /// Default region when enclave.region is "gcp-default".
+    /// Default region used when enclave.region is not set.
     pub default_region: String,   // "us-central1"
-    /// Path to service account JSON key, or None to use ADC.
-    pub credentials: Option<PathBuf>,
+    /// Optional prefix prepended to every GCP project ID.
+    /// e.g. prefix "acme" + enclave "product-a-dev" → project "acme-product-a-dev".
+    /// Avoids global project ID collisions without changing enclave YAML IDs.
+    pub project_prefix: Option<String>,
 }
 ```
 
@@ -478,8 +499,8 @@ async fn wait_for_operation(
     token: &str,
     operation_url: &str,
 ) -> Result<serde_json::Value, DriverError> {
-    let backoff = [1, 2, 4, 8, 16, 30]; // seconds
-    for &delay in backoff.iter().cycle().take(30) {
+    let backoff = [1, 2, 4, 8, 16, 30]; // seconds, cycling
+    for (i, &delay) in backoff.iter().cycle().take(120).enumerate() {
         let op: serde_json::Value = client
             .get(operation_url)
             .bearer_auth(token)
@@ -492,30 +513,36 @@ async fn wait_for_operation(
             }
             return Ok(op["response"].clone());
         }
+        if i % 10 == 0 {
+            tracing::info!(poll = i, url = operation_url, "waiting for GCP operation");
+        }
         tokio::time::sleep(Duration::from_secs(delay)).await;
     }
-    Err(DriverError::ProvisionFailed("operation timed out".into()))
+    Err(DriverError::ProvisionFailed(
+        format!("operation timed out after 120 polls: {operation_url}")
+    ))
 }
 ```
+
+Max polls: **120** (backoff cycles `[1,2,4,8,16,30]` — ceiling ~58 minutes). An INFO log is emitted every 10 polls. The timeout error includes the operation URL to aid debugging.
 
 Operation endpoint patterns by API:
 - Resource Manager: `https://cloudresourcemanager.googleapis.com/v3/{operation}`
 - Compute: `https://compute.googleapis.com/compute/v1/projects/{p}/global/operations/{op}`
   (or regional: `.../regions/{r}/operations/{op}`)
 - Cloud Run: `https://run.googleapis.com/v2/{operation}`
-- Cloud SQL: `https://sqladmin.googleapis.com/v1/projects/{p}/operations/{op}`
 
 ---
 
 ## Idempotency strategy
 
-Every GCP create call should be checked against `existing: Option<&Handle>` before issuing:
+Every GCP create call is idempotent:
 
-- If `handle` is `Some` and contains a `project_id` / `service_name` / etc.,
-  issue a `GET` first and only `PATCH`/`PUT` if state has drifted.
+- **`provision_enclave` early return:** if the existing handle contains `"provisioning_complete": true`, all five setup steps are skipped. This flag is only set after every step completes successfully, so a partial run (e.g., a timeout during API enablement) will re-execute all steps on the next apply — safely, because each step is itself idempotent.
+- **ALREADY_EXISTS:** GCP APIs sometimes return `ALREADY_EXISTS` status (409) and sometimes return `UNKNOWN` with "already exists" in the message body (Compute API quirk). Both cases are treated as success.
 - Cloud Run `services.patch` with `updateMask` is safe to call repeatedly.
-- Pub/Sub `topics.create` returns `ALREADY_EXISTS` (409); treat as success.
-- Project creation: check `projects.get` first; if it exists and is active, skip.
+- Pub/Sub `topics.create`: `ALREADY_EXISTS` → success.
+- Project creation: if it exists and is active, proceed to billing/API steps.
 - PSC attachments and forwarding rules: check by name before creating.
 
 ---
@@ -578,24 +605,21 @@ hostname  →  response.uri  (strip "https://")
 port      →  443
 ```
 
-#### Cloud SQL (tcp)
+#### TCP passthrough
+
+TCP partitions are externally managed; no cloud API is called. `observe_partition`
+reads hostname and port from the stored handle:
 
 ```
-GET https://sqladmin.googleapis.com/v1/projects/<p>/instances/<partition-id>
+hostname  →  handle["hostname"]
+port      →  handle["port"]
 ```
 
-| `instance.state` | `ProvisioningStatus` |
+| Condition | `ProvisioningStatus` |
 |---|---|
-| `RUNNABLE` | `Active` |
-| `PENDING_CREATE` | `Provisioning` |
-| `MAINTENANCE`, `SUSPENDED` | `Degraded` |
-| `FAILED` | `Error` |
-| HTTP 404 | `exists: false` |
-
-```
-hostname  →  first ipAddress where type == "PRIVATE"
-port      →  5432
-```
+| handle present, hostname non-empty | `Active` |
+| handle present, hostname empty | `Degraded` |
+| no handle | `exists: false` |
 
 #### Pub/Sub topic (queue)
 
@@ -623,7 +647,7 @@ translating cloud API responses into the nclav lifecycle state machine.
 The reconciler owns the state transitions; this table defines what the
 driver reports via `ObservedState`.
 
-| Resource | GCP signal | `ProvisioningStatus` |
+| Resource | Signal | `ProvisioningStatus` |
 |---|---|---|
 | Project | `lifecycleState: ACTIVE` | `Active` |
 | Project | `lifecycleState: DELETE_REQUESTED` | `Deleting` |
@@ -633,11 +657,9 @@ driver reports via `ObservedState`.
 | Cloud Run | `conditions[Ready].status: False` | `Degraded` |
 | Cloud Run | `conditions[Ready].status: Unknown` | `Provisioning` |
 | Cloud Run | HTTP 404 | (caller treats as `Deleted`) |
-| Cloud SQL | `state: RUNNABLE` | `Active` |
-| Cloud SQL | `state: PENDING_CREATE` | `Provisioning` |
-| Cloud SQL | `state: MAINTENANCE` / `SUSPENDED` | `Degraded` |
-| Cloud SQL | `state: FAILED` | `Error` |
-| Cloud SQL | HTTP 404 | (caller treats as `Deleted`) |
+| TCP passthrough | handle present, hostname non-empty | `Active` |
+| TCP passthrough | handle present, hostname empty | `Degraded` |
+| TCP passthrough | no handle | (caller treats as `Deleted`) |
 | Pub/Sub topic | HTTP 200 | `Active` |
 | Pub/Sub topic | HTTP 404 | (caller treats as `Deleted`) |
 

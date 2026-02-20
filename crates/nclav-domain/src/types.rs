@@ -47,6 +47,7 @@ impl std::fmt::Display for PartitionId {
 #[serde(rename_all = "lowercase")]
 pub enum CloudTarget {
     Local,
+    Gcp,
     Azure,
 }
 

@@ -39,6 +39,12 @@ pub enum Command {
         #[arg(long, env = "NCLAV_GCP_DEFAULT_REGION", default_value = "us-central1")]
         gcp_default_region: String,
 
+        /// Prefix prepended to every GCP project ID (e.g. "acme" → "acme-product-a-dev").
+        /// Avoids global project ID collisions without changing enclave YAML IDs.
+        /// Env: NCLAV_GCP_PROJECT_PREFIX
+        #[arg(long, env = "NCLAV_GCP_PROJECT_PREFIX")]
+        gcp_project_prefix: Option<String>,
+
         /// TCP port to bind the HTTP API server on. Env: NCLAV_PORT
         #[arg(long, env = "NCLAV_PORT", default_value = "8080")]
         port: u16,

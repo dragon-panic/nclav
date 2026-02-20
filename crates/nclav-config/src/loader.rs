@@ -239,6 +239,7 @@ fn convert_export_target(raw: RawExportTarget, path: &Path) -> Result<ExportTarg
 fn parse_cloud(s: &str, path: &Path) -> Result<CloudTarget, ConfigError> {
     match s {
         "local" => Ok(CloudTarget::Local),
+        "gcp"   => Ok(CloudTarget::Gcp),
         "azure" => Ok(CloudTarget::Azure),
         other => Err(ConfigError::Conversion {
             path: path.display().to_string(),

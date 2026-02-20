@@ -17,8 +17,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Bootstrap { cloud, gcp_parent, gcp_billing_account, gcp_default_region, port } => {
-            commands::bootstrap(cloud, cli.remote, gcp_parent, gcp_billing_account, gcp_default_region, port).await
+        Command::Bootstrap { cloud, gcp_parent, gcp_billing_account, gcp_default_region, gcp_project_prefix, port } => {
+            commands::bootstrap(cloud, cli.remote, gcp_parent, gcp_billing_account, gcp_default_region, gcp_project_prefix, port).await
         }
         Command::Apply { enclaves_dir } => commands::apply(enclaves_dir, cli.remote).await,
         Command::Diff { enclaves_dir } => commands::diff(enclaves_dir, cli.remote).await,

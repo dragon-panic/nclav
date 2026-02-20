@@ -1,8 +1,8 @@
 id: product-a-dev
-name: Product A (Development)
-cloud: local
-region: local-1
-identity: product-a-dev-identity
+name: Product A Development
+cloud: gcp
+region: us-central1
+identity: product-a-dev-sa
 network:
   vpc_cidr: "10.0.0.0/16"
   subnets:

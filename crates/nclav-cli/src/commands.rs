@@ -16,6 +16,7 @@ pub async fn bootstrap(
     gcp_parent: Option<String>,
     gcp_billing_account: Option<String>,
     gcp_default_region: String,
+    gcp_project_prefix: Option<String>,
     port: u16,
 ) -> Result<()> {
     if remote.is_some() {
@@ -51,6 +52,7 @@ pub async fn bootstrap(
                 parent,
                 billing_account,
                 default_region: gcp_default_region,
+                project_prefix: gcp_project_prefix,
             };
 
             println!("Initialising GCP driver (ADC)…");
@@ -184,15 +186,25 @@ async fn api_reconcile(url: &str, enclaves_dir: &PathBuf, dry_run: bool) -> Resu
         }
     }
 
+    let n_changes = report
+        .get("changes")
+        .and_then(|c| c.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
     println!(
         "{} change(s){}.",
-        report
-            .get("changes")
-            .and_then(|c| c.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0),
+        n_changes,
         if dry_run { " (dry run)" } else { " applied" }
     );
+
+    if let Some(errors) = report.get("errors").and_then(|e| e.as_array()) {
+        if !errors.is_empty() {
+            eprintln!("\n{} error(s):", errors.len());
+            for e in errors {
+                eprintln!("  ! {}", e);
+            }
+        }
+    }
 
     Ok(())
 }

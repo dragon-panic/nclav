@@ -27,17 +27,17 @@ cd nclav
 # Build everything
 cargo build --workspace
 
-# See what would change against the bundled example
+# Start the HTTP API server (binds :8080, in-memory store)
+cargo run -p nclav-cli -- bootstrap --cloud local
+
+# In another terminal — see what would change
 cargo run -p nclav-cli -- diff ./enclaves
 
-# Apply it (in-memory, no real infrastructure)
+# Apply changes (provisions resources via the running server)
 cargo run -p nclav-cli -- apply ./enclaves
 
-# Render the dependency graph
-cargo run -p nclav-cli -- graph ./enclaves --output text
-
-# Start the HTTP API server (binds :8080)
-cargo run -p nclav-cli -- bootstrap --cloud local
+# Render the dependency graph (fetched from the running server)
+cargo run -p nclav-cli -- graph --output text
 ```
 
 ## CLI reference
@@ -46,7 +46,7 @@ cargo run -p nclav-cli -- bootstrap --cloud local
 nclav [--remote <url>] <command>
 ```
 
-All commands run **in-process** by default (ephemeral in-memory store, local driver). Pass `--remote <url>` (or set `NCLAV_URL`) to forward the command to a running server instead.
+`bootstrap` starts the API server. All other commands (`diff`, `apply`, `graph`, `status`) send HTTP requests to it — defaulting to `http://localhost:8080`. Pass `--remote <url>` (or set `NCLAV_URL`) to target a remote server.
 
 ### `nclav diff <enclaves-dir>`
 
@@ -68,22 +68,22 @@ Prefix key: `+` create, `~` update, `-` delete, `>` export wired, `<` import wir
 
 Reconcile and apply: same as `diff` but actually provisions resources and persists state.
 
-### `nclav graph <enclaves-dir> [--output text|json|dot] [--enclave <id>]`
+### `nclav graph [--output text|json|dot] [--enclave <id>]`
 
-Render the dependency graph between enclaves and partitions.
+Render the dependency graph from the running server's applied state.
 
 ```bash
 # Human-readable
-nclav graph ./enclaves
+nclav graph
 
 # Graphviz — pipe to dot for an SVG
-nclav graph ./enclaves --output dot | dot -Tsvg > graph.svg
+nclav graph --output dot | dot -Tsvg > graph.svg
 
 # Machine-readable JSON
-nclav graph ./enclaves --output json
+nclav graph --output json
 
 # Filter to one enclave
-nclav graph ./enclaves --enclave product-a-dev
+nclav graph --enclave product-a-dev
 ```
 
 ### `nclav bootstrap --cloud local`
@@ -96,11 +96,12 @@ Starts the server backed by the GCP driver. Authenticates via [Application Defau
 
 **Required flags / env vars:**
 
-| Flag | Env var | Description |
-|---|---|---|
-| `--gcp-parent` | `NCLAV_GCP_PARENT` | Resource parent for new GCP Projects, e.g. `folders/123` or `organizations/456` |
-| `--gcp-billing-account` | `NCLAV_GCP_BILLING_ACCOUNT` | Billing account to attach, e.g. `billingAccounts/XXXX-YYYY-ZZZZ` |
-| `--gcp-default-region` | `NCLAV_GCP_DEFAULT_REGION` | Default region (default: `us-central1`) |
+| Flag | Env var | Required | Description |
+|---|---|:---:|---|
+| `--gcp-parent` | `NCLAV_GCP_PARENT` | yes | Resource parent for new GCP Projects, e.g. `folders/123` or `organizations/456` |
+| `--gcp-billing-account` | `NCLAV_GCP_BILLING_ACCOUNT` | yes | Billing account to attach, e.g. `billingAccounts/XXXX-YYYY-ZZZZ` |
+| `--gcp-default-region` | `NCLAV_GCP_DEFAULT_REGION` | no | Default region (default: `us-central1`) |
+| `--gcp-project-prefix` | `NCLAV_GCP_PROJECT_PREFIX` | no | Prefix prepended to every GCP project ID, e.g. `acme` → `acme-product-a-dev`. Avoids global project ID collisions without changing enclave YAML IDs. |
 
 ```bash
 export NCLAV_GCP_PARENT="folders/123456789"
@@ -119,7 +120,7 @@ cargo run -p nclav-cli -- bootstrap --cloud gcp \
 | Partition `produces` | GCP resource provisioned |
 |---|---|
 | `http` | Cloud Run service |
-| `tcp` | Cloud SQL instance |
+| `tcp` | Externally managed — nclav validates wiring and reads `hostname`/`port` from partition `inputs:` |
 | `queue` | Pub/Sub topic + subscription |
 
 **Teardown:** removing an enclave from YAML and re-running `nclav apply` will delete the corresponding GCP Project (and all resources inside it).

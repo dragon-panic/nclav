@@ -175,9 +175,9 @@ Reconciler (domain)
       ▼
 DriverInterface
       ├── LocalDriver     (v1 — no credentials, in-process state)
-      ├── AzureDriver     (v1)
-      ├── AwsDriver       (future)
-      └── GcpDriver       (future)
+      ├── GcpDriver       (v1 — Cloud Run, Pub/Sub, VPC, IAM)
+      ├── AzureDriver     (future)
+      └── AwsDriver       (future)
 ```
 
 The domain model describes intent. Drivers produce cloud-specific handles — opaque receipts stored in state so the driver can locate its resources on subsequent reconciles. The reconciler never reads inside handles. Only the driver that produced them reads them.
@@ -527,13 +527,13 @@ nclav graph ./enclaves       # Render full import/export graph
 - **Language:** Rust
 - **Database:** Postgres
 - **IaC:** Terraform
-- **Clouds (v1):** Local, Azure
+- **Clouds (v1):** Local, GCP
 
 ---
 
 ## Non-Goals (v1)
 
-- AWS and GCP drivers (abstraction layer is built; drivers are future)
+- Azure and AWS drivers (abstraction layer is built; drivers are future)
 - Org-level policy enforcement and compliance controls
 - Template and mixin system
 - Intra-enclave NSG enforcement (declarations generated, compliance not verified)
