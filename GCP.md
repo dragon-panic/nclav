@@ -520,6 +520,174 @@ Every GCP create call should be checked against `existing: Option<&Handle>` befo
 
 ---
 
+## Observe method specifications
+
+`observe_*` methods are read-only. They are called by the drift detection path
+(`GET /enclaves/{id}?observe=true` or the background drift scanner) and must
+never modify any cloud resource. They populate `ObservedState` which the
+reconciler uses to set `ResourceMeta.last_seen_at` and `ProvisioningStatus`.
+
+### `observe_enclave`
+
+```
+GET https://cloudresourcemanager.googleapis.com/v3/projects/<project-id>
+```
+
+| GCP response field | Maps to |
+|---|---|
+| `lifecycleState == ACTIVE` | `exists: true`, `healthy: true` |
+| `lifecycleState == DELETE_REQUESTED` | `exists: true`, `healthy: false` |
+| HTTP 404 | `exists: false` |
+| Any other HTTP error | propagate as `DriverError` |
+
+Additionally check VPC and service account presence with two parallel GETs:
+
+```
+GET https://compute.googleapis.com/compute/v1/projects/<p>/global/networks/nclav-vpc
+GET https://iam.googleapis.com/v1/projects/<p>/serviceAccounts/<identity>@<p>.iam.gserviceaccount.com
+```
+
+Set `healthy: false` (→ `Degraded`) if the project exists but either the VPC
+or the service account is missing — the enclave is partially provisioned.
+
+**`ObservedState.outputs`:** empty for enclaves (no keyed outputs).
+
+---
+
+### `observe_partition`
+
+#### Cloud Run (http)
+
+```
+GET https://run.googleapis.com/v2/projects/<p>/locations/<r>/services/<partition-id>
+```
+
+Map the `conditions` array:
+
+| Condition | `status` | Meaning |
+|---|---|---|
+| `type: Ready`, `status: True` | `Active` | Service is live and handling traffic |
+| `type: Ready`, `status: False` | `Degraded` | Service exists but is not ready |
+| `type: Ready`, `status: Unknown` | `Provisioning` | Deployment still rolling out |
+| HTTP 404 | report `exists: false` | — |
+
+Populate `ObservedState.outputs` from the live service:
+
+```
+hostname  →  response.uri  (strip "https://")
+port      →  443
+```
+
+#### Cloud SQL (tcp)
+
+```
+GET https://sqladmin.googleapis.com/v1/projects/<p>/instances/<partition-id>
+```
+
+| `instance.state` | `ProvisioningStatus` |
+|---|---|
+| `RUNNABLE` | `Active` |
+| `PENDING_CREATE` | `Provisioning` |
+| `MAINTENANCE`, `SUSPENDED` | `Degraded` |
+| `FAILED` | `Error` |
+| HTTP 404 | `exists: false` |
+
+```
+hostname  →  first ipAddress where type == "PRIVATE"
+port      →  5432
+```
+
+#### Pub/Sub topic (queue)
+
+```
+GET https://pubsub.googleapis.com/v1/projects/<p>/topics/<partition-id>
+```
+
+Pub/Sub topics have no health state beyond existence:
+
+| Response | `ProvisioningStatus` |
+|---|---|
+| HTTP 200 | `Active` |
+| HTTP 404 | `exists: false` |
+
+```
+queue_url  →  response.name   ("projects/<p>/topics/<partition-id>")
+```
+
+---
+
+## GCP health signals → ProvisioningStatus
+
+The following table is the complete mapping the GCP driver uses when
+translating cloud API responses into the nclav lifecycle state machine.
+The reconciler owns the state transitions; this table defines what the
+driver reports via `ObservedState`.
+
+| Resource | GCP signal | `ProvisioningStatus` |
+|---|---|---|
+| Project | `lifecycleState: ACTIVE` | `Active` |
+| Project | `lifecycleState: DELETE_REQUESTED` | `Deleting` |
+| Project | VPC or SA missing | `Degraded` |
+| Project | HTTP 404 | (caller treats as `Deleted`) |
+| Cloud Run | `conditions[Ready].status: True` | `Active` |
+| Cloud Run | `conditions[Ready].status: False` | `Degraded` |
+| Cloud Run | `conditions[Ready].status: Unknown` | `Provisioning` |
+| Cloud Run | HTTP 404 | (caller treats as `Deleted`) |
+| Cloud SQL | `state: RUNNABLE` | `Active` |
+| Cloud SQL | `state: PENDING_CREATE` | `Provisioning` |
+| Cloud SQL | `state: MAINTENANCE` / `SUSPENDED` | `Degraded` |
+| Cloud SQL | `state: FAILED` | `Error` |
+| Cloud SQL | HTTP 404 | (caller treats as `Deleted`) |
+| Pub/Sub topic | HTTP 200 | `Active` |
+| Pub/Sub topic | HTTP 404 | (caller treats as `Deleted`) |
+
+The reconciler — not the driver — writes to `ResourceMeta.status`. The driver
+returns `ObservedState`; the reconciler decides the transition.
+
+---
+
+## GCP error format → ResourceError
+
+GCP REST APIs return errors in this envelope:
+
+```json
+{
+  "error": {
+    "code": 403,
+    "status": "PERMISSION_DENIED",
+    "message": "The caller does not have permission",
+    "details": [
+      { "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+        "reason": "IAM_PERMISSION_DENIED",
+        "domain": "iam.googleapis.com",
+        "metadata": { "permission": "compute.networks.create" } }
+    ]
+  }
+}
+```
+
+The GCP driver extracts `ResourceError.message` as:
+
+```
+"<status>: <message>"
+```
+
+e.g. `"PERMISSION_DENIED: The caller does not have permission"`.
+
+If `details` is non-empty, append the first `ErrorInfo.reason` and the
+`metadata` values to give operators enough context to act without reading
+raw JSON:
+
+```
+"PERMISSION_DENIED: The caller does not have permission [IAM_PERMISSION_DENIED — compute.networks.create]"
+```
+
+For long-running operations that fail, the error is nested at
+`operation.error` with the same shape. The polling helper extracts it
+the same way before surfacing it as a `DriverError::ProvisionFailed`.
+
+---
+
 ## What's explicitly out of scope for the first GCP driver iteration
 
 - GKE-backed partitions (Cloud Run covers the initial http/tcp surface)
