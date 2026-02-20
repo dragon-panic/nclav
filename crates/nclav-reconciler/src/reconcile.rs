@@ -3,11 +3,14 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use nclav_domain::{Enclave, EnclaveId};
-use nclav_store::{AuditEvent, EnclaveState, PartitionState, StateStore};
+use nclav_store::{
+    AuditEvent, EnclaveState, PartitionState, ProvisioningStatus, StateStore,
+    compute_desired_hash,
+};
 use nclav_driver::Driver;
 use nclav_graph::validate;
 use uuid::Uuid;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::ReconcileError;
 use crate::report::{Change, ReconcileReport, ReconcileRequest};
@@ -24,7 +27,7 @@ pub async fn reconcile(
     let desired_enclaves = nclav_config::load_enclaves(&req.enclaves_dir)?;
     debug!("Loaded {} enclaves", desired_enclaves.len());
 
-    // 2. Validate graph
+    // 2. Validate graph — abort entire reconcile on structural errors
     info!("Validating enclave graph");
     let resolved = validate(&desired_enclaves)?;
     debug!(
@@ -33,35 +36,32 @@ pub async fn reconcile(
     );
 
     // 3. Load actual state
-    let actual_states: HashMap<EnclaveId, nclav_store::EnclaveState> = store
+    let actual_states: HashMap<EnclaveId, EnclaveState> = store
         .list_enclaves()
         .await?
         .into_iter()
         .map(|s| (s.desired.id.clone(), s))
         .collect();
 
-    // 4. Diff: detect creates, updates, deletes
+    // 4. Diff: compute desired vs actual and collect changes
     let desired_ids: HashSet<EnclaveId> =
         desired_enclaves.iter().map(|e| e.id.clone()).collect();
     let actual_ids: HashSet<EnclaveId> = actual_states.keys().cloned().collect();
 
-    // Deletes
+    // Removals
     for id in actual_ids.difference(&desired_ids) {
         report.changes.push(Change::EnclaveDeleted { id: id.clone() });
     }
 
-    // Creates and updates (in topo order)
+    // Build ordered list of desired enclaves (topo order first)
     let topo_ids: Vec<EnclaveId> = resolved
         .topo_order
         .iter()
         .map(|n| EnclaveId::new(&n.0))
         .collect();
-
-    // Build a map for quick lookup
     let desired_map: HashMap<&EnclaveId, &Enclave> =
         desired_enclaves.iter().map(|e| (&e.id, e)).collect();
 
-    // Add creates/updates in topo order, then any remaining in arbitrary order
     let mut ordered_desired: Vec<&Enclave> = Vec::new();
     for id in &topo_ids {
         if let Some(enc) = desired_map.get(id) {
@@ -76,26 +76,30 @@ pub async fn reconcile(
 
     for enc in &ordered_desired {
         let existing = actual_states.get(&enc.id);
-        let is_new = existing.is_none();
-        let is_changed = existing.map_or(true, |s| s.desired != **enc);
+        let enc_hash = compute_desired_hash(enc);
+        let hash_unchanged = existing
+            .and_then(|s| s.meta.desired_hash.as_deref())
+            .map_or(false, |h| h == enc_hash);
 
-        if is_new {
+        if existing.is_none() {
             report.changes.push(Change::EnclaveCreated { id: enc.id.clone() });
-        } else if is_changed {
+        } else if !hash_unchanged {
             report.changes.push(Change::EnclaveUpdated { id: enc.id.clone() });
         }
 
         for part in &enc.partitions {
+            let part_hash = compute_desired_hash(part);
             let part_existing = existing.and_then(|s| s.partitions.get(&part.id));
-            let part_is_new = part_existing.is_none();
-            let part_is_changed = part_existing.map_or(true, |ps| ps.desired != *part);
+            let part_hash_unchanged = part_existing
+                .and_then(|ps| ps.meta.desired_hash.as_deref())
+                .map_or(false, |h| h == part_hash);
 
-            if part_is_new {
+            if part_existing.is_none() {
                 report.changes.push(Change::PartitionCreated {
                     enclave_id: enc.id.clone(),
                     partition_id: part.id.clone(),
                 });
-            } else if part_is_changed {
+            } else if !part_hash_unchanged {
                 report.changes.push(Change::PartitionUpdated {
                     enclave_id: enc.id.clone(),
                     partition_id: part.id.clone(),
@@ -116,14 +120,11 @@ pub async fn reconcile(
         }
     }
 
-    // Cross-enclave imports
+    // Cross-enclave import changes
     for enc in &ordered_desired {
+        let existing = actual_states.get(&enc.id);
         for import in &enc.imports {
-            let existing = actual_states.get(&enc.id);
-            let already_wired = existing
-                .and_then(|s| s.import_handles.get(&import.alias))
-                .is_some();
-            if !already_wired {
+            if existing.and_then(|s| s.import_handles.get(&import.alias)).is_none() {
                 report.changes.push(Change::ImportWired {
                     importer_enclave: enc.id.clone(),
                     alias: import.alias.clone(),
@@ -131,12 +132,8 @@ pub async fn reconcile(
             }
         }
         for part in &enc.partitions {
-            let existing = actual_states.get(&enc.id);
             for import in &part.imports {
-                let already_wired = existing
-                    .and_then(|s| s.import_handles.get(&import.alias))
-                    .is_some();
-                if !already_wired {
+                if existing.and_then(|s| s.import_handles.get(&import.alias)).is_none() {
                     report.changes.push(Change::ImportWired {
                         importer_enclave: enc.id.clone(),
                         alias: import.alias.clone(),
@@ -152,9 +149,7 @@ pub async fn reconcile(
         return Ok(report);
     }
 
-    // 6. Provision in topo order
     let run_id = Uuid::new_v4();
-
     store
         .append_event(&AuditEvent::ReconcileStarted {
             id: run_id,
@@ -163,106 +158,176 @@ pub async fn reconcile(
         })
         .await?;
 
-    // Handle deletes
+    // 6. Teardowns for removed enclaves
     for id in actual_ids.difference(&desired_ids) {
         if let Some(existing) = actual_states.get(id) {
             if let Some(handle) = &existing.enclave_handle {
-                let enclave = &existing.desired;
-                driver.teardown_enclave(enclave, handle).await?;
+                driver.teardown_enclave(&existing.desired, handle).await?;
             }
             store.delete_enclave(id).await?;
         }
     }
 
-    // Provision creates/updates in topo order
+    // 7. Provision / update in topo order
     for enc in &ordered_desired {
         let existing = actual_states.get(&enc.id);
-        let _is_changed = existing.map_or(true, |s| s.desired != **enc);
+        let enc_hash = compute_desired_hash(enc);
+        let _hash_unchanged = existing
+            .and_then(|s| s.meta.desired_hash.as_deref())
+            .map_or(false, |h| h == enc_hash);
+
+        // Initialise or clone state
+        let mut enc_state = existing
+            .cloned()
+            .unwrap_or_else(|| EnclaveState::new((*enc).clone()));
+        enc_state.desired = (*enc).clone();
+
+        // Mark in-flight status before driver call
+        enc_state.meta.status = if existing.is_some() {
+            ProvisioningStatus::Updating
+        } else {
+            ProvisioningStatus::Provisioning
+        };
+        store.upsert_enclave(&enc_state).await?;
 
         // Provision enclave
-        let enc_result = driver
+        match driver
             .provision_enclave(enc, existing.and_then(|s| s.enclave_handle.as_ref()))
-            .await?;
-
-        let mut enc_state = existing.cloned().unwrap_or_else(|| EnclaveState::new((*enc).clone()));
-        enc_state.desired = (*enc).clone();
-        enc_state.enclave_handle = Some(enc_result.handle.clone());
+            .await
+        {
+            Ok(result) => {
+                let now = Utc::now();
+                enc_state.enclave_handle = Some(result.handle);
+                enc_state.meta.mark_active(now, enc_hash);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                warn!(enclave_id = %enc.id, error = %msg, "enclave provision failed");
+                enc_state.meta.mark_error(Utc::now(), msg.clone());
+                store.upsert_enclave(&enc_state).await?;
+                store
+                    .append_event(&AuditEvent::EnclaveError {
+                        id: Uuid::new_v4(),
+                        at: Utc::now(),
+                        enclave_id: enc.id.clone(),
+                        message: msg.clone(),
+                    })
+                    .await?;
+                report.errors.push(format!("enclave {}: {}", enc.id, msg));
+                continue; // skip partitions for this enclave
+            }
+        }
 
         // Provision partitions
         for part in &enc.partitions {
-            let part_existing = existing.and_then(|s| s.partitions.get(&part.id));
-            let _part_is_changed = part_existing.map_or(true, |ps| ps.desired != *part);
+            let part_hash = compute_desired_hash(part);
+            let part_existing = enc_state.partitions.get(&part.id).cloned();
+            let part_hash_unchanged = part_existing
+                .as_ref()
+                .and_then(|ps| ps.meta.desired_hash.as_deref())
+                .map_or(false, |h| h == part_hash);
 
-            // Resolve template inputs
+            if part_hash_unchanged {
+                debug!(partition_id = %part.id, "skipping unchanged partition");
+                continue;
+            }
+
             let resolved_inputs = resolve_inputs(&part.inputs, &enc_state);
 
-            let part_result = driver
+            let mut part_state = part_existing
+                .unwrap_or_else(|| PartitionState::new(part.clone()));
+            part_state.desired = part.clone();
+            part_state.meta.status = if part_state.partition_handle.is_some() {
+                ProvisioningStatus::Updating
+            } else {
+                ProvisioningStatus::Provisioning
+            };
+            enc_state.partitions.insert(part.id.clone(), part_state.clone());
+            store.upsert_enclave(&enc_state).await?;
+
+            match driver
                 .provision_partition(
                     enc,
                     part,
                     &resolved_inputs,
-                    part_existing.and_then(|ps| ps.partition_handle.as_ref()),
+                    part_state.partition_handle.as_ref(),
                 )
-                .await?;
+                .await
+            {
+                Ok(result) => {
+                    let now = Utc::now();
+                    let ps = enc_state.partitions.entry(part.id.clone()).or_insert_with(|| PartitionState::new(part.clone()));
+                    ps.partition_handle = Some(result.handle);
+                    ps.resolved_outputs = result.outputs;
+                    ps.meta.mark_active(now, part_hash);
 
-            let part_state = PartitionState {
-                desired: part.clone(),
-                partition_handle: Some(part_result.handle),
-                resolved_outputs: part_result.outputs.clone(),
-            };
+                    store
+                        .append_event(&AuditEvent::PartitionProvisioned {
+                            id: Uuid::new_v4(),
+                            at: Utc::now(),
+                            enclave_id: enc.id.clone(),
+                            partition_id: part.id.clone(),
+                        })
+                        .await?;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    warn!(partition_id = %part.id, error = %msg, "partition provision failed");
+                    let ps = enc_state.partitions.entry(part.id.clone()).or_insert_with(|| PartitionState::new(part.clone()));
+                    ps.meta.mark_error(Utc::now(), msg.clone());
 
-            enc_state.partitions.insert(part.id.clone(), part_state);
-
-            store
-                .append_event(&AuditEvent::PartitionProvisioned {
-                    id: Uuid::new_v4(),
-                    at: Utc::now(),
-                    enclave_id: enc.id.clone(),
-                    partition_id: part.id.clone(),
-                })
-                .await?;
+                    store
+                        .append_event(&AuditEvent::PartitionError {
+                            id: Uuid::new_v4(),
+                            at: Utc::now(),
+                            enclave_id: enc.id.clone(),
+                            partition_id: part.id.clone(),
+                            message: msg.clone(),
+                        })
+                        .await?;
+                    report.errors.push(format!(
+                        "partition {}/{}: {}", enc.id, part.id, msg
+                    ));
+                    // Continue with remaining partitions
+                }
+            }
         }
 
         // Provision exports
         for export in &enc.exports {
-            let _already_wired = existing
-                .and_then(|s| s.export_handles.get(&export.name))
-                .is_some();
-
-            // Gather partition outputs for this export's target partition
             let part_outputs = enc_state
                 .partitions
                 .get(&export.target_partition)
                 .map(|ps| ps.resolved_outputs.clone())
                 .unwrap_or_default();
 
-            let export_result = driver
+            match driver
                 .provision_export(
                     enc,
                     export,
                     &part_outputs,
-                    existing.and_then(|s| s.export_handles.get(&export.name)),
+                    enc_state.export_handles.get(&export.name),
                 )
-                .await?;
-
-            enc_state
-                .export_handles
-                .insert(export.name.clone(), export_result.handle);
-
-            store
-                .append_event(&AuditEvent::ExportWired {
-                    id: Uuid::new_v4(),
-                    at: Utc::now(),
-                    enclave_id: enc.id.clone(),
-                    export_name: export.name.clone(),
-                })
-                .await?;
+                .await
+            {
+                Ok(result) => {
+                    enc_state.export_handles.insert(export.name.clone(), result.handle);
+                    store
+                        .append_event(&AuditEvent::ExportWired {
+                            id: Uuid::new_v4(),
+                            at: Utc::now(),
+                            enclave_id: enc.id.clone(),
+                            export_name: export.name.clone(),
+                        })
+                        .await?;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    warn!(export = %export.name, error = %msg, "export provision failed");
+                    report.errors.push(format!("export {}/{}: {}", enc.id, export.name, msg));
+                }
+            }
         }
-
-        enc_state.last_reconciled_at = Some(Utc::now());
-
-        // Persist enclave state
-        store.upsert_enclave(&enc_state).await?;
 
         store
             .append_event(&AuditEvent::EnclaveProvisioned {
@@ -271,79 +336,55 @@ pub async fn reconcile(
                 enclave_id: enc.id.clone(),
             })
             .await?;
+
+        store.upsert_enclave(&enc_state).await?;
     }
 
-    // 7. Wire cross-enclave imports (second pass, after all enclaves provisioned)
+    // 8. Wire cross-enclave imports (second pass, after all enclaves provisioned)
     for enc in &ordered_desired {
-        let mut enc_state = store
-            .get_enclave(&enc.id)
-            .await?
-            .unwrap_or_else(|| EnclaveState::new((*enc).clone()));
-
+        let mut enc_state = match store.get_enclave(&enc.id).await? {
+            Some(s) => s,
+            None => continue,
+        };
         let mut changed = false;
 
-        // Enclave-level imports
-        for import in &enc.imports {
-            // Get the exporter's export handle
+        for import in enc.imports.iter().chain(
+            enc.partitions.iter().flat_map(|p| p.imports.iter())
+        ) {
+            if enc_state.import_handles.contains_key(&import.alias) {
+                continue; // already wired
+            }
             let exporter_state = store.get_enclave(&import.from).await?;
             if let Some(exporter) = exporter_state {
                 if let Some(export_handle) = exporter.export_handles.get(&import.export_name) {
-                    let import_result = driver
+                    match driver
                         .provision_import(
                             enc,
                             import,
                             export_handle,
                             enc_state.import_handles.get(&import.alias),
                         )
-                        .await?;
-
-                    enc_state
-                        .import_handles
-                        .insert(import.alias.clone(), import_result.handle);
-
-                    store
-                        .append_event(&AuditEvent::ImportWired {
-                            id: Uuid::new_v4(),
-                            at: Utc::now(),
-                            importer_enclave: enc.id.clone(),
-                            export_name: import.export_name.clone(),
-                        })
-                        .await?;
-
-                    changed = true;
-                }
-            }
-        }
-
-        // Partition-level imports
-        for part in &enc.partitions {
-            for import in &part.imports {
-                let exporter_state = store.get_enclave(&import.from).await?;
-                if let Some(exporter) = exporter_state {
-                    if let Some(export_handle) = exporter.export_handles.get(&import.export_name) {
-                        let import_result = driver
-                            .provision_import(
-                                enc,
-                                import,
-                                export_handle,
-                                enc_state.import_handles.get(&import.alias),
-                            )
-                            .await?;
-
-                        enc_state
-                            .import_handles
-                            .insert(import.alias.clone(), import_result.handle);
-
-                        store
-                            .append_event(&AuditEvent::ImportWired {
-                                id: Uuid::new_v4(),
-                                at: Utc::now(),
-                                importer_enclave: enc.id.clone(),
-                                export_name: import.export_name.clone(),
-                            })
-                            .await?;
-
-                        changed = true;
+                        .await
+                    {
+                        Ok(result) => {
+                            enc_state.import_handles.insert(import.alias.clone(), result.handle);
+                            store
+                                .append_event(&AuditEvent::ImportWired {
+                                    id: Uuid::new_v4(),
+                                    at: Utc::now(),
+                                    importer_enclave: enc.id.clone(),
+                                    export_name: import.export_name.clone(),
+                                })
+                                .await?;
+                            changed = true;
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            warn!(alias = %import.alias, error = %msg, "import wiring failed");
+                            report.errors.push(format!(
+                                "import {}/{}: {}", enc.id, import.alias, msg
+                            ));
+                        }
                     }
                 }
             }
@@ -354,7 +395,7 @@ pub async fn reconcile(
         }
     }
 
-    // 8. Final audit event
+    // 9. Final audit event
     store
         .append_event(&AuditEvent::ReconcileCompleted {
             id: run_id,
@@ -364,72 +405,55 @@ pub async fn reconcile(
         })
         .await?;
 
-    info!("Reconcile complete: {} changes", report.changes.len());
+    info!(
+        changes = report.changes.len(),
+        errors = report.errors.len(),
+        "Reconcile complete"
+    );
     Ok(report)
 }
 
-/// Resolve template variables of the form `{{ alias.key }}` in input values.
+/// Resolve `{{ alias.key }}` template variables from import handles.
 fn resolve_inputs(
     inputs: &HashMap<String, String>,
     enc_state: &EnclaveState,
 ) -> HashMap<String, String> {
     inputs
         .iter()
-        .map(|(k, v)| {
-            let resolved = resolve_template(v, enc_state);
-            (k.clone(), resolved)
-        })
+        .map(|(k, v)| (k.clone(), resolve_template(v, enc_state)))
         .collect()
 }
 
 fn resolve_template(template: &str, enc_state: &EnclaveState) -> String {
-    // Replace {{ alias.key }} patterns
     let mut result = template.to_string();
-    let _re_pattern = "{{ ";
-
     let mut search_start = 0;
     loop {
-        if let Some(start) = result[search_start..].find("{{") {
-            let abs_start = search_start + start;
-            if let Some(end) = result[abs_start..].find("}}") {
-                let abs_end = abs_start + end + 2;
-                let placeholder = &result[abs_start..abs_end];
-                let inner = placeholder
-                    .trim_start_matches("{{")
-                    .trim_end_matches("}}")
-                    .trim();
+        let Some(start) = result[search_start..].find("{{") else { break };
+        let abs_start = search_start + start;
+        let Some(end) = result[abs_start..].find("}}") else { break };
+        let abs_end = abs_start + end + 2;
 
-                // inner is "alias.key"
-                let parts: Vec<&str> = inner.splitn(2, '.').collect();
-                if parts.len() == 2 {
-                    let alias = parts[0];
-                    let key = parts[1];
+        let inner = result[abs_start + 2..abs_end - 2].trim();
+        let parts: Vec<&str> = inner.splitn(2, '.').collect();
+        if parts.len() == 2 {
+            let alias = parts[0];
+            let key = parts[1];
+            let resolved_val = enc_state
+                .import_handles
+                .get(alias)
+                .and_then(|h| h.get("outputs"))
+                .and_then(|o| o.get(key))
+                .and_then(|v| v.as_str())
+                .map(String::from);
 
-                    // Look in import_handles (outputs)
-                    let resolved_val = enc_state
-                        .import_handles
-                        .get(alias)
-                        .and_then(|h| h.get("outputs"))
-                        .and_then(|o| o.get(key))
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-
-                    if let Some(val) = resolved_val {
-                        result = format!("{}{}{}", &result[..abs_start], val, &result[abs_end..]);
-                        search_start = abs_start + val.len();
-                        continue;
-                    }
-                }
-
-                search_start = abs_end;
-            } else {
-                break;
+            if let Some(val) = resolved_val {
+                result = format!("{}{}{}", &result[..abs_start], val, &result[abs_end..]);
+                search_start = abs_start + val.len();
+                continue;
             }
-        } else {
-            break;
         }
+        search_start = abs_end;
     }
-
     result
 }
 
@@ -437,89 +461,73 @@ fn resolve_template(template: &str, enc_state: &EnclaveState) -> String {
 mod tests {
     use super::*;
     use nclav_driver::LocalDriver;
-    use nclav_store::InMemoryStore;
+    use nclav_store::{InMemoryStore, ProvisioningStatus};
     use std::path::Path;
 
     #[tokio::test]
     async fn dry_run_returns_changes_without_persisting() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../enclaves");
-        if !dir.exists() {
-            return;
-        }
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../enclaves");
+        if !dir.exists() { return; }
 
         let store = Arc::new(InMemoryStore::new());
         let driver = Arc::new(LocalDriver::new());
-
-        let req = ReconcileRequest {
-            enclaves_dir: dir,
-            dry_run: true,
-        };
+        let req = ReconcileRequest { enclaves_dir: dir, dry_run: true };
 
         let report = reconcile(req, store.clone(), driver).await.unwrap();
         assert!(report.dry_run);
         assert!(!report.changes.is_empty());
-
-        // State must not be modified
-        let enclaves = store.list_enclaves().await.unwrap();
-        assert!(enclaves.is_empty(), "dry run should not persist state");
+        assert!(store.list_enclaves().await.unwrap().is_empty(), "dry run must not persist");
     }
 
     #[tokio::test]
-    async fn apply_persists_state() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../enclaves");
-        if !dir.exists() {
-            return;
-        }
+    async fn apply_sets_active_status() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../enclaves");
+        if !dir.exists() { return; }
 
         let store = Arc::new(InMemoryStore::new());
         let driver = Arc::new(LocalDriver::new());
+        let req = ReconcileRequest { enclaves_dir: dir, dry_run: false };
 
-        let req = ReconcileRequest {
-            enclaves_dir: dir.clone(),
-            dry_run: false,
-        };
+        let report = reconcile(req, store.clone(), driver).await.unwrap();
+        assert!(report.errors.is_empty(), "expected no errors: {:?}", report.errors);
 
-        let report = reconcile(req, store.clone(), driver.clone()).await.unwrap();
-        assert!(!report.dry_run);
-        assert!(!report.changes.is_empty());
-
-        // State must have been persisted
-        let enclaves = store.list_enclaves().await.unwrap();
-        assert!(!enclaves.is_empty(), "apply should persist state");
+        for enc_state in store.list_enclaves().await.unwrap() {
+            assert_eq!(
+                enc_state.meta.status,
+                ProvisioningStatus::Active,
+                "enclave {} should be Active",
+                enc_state.desired.id
+            );
+            assert!(enc_state.meta.created_at.is_some());
+            assert!(enc_state.meta.desired_hash.is_some());
+            for (pid, ps) in &enc_state.partitions {
+                assert_eq!(
+                    ps.meta.status,
+                    ProvisioningStatus::Active,
+                    "partition {} should be Active",
+                    pid
+                );
+                assert!(ps.meta.created_at.is_some());
+            }
+        }
     }
 
     #[tokio::test]
-    async fn idempotent_apply() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../enclaves");
-        if !dir.exists() {
-            return;
-        }
+    async fn idempotent_apply_skips_unchanged() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../enclaves");
+        if !dir.exists() { return; }
 
         let store = Arc::new(InMemoryStore::new());
         let driver = Arc::new(LocalDriver::new());
+        let req = ReconcileRequest { enclaves_dir: dir.clone(), dry_run: false };
 
-        let req = ReconcileRequest {
-            enclaves_dir: dir.clone(),
-            dry_run: false,
-        };
-
-        // First apply
         reconcile(req.clone(), store.clone(), driver.clone()).await.unwrap();
-
-        // Second apply — should find fewer (or zero) changes
         let report2 = reconcile(req, store.clone(), driver).await.unwrap();
-        // Changes related to already-provisioned items should be empty/minimal
-        let creates: Vec<_> = report2
-            .changes
-            .iter()
+
+        // No creates on second run — hash-matched resources are skipped
+        let creates: Vec<_> = report2.changes.iter()
             .filter(|c| matches!(c, Change::EnclaveCreated { .. }))
             .collect();
-        assert!(
-            creates.is_empty(),
-            "second apply should not create enclaves again"
-        );
+        assert!(creates.is_empty(), "second apply should not create enclaves again");
     }
 }

@@ -5,7 +5,7 @@ use nclav_domain::{Enclave, Export, Import, Partition};
 use serde_json::json;
 use tracing::debug;
 
-use crate::driver::{Driver, ProvisionResult};
+use crate::driver::{Driver, ObservedState, ProvisionResult};
 use crate::error::DriverError;
 use crate::Handle;
 
@@ -160,6 +160,45 @@ impl Driver for LocalDriver {
         };
 
         Ok(ProvisionResult { handle, outputs })
+    }
+
+    async fn observe_enclave(
+        &self,
+        enclave: &Enclave,
+        handle: &Handle,
+    ) -> Result<ObservedState, DriverError> {
+        debug!(enclave_id = %enclave.id, "LocalDriver: observe_enclave");
+        Ok(ObservedState {
+            exists: true,
+            healthy: true,
+            outputs: HashMap::new(),
+            raw: handle.clone(),
+        })
+    }
+
+    async fn observe_partition(
+        &self,
+        _enclave: &Enclave,
+        partition: &Partition,
+        handle: &Handle,
+    ) -> Result<ObservedState, DriverError> {
+        debug!(partition_id = %partition.id, "LocalDriver: observe_partition");
+        // Reconstruct the stubbed outputs the same way provision_partition does.
+        let mut outputs = HashMap::new();
+        if let Some(produces) = &partition.produces {
+            for key in produces.required_outputs() {
+                outputs.insert(
+                    key.to_string(),
+                    format!("local://{}/{}", partition.id.as_str(), key),
+                );
+            }
+        }
+        Ok(ObservedState {
+            exists: true,
+            healthy: true,
+            outputs,
+            raw: handle.clone(),
+        })
     }
 }
 

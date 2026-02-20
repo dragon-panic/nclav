@@ -5,8 +5,9 @@ use anyhow::{Context, Result};
 use nclav_config::load_enclaves;
 use nclav_driver::LocalDriver;
 use nclav_graph::validate;
+use nclav_driver::Driver;
 use nclav_reconciler::{reconcile, ReconcileRequest};
-use nclav_store::InMemoryStore;
+use nclav_store::{EnclaveState, InMemoryStore, StateStore};
 
 use crate::cli::{CloudArg, GraphOutput};
 use crate::output;
@@ -46,9 +47,18 @@ pub async fn apply(enclaves_dir: PathBuf, remote: Option<String>) -> Result<()> 
     if let Some(url) = remote {
         remote_reconcile(&url, &enclaves_dir, false).await
     } else {
-        let report = in_process_reconcile(&enclaves_dir, false).await?;
+        let (store, report) = in_process_reconcile_with_store(&enclaves_dir, false).await?;
         print!("{}", output::render_changes(&report.changes));
         println!("Applied {} change(s).", report.changes.len());
+        if !report.errors.is_empty() {
+            eprintln!("\n{} error(s) during apply:", report.errors.len());
+            for e in &report.errors {
+                eprintln!("  ! {}", e);
+            }
+        }
+        let states = store.list_enclaves().await.context("Failed to read store")?;
+        println!("\nStatus after apply:");
+        print!("{}", output::render_status(&states));
         Ok(())
     }
 }
@@ -97,19 +107,43 @@ pub async fn graph(
     remote: Option<String>,
 ) -> Result<()> {
     if let Some(url) = remote {
-        let path = if let Some(ref enc) = filter_enclave {
-            format!("{}/enclaves/{}/graph", url.trim_end_matches('/'), enc)
-        } else {
-            format!("{}/graph", url.trim_end_matches('/'))
-        };
         let client = reqwest::Client::new();
-        let resp = client
-            .get(&path)
-            .send()
-            .await
-            .context("Failed to reach remote server")?;
-        let body: serde_json::Value = resp.json().await?;
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        let filter = filter_enclave.as_deref();
+
+        match output_format {
+            GraphOutput::Json => {
+                // Fetch the system-level graph JSON as-is
+                let path = if let Some(enc) = filter {
+                    format!("{}/enclaves/{}/graph", url.trim_end_matches('/'), enc)
+                } else {
+                    format!("{}/graph", url.trim_end_matches('/'))
+                };
+                let body: serde_json::Value = client
+                    .get(&path)
+                    .send()
+                    .await
+                    .context("Failed to reach remote server")?
+                    .json()
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&body)?);
+            }
+            GraphOutput::Text | GraphOutput::Dot => {
+                // Fetch full enclave states and render with live functions
+                let states: Vec<EnclaveState> = client
+                    .get(format!("{}/enclaves", url.trim_end_matches('/')))
+                    .send()
+                    .await
+                    .context("Failed to reach remote server")?
+                    .json()
+                    .await
+                    .context("Failed to deserialize enclave states")?;
+                match output_format {
+                    GraphOutput::Text => print!("{}", output::render_graph_text_live(&states, filter)),
+                    GraphOutput::Dot => println!("{}", output::render_dot_live(&states, filter)),
+                    GraphOutput::Json => unreachable!(),
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -140,19 +174,29 @@ pub async fn graph(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-async fn in_process_reconcile(
+/// Run reconcile in-process, returning the live store alongside the report.
+async fn in_process_reconcile_with_store(
     enclaves_dir: &PathBuf,
     dry_run: bool,
-) -> Result<nclav_reconciler::ReconcileReport> {
-    let store = Arc::new(InMemoryStore::new());
-    let driver = Arc::new(LocalDriver::new());
+) -> Result<(Arc<dyn StateStore>, nclav_reconciler::ReconcileReport)> {
+    let store: Arc<dyn StateStore> = Arc::new(InMemoryStore::new());
+    let driver: Arc<dyn Driver> = Arc::new(LocalDriver::new());
     let req = ReconcileRequest {
         enclaves_dir: enclaves_dir.clone(),
         dry_run,
     };
-    reconcile(req, store, driver)
+    let report = reconcile(req, Arc::clone(&store), driver)
         .await
-        .context("Reconcile failed")
+        .context("Reconcile failed")?;
+    Ok((store, report))
+}
+
+async fn in_process_reconcile(
+    enclaves_dir: &PathBuf,
+    dry_run: bool,
+) -> Result<nclav_reconciler::ReconcileReport> {
+    let (_, report) = in_process_reconcile_with_store(enclaves_dir, dry_run).await?;
+    Ok(report)
 }
 
 async fn remote_reconcile(url: &str, enclaves_dir: &PathBuf, dry_run: bool) -> Result<()> {

@@ -6,6 +6,7 @@ use nclav_domain::EnclaveId;
 use nclav_reconciler::{reconcile, ReconcileRequest};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -17,7 +18,6 @@ pub async fn health() -> StatusCode {
 }
 
 pub async fn ready(State(state): State<AppState>) -> Result<StatusCode, ApiError> {
-    // Probe the store by listing enclaves
     state.store.list_enclaves().await?;
     Ok(StatusCode::OK)
 }
@@ -33,10 +33,7 @@ pub async fn post_reconcile(
     State(state): State<AppState>,
     Json(body): Json<ReconcileBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let req = ReconcileRequest {
-        enclaves_dir: body.enclaves_dir.into(),
-        dry_run: false,
-    };
+    let req = ReconcileRequest { enclaves_dir: body.enclaves_dir.into(), dry_run: false };
     let report = reconcile(req, state.store, state.driver).await?;
     Ok(Json(json!(report)))
 }
@@ -45,10 +42,7 @@ pub async fn post_reconcile_dry_run(
     State(state): State<AppState>,
     Json(body): Json<ReconcileBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let req = ReconcileRequest {
-        enclaves_dir: body.enclaves_dir.into(),
-        dry_run: true,
-    };
+    let req = ReconcileRequest { enclaves_dir: body.enclaves_dir.into(), dry_run: true };
     let report = reconcile(req, state.store, state.driver).await?;
     Ok(Json(json!(report)))
 }
@@ -78,21 +72,27 @@ pub async fn get_enclave_graph(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let eid = EnclaveId::new(&id);
-    let enclave_state = state
+    let enc_state = state
         .store
         .get_enclave(&eid)
         .await?
         .ok_or_else(|| ApiError::not_found(format!("enclave '{}' not found", eid)))?;
 
-    let enc = &enclave_state.desired;
+    let enc = &enc_state.desired;
     let nodes: Vec<Value> = enc
         .partitions
         .iter()
         .map(|p| {
+            let part_status = enc_state
+                .partitions
+                .get(&p.id)
+                .map(|ps| ps.meta.status.to_string())
+                .unwrap_or_else(|| "pending".to_string());
             json!({
                 "id": p.id,
                 "name": p.name,
                 "produces": p.produces,
+                "status": part_status,
             })
         })
         .collect();
@@ -111,6 +111,7 @@ pub async fn get_enclave_graph(
 
     Ok(Json(json!({
         "enclave": id,
+        "status": enc_state.meta.status,
         "nodes": nodes,
         "edges": edges,
     })))
@@ -118,18 +119,35 @@ pub async fn get_enclave_graph(
 
 pub async fn get_system_graph(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let all = state.store.list_enclaves().await?;
+
     let nodes: Vec<Value> = all
         .iter()
         .map(|s| {
+            let partitions: Vec<Value> = s.desired.partitions.iter().map(|p| {
+                let part_status = s.partitions.get(&p.id)
+                    .map(|ps| ps.meta.status.to_string())
+                    .unwrap_or_else(|| "pending".to_string());
+                json!({
+                    "id": p.id,
+                    "name": p.name,
+                    "produces": p.produces,
+                    "status": part_status,
+                })
+            }).collect();
+
             json!({
                 "id": s.desired.id,
                 "name": s.desired.name,
                 "cloud": s.desired.cloud,
+                "status": s.meta.status,
+                "created_at": s.meta.created_at,
+                "updated_at": s.meta.updated_at,
+                "last_error": s.meta.last_error,
+                "partitions": partitions,
             })
         })
         .collect();
 
-    // Wiring: collect all cross-enclave imports
     let mut edges: Vec<Value> = Vec::new();
     for s in &all {
         for import in &s.desired.imports {
@@ -169,8 +187,7 @@ pub async fn list_events(
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let eid = q.enclave_id.as_deref().map(EnclaveId::new);
-    let limit = q.limit.unwrap_or(100);
-    let events = state.store.list_events(eid.as_ref(), limit).await?;
+    let events = state.store.list_events(eid.as_ref(), q.limit.unwrap_or(100)).await?;
     Ok(Json(json!(events)))
 }
 
@@ -178,14 +195,38 @@ pub async fn list_events(
 
 pub async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let enclaves = state.store.list_enclaves().await?;
-    let total = enclaves.len();
-    let last_reconciled = enclaves
-        .iter()
-        .filter_map(|s| s.last_reconciled_at)
-        .max();
+
+    let mut by_status: HashMap<String, usize> = HashMap::new();
+    let mut errors: Vec<Value> = Vec::new();
+
+    for s in &enclaves {
+        *by_status.entry(s.meta.status.to_string()).or_default() += 1;
+
+        if let Some(err) = &s.meta.last_error {
+            errors.push(json!({
+                "enclave_id": s.desired.id,
+                "message": err.message,
+                "occurred_at": err.occurred_at,
+            }));
+        }
+        for (pid, ps) in &s.partitions {
+            if let Some(err) = &ps.meta.last_error {
+                errors.push(json!({
+                    "enclave_id": s.desired.id,
+                    "partition_id": pid,
+                    "message": err.message,
+                    "occurred_at": err.occurred_at,
+                }));
+            }
+        }
+    }
+
+    let last_reconciled_at = enclaves.iter().filter_map(|s| s.meta.updated_at).max();
 
     Ok(Json(json!({
-        "enclave_count": total,
-        "last_reconciled_at": last_reconciled,
+        "enclave_count": enclaves.len(),
+        "by_status": by_status,
+        "last_reconciled_at": last_reconciled_at,
+        "errors": errors,
     })))
 }

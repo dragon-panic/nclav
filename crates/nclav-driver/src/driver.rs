@@ -15,9 +15,26 @@ pub struct ProvisionResult {
     pub outputs: HashMap<String, String>,
 }
 
+/// Read-only snapshot of a resource as it exists in the cloud right now.
+/// Returned by observe_* methods; never modifies cloud state.
+#[derive(Debug, Clone)]
+pub struct ObservedState {
+    /// Whether the resource exists at all in the cloud.
+    pub exists: bool,
+    /// Whether the resource is healthy (exists and passing health checks).
+    pub healthy: bool,
+    /// Current output values read from the cloud (may differ from stored outputs
+    /// if cloud drift has occurred).
+    pub outputs: HashMap<String, String>,
+    /// Full cloud API response, stored opaquely for debugging.
+    pub raw: Handle,
+}
+
 #[async_trait]
 pub trait Driver: Send + Sync + 'static {
     fn name(&self) -> &'static str;
+
+    // ── Mutating ──────────────────────────────────────────────────────────────
 
     async fn provision_enclave(
         &self,
@@ -61,4 +78,23 @@ pub trait Driver: Send + Sync + 'static {
         export_handle: &Handle,
         existing: Option<&Handle>,
     ) -> Result<ProvisionResult, DriverError>;
+
+    // ── Read-only (drift detection) ───────────────────────────────────────────
+
+    /// Read the current state of an enclave from the cloud without modifying
+    /// anything. Called by the drift detection path.
+    async fn observe_enclave(
+        &self,
+        enclave: &Enclave,
+        handle: &Handle,
+    ) -> Result<ObservedState, DriverError>;
+
+    /// Read the current state of a partition from the cloud without modifying
+    /// anything.
+    async fn observe_partition(
+        &self,
+        enclave: &Enclave,
+        partition: &Partition,
+        handle: &Handle,
+    ) -> Result<ObservedState, DriverError>;
 }

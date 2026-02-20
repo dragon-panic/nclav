@@ -2,7 +2,7 @@ pub mod driver;
 pub mod local;
 pub mod error;
 
-pub use driver::{Driver, ProvisionResult};
+pub use driver::{Driver, ObservedState, ProvisionResult};
 pub use local::LocalDriver;
 pub use error::DriverError;
 
