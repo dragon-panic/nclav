@@ -211,7 +211,7 @@ mod tests {
         Enclave {
             id: EnclaveId::new("test"),
             name: "test".to_string(),
-            cloud: CloudTarget::Local,
+            cloud: None,
             region: "local".to_string(),
             identity: None,
             network: None,

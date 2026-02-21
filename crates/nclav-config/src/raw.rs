@@ -6,7 +6,8 @@ use std::collections::HashMap;
 pub struct RawEnclave {
     pub id: String,
     pub name: String,
-    pub cloud: String,
+    /// Optional cloud target; absent means inherit the API's default cloud.
+    pub cloud: Option<String>,
     pub region: String,
     pub identity: Option<String>,
     pub network: Option<RawNetwork>,

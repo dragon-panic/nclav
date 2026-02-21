@@ -1,3 +1,4 @@
+use nclav_domain::CloudTarget;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -10,4 +11,7 @@ pub enum DriverError {
 
     #[error("internal driver error: {0}")]
     Internal(String),
+
+    #[error("driver not configured for cloud: {0}")]
+    DriverNotConfigured(CloudTarget),
 }

@@ -34,7 +34,7 @@ pub async fn post_reconcile(
     Json(body): Json<ReconcileBody>,
 ) -> Result<Json<Value>, ApiError> {
     let req = ReconcileRequest { enclaves_dir: body.enclaves_dir.into(), dry_run: false };
-    let report = reconcile(req, state.store, state.driver).await?;
+    let report = reconcile(req, state.store, state.registry).await?;
     Ok(Json(json!(report)))
 }
 
@@ -43,7 +43,7 @@ pub async fn post_reconcile_dry_run(
     Json(body): Json<ReconcileBody>,
 ) -> Result<Json<Value>, ApiError> {
     let req = ReconcileRequest { enclaves_dir: body.enclaves_dir.into(), dry_run: true };
-    let report = reconcile(req, state.store, state.driver).await?;
+    let report = reconcile(req, state.store, state.registry).await?;
     Ok(Json(json!(report)))
 }
 
@@ -222,11 +222,19 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiErr
     }
 
     let last_reconciled_at = enclaves.iter().filter_map(|s| s.meta.updated_at).max();
+    let default_cloud = &state.registry.default_cloud;
+    let active_drivers: Vec<String> = {
+        let mut clouds = state.registry.active_clouds();
+        clouds.sort_by_key(|c| c.to_string());
+        clouds.iter().map(|c| c.to_string()).collect()
+    };
 
     Ok(Json(json!({
         "enclave_count": enclaves.len(),
         "by_status": by_status,
         "last_reconciled_at": last_reconciled_at,
         "errors": errors,
+        "default_cloud": default_cloud,
+        "active_drivers": active_drivers,
     })))
 }

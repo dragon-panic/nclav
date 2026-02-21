@@ -17,14 +17,42 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Bootstrap { cloud, gcp_parent, gcp_billing_account, gcp_default_region, gcp_project_prefix, port } => {
-            commands::bootstrap(cloud, cli.remote, gcp_parent, gcp_billing_account, gcp_default_region, gcp_project_prefix, port).await
+        Command::Bootstrap {
+            cloud,
+            ephemeral,
+            rotate_token,
+            store_path,
+            gcp_parent,
+            gcp_billing_account,
+            gcp_default_region,
+            gcp_project_prefix,
+            port,
+            bind,
+        } => {
+            commands::bootstrap(
+                cloud,
+                cli.remote,
+                ephemeral,
+                rotate_token,
+                store_path,
+                gcp_parent,
+                gcp_billing_account,
+                gcp_default_region,
+                gcp_project_prefix,
+                port,
+                bind,
+            )
+            .await
         }
-        Command::Apply { enclaves_dir } => commands::apply(enclaves_dir, cli.remote).await,
-        Command::Diff { enclaves_dir } => commands::diff(enclaves_dir, cli.remote).await,
-        Command::Status => commands::status(cli.remote).await,
+        Command::Apply { enclaves_dir } => {
+            commands::apply(enclaves_dir, cli.remote, cli.token).await
+        }
+        Command::Diff { enclaves_dir } => {
+            commands::diff(enclaves_dir, cli.remote, cli.token).await
+        }
+        Command::Status => commands::status(cli.remote, cli.token).await,
         Command::Graph { output, enclave } => {
-            commands::graph(output, enclave, cli.remote).await
+            commands::graph(output, enclave, cli.remote, cli.token).await
         }
     }
 }

@@ -120,7 +120,7 @@ mod tests {
         EnclaveState::new(Enclave {
             id: EnclaveId::new(id),
             name: id.to_string(),
-            cloud: CloudTarget::Local,
+            cloud: None,
             region: "local".to_string(),
             identity: None,
             network: None,

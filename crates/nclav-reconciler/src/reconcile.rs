@@ -7,7 +7,7 @@ use nclav_store::{
     AuditEvent, EnclaveState, PartitionState, ProvisioningStatus, StateStore,
     compute_desired_hash,
 };
-use nclav_driver::Driver;
+use nclav_driver::DriverRegistry;
 use nclav_graph::validate;
 use uuid::Uuid;
 use tracing::{debug, info, warn};
@@ -18,7 +18,7 @@ use crate::report::{Change, ReconcileReport, ReconcileRequest};
 pub async fn reconcile(
     req: ReconcileRequest,
     store: Arc<dyn StateStore>,
-    driver: Arc<dyn Driver>,
+    registry: Arc<DriverRegistry>,
 ) -> Result<ReconcileReport, ReconcileError> {
     let mut report = ReconcileReport::new(req.dry_run);
 
@@ -161,8 +161,12 @@ pub async fn reconcile(
     // 6. Teardowns for removed enclaves
     for id in actual_ids.difference(&desired_ids) {
         if let Some(existing) = actual_states.get(id) {
-            if let Some(handle) = &existing.enclave_handle {
-                driver.teardown_enclave(&existing.desired, handle).await?;
+            // Use resolved_cloud from persisted state so teardown works after YAML removal
+            let cloud = existing.resolved_cloud.clone().unwrap_or_else(|| registry.default_cloud.clone());
+            if let Ok(driver) = registry.for_cloud(cloud) {
+                if let Some(handle) = &existing.enclave_handle {
+                    driver.teardown_enclave(&existing.desired, handle).await?;
+                }
             }
             store.delete_enclave(id).await?;
         }
@@ -170,6 +174,17 @@ pub async fn reconcile(
 
     // 7. Provision / update in topo order
     for enc in &ordered_desired {
+        // Resolve the driver for this enclave — per-enclave error, not global abort
+        let driver = match registry.for_enclave(enc) {
+            Ok(d) => d,
+            Err(e) => {
+                let msg = e.to_string();
+                warn!(enclave_id = %enc.id, error = %msg, "no driver for enclave cloud");
+                report.errors.push(format!("enclave {}: {}", enc.id, msg));
+                continue;
+            }
+        };
+
         let existing = actual_states.get(&enc.id);
         let enc_hash = compute_desired_hash(enc);
         let _hash_unchanged = existing
@@ -181,6 +196,9 @@ pub async fn reconcile(
             .cloned()
             .unwrap_or_else(|| EnclaveState::new((*enc).clone()));
         enc_state.desired = (*enc).clone();
+
+        // Stamp resolved cloud before the first upsert so teardown always knows which driver to use
+        enc_state.resolved_cloud = Some(registry.resolved_cloud(enc));
 
         // Mark in-flight status before driver call
         enc_state.meta.status = if existing.is_some() {
@@ -342,6 +360,12 @@ pub async fn reconcile(
 
     // 8. Wire cross-enclave imports (second pass, after all enclaves provisioned)
     for enc in &ordered_desired {
+        // Use the importer's driver for import wiring
+        let driver = match registry.for_enclave(enc) {
+            Ok(d) => d,
+            Err(_) => continue, // already logged in step 7
+        };
+
         let mut enc_state = match store.get_enclave(&enc.id).await? {
             Some(s) => s,
             None => continue,
@@ -460,9 +484,20 @@ fn resolve_template(template: &str, enc_state: &EnclaveState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nclav_driver::LocalDriver;
+    use nclav_domain::CloudTarget;
+    use nclav_driver::{DriverRegistry, LocalDriver};
     use nclav_store::{InMemoryStore, ProvisioningStatus};
     use std::path::Path;
+
+    fn test_registry() -> Arc<DriverRegistry> {
+        // Register LocalDriver for both Local and Gcp so fixture YAMLs with
+        // cloud: gcp work in tests without real GCP credentials.
+        let driver = Arc::new(LocalDriver::new());
+        let mut registry = DriverRegistry::new(CloudTarget::Local);
+        registry.register(CloudTarget::Local, driver.clone());
+        registry.register(CloudTarget::Gcp, driver);
+        Arc::new(registry)
+    }
 
     #[tokio::test]
     async fn dry_run_returns_changes_without_persisting() {
@@ -470,10 +505,10 @@ mod tests {
         if !dir.exists() { return; }
 
         let store = Arc::new(InMemoryStore::new());
-        let driver = Arc::new(LocalDriver::new());
+        let registry = test_registry();
         let req = ReconcileRequest { enclaves_dir: dir, dry_run: true };
 
-        let report = reconcile(req, store.clone(), driver).await.unwrap();
+        let report = reconcile(req, store.clone(), registry).await.unwrap();
         assert!(report.dry_run);
         assert!(!report.changes.is_empty());
         assert!(store.list_enclaves().await.unwrap().is_empty(), "dry run must not persist");
@@ -485,10 +520,10 @@ mod tests {
         if !dir.exists() { return; }
 
         let store = Arc::new(InMemoryStore::new());
-        let driver = Arc::new(LocalDriver::new());
+        let registry = test_registry();
         let req = ReconcileRequest { enclaves_dir: dir, dry_run: false };
 
-        let report = reconcile(req, store.clone(), driver).await.unwrap();
+        let report = reconcile(req, store.clone(), registry).await.unwrap();
         assert!(report.errors.is_empty(), "expected no errors: {:?}", report.errors);
 
         for enc_state in store.list_enclaves().await.unwrap() {
@@ -500,6 +535,7 @@ mod tests {
             );
             assert!(enc_state.meta.created_at.is_some());
             assert!(enc_state.meta.desired_hash.is_some());
+            assert!(enc_state.resolved_cloud.is_some(), "resolved_cloud should be set");
             for (pid, ps) in &enc_state.partitions {
                 assert_eq!(
                     ps.meta.status,
@@ -518,11 +554,11 @@ mod tests {
         if !dir.exists() { return; }
 
         let store = Arc::new(InMemoryStore::new());
-        let driver = Arc::new(LocalDriver::new());
+        let registry = test_registry();
         let req = ReconcileRequest { enclaves_dir: dir.clone(), dry_run: false };
 
-        reconcile(req.clone(), store.clone(), driver.clone()).await.unwrap();
-        let report2 = reconcile(req, store.clone(), driver).await.unwrap();
+        reconcile(req.clone(), store.clone(), registry.clone()).await.unwrap();
+        let report2 = reconcile(req, store.clone(), registry).await.unwrap();
 
         // No creates on second run — hash-matched resources are skipped
         let creates: Vec<_> = report2.changes.iter()

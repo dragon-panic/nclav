@@ -9,7 +9,7 @@ fn load_valid_fixture() {
 
     let enc = &enclaves[0];
     assert_eq!(enc.id.as_str(), "test-enclave");
-    assert_eq!(enc.cloud, nclav_domain::CloudTarget::Local);
+    assert_eq!(enc.cloud, Some(nclav_domain::CloudTarget::Local));
 }
 
 #[test]

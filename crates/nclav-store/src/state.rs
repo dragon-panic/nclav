@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use nclav_domain::{Enclave, EnclaveId, Partition, PartitionId};
+use nclav_domain::{CloudTarget, Enclave, EnclaveId, Partition, PartitionId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -205,6 +205,10 @@ pub struct EnclaveState {
     pub import_handles: HashMap<String, Handle>,
     /// Lifecycle and health metadata.
     pub meta: ResourceMeta,
+    /// The cloud target resolved at reconcile time (desired.cloud or the API default).
+    /// Stored so teardown knows which driver to use even after YAML removal.
+    #[serde(default)]
+    pub resolved_cloud: Option<CloudTarget>,
 }
 
 impl EnclaveState {
@@ -216,6 +220,7 @@ impl EnclaveState {
             export_handles: HashMap::new(),
             import_handles: HashMap::new(),
             meta: ResourceMeta::default(),
+            resolved_cloud: None,
         }
     }
 }

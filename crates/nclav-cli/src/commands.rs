@@ -2,8 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use nclav_driver::{Driver, GcpDriver, GcpDriverConfig, LocalDriver};
-use nclav_store::{EnclaveState, InMemoryStore};
+use nclav_domain::CloudTarget;
+use nclav_driver::{DriverRegistry, GcpDriver, GcpDriverConfig, LocalDriver};
+use nclav_store::{EnclaveState, InMemoryStore, RedbStore, StateStore};
+use uuid::Uuid;
 
 use crate::cli::{CloudArg, GraphOutput};
 use crate::output;
@@ -13,31 +15,77 @@ use crate::output;
 pub async fn bootstrap(
     cloud: CloudArg,
     remote: Option<String>,
+    ephemeral: bool,
+    rotate_token: bool,
+    store_path: Option<String>,
     gcp_parent: Option<String>,
     gcp_billing_account: Option<String>,
     gcp_default_region: String,
     gcp_project_prefix: Option<String>,
     port: u16,
+    bind: String,
 ) -> Result<()> {
     if remote.is_some() {
         anyhow::bail!("bootstrap does not support --remote; run the server locally");
     }
+
+    // Reuse existing token unless rotation is explicitly requested.
+    // This means server restarts don't invalidate client configurations.
+    let token_path = default_token_path();
+    let token = if !rotate_token {
+        if let Ok(existing) = std::fs::read_to_string(&token_path).map(|s| s.trim().to_string()) {
+            if !existing.is_empty() {
+                println!("Reusing existing token from {}", token_path.display());
+                existing
+            } else {
+                let t = generate_token();
+                write_token(&token_path, &t)?;
+                println!("Generated new token (written to {})", token_path.display());
+                t
+            }
+        } else {
+            let t = generate_token();
+            write_token(&token_path, &t)?;
+            println!("Generated new token (written to {})", token_path.display());
+            t
+        }
+    } else {
+        let t = generate_token();
+        write_token(&token_path, &t)?;
+        println!("Rotated token (written to {})", token_path.display());
+        println!("New token: {}", t);
+        t
+    };
+
+    let store: Arc<dyn StateStore> = if ephemeral {
+        println!("Using in-memory (ephemeral) store — state will be lost on server stop");
+        Arc::new(InMemoryStore::new())
+    } else {
+        let path = resolve_store_path(store_path);
+        println!("Using persistent store at {}", path.display());
+        Arc::new(
+            RedbStore::open(&path)
+                .with_context(|| format!("Failed to open store at {}", path.display()))?,
+        )
+    };
 
     match cloud {
         CloudArg::Azure => {
             anyhow::bail!("Azure bootstrap not yet implemented");
         }
         CloudArg::Local => {
-            let addr = format!("0.0.0.0:{port}");
-            println!("Starting nclav API server on http://{addr} (in-memory store)");
-            let store = Arc::new(InMemoryStore::new());
-            let driver: Arc<dyn Driver> = Arc::new(LocalDriver::new());
-            let app = nclav_api::build_app(store, driver);
+            let driver = Arc::new(LocalDriver::new());
+            let mut registry = DriverRegistry::new(CloudTarget::Local);
+            registry.register(CloudTarget::Local, driver);
+            let registry = Arc::new(registry);
+
+            let addr = format!("{bind}:{port}");
+            println!("Starting nclav API server on http://{addr} (default cloud: local)");
+            let app = nclav_api::build_app(store, registry, Arc::new(token));
 
             let listener = tokio::net::TcpListener::bind(&addr)
                 .await
-                .with_context(|| format!("Failed to bind to port {port}"))?;
-
+                .with_context(|| format!("Failed to bind to {addr}"))?;
             println!("Listening on http://{addr}");
             axum::serve(listener, app).await.context("Server error")?;
         }
@@ -56,20 +104,25 @@ pub async fn bootstrap(
             };
 
             println!("Initialising GCP driver (ADC)…");
-            let driver: Arc<dyn Driver> = Arc::new(
+            let gcp_driver = Arc::new(
                 GcpDriver::from_adc(config)
                     .await
                     .context("Failed to initialise GCP driver")?,
             );
 
-            let store = Arc::new(InMemoryStore::new());
-            let app = nclav_api::build_app(store, driver);
+            let local_driver = Arc::new(LocalDriver::new());
+            let mut registry = DriverRegistry::new(CloudTarget::Gcp);
+            registry.register(CloudTarget::Gcp, gcp_driver);
+            registry.register(CloudTarget::Local, local_driver);
+            let registry = Arc::new(registry);
 
-            let addr = format!("0.0.0.0:{port}");
-            println!("Starting nclav API server on http://{addr} (GCP driver)");
+            let addr = format!("{bind}:{port}");
+            println!("Starting nclav API server on http://{addr} (default cloud: gcp)");
+            let app = nclav_api::build_app(store, registry, Arc::new(token));
+
             let listener = tokio::net::TcpListener::bind(&addr)
                 .await
-                .with_context(|| format!("Failed to bind to port {port}"))?;
+                .with_context(|| format!("Failed to bind to {addr}"))?;
             println!("Listening on http://{addr}");
             axum::serve(listener, app).await.context("Server error")?;
         }
@@ -80,27 +133,49 @@ pub async fn bootstrap(
 
 // ── Apply ─────────────────────────────────────────────────────────────────────
 
-pub async fn apply(enclaves_dir: PathBuf, remote: Option<String>) -> Result<()> {
-    api_reconcile(&server_url(remote), &enclaves_dir, false).await
+pub async fn apply(
+    enclaves_dir: PathBuf,
+    remote: Option<String>,
+    token: Option<String>,
+) -> Result<()> {
+    let token = resolve_token(token)?;
+    api_reconcile(&server_url(remote), &enclaves_dir, false, &token).await
 }
 
 // ── Diff ──────────────────────────────────────────────────────────────────────
 
-pub async fn diff(enclaves_dir: PathBuf, remote: Option<String>) -> Result<()> {
-    api_reconcile(&server_url(remote), &enclaves_dir, true).await
+pub async fn diff(
+    enclaves_dir: PathBuf,
+    remote: Option<String>,
+    token: Option<String>,
+) -> Result<()> {
+    let token = resolve_token(token)?;
+    api_reconcile(&server_url(remote), &enclaves_dir, true, &token).await
 }
 
 // ── Status ────────────────────────────────────────────────────────────────────
 
-pub async fn status(remote: Option<String>) -> Result<()> {
+pub async fn status(remote: Option<String>, token: Option<String>) -> Result<()> {
+    let token = resolve_token(token)?;
     let url = server_url(remote);
-    let client = reqwest::Client::new();
-    let resp = client
+    let body: serde_json::Value = authed_client(&token)
         .get(format!("{}/status", url.trim_end_matches('/')))
         .send()
         .await
-        .with_context(|| format!("Failed to reach server at {url}"))?;
-    let body: serde_json::Value = resp.json().await?;
+        .with_context(|| format!("Failed to reach server at {url}"))?
+        .json()
+        .await?;
+
+    if let Some(count) = body.get("enclave_count").and_then(|v| v.as_u64()) {
+        println!("Enclaves: {}", count);
+    }
+    if let Some(cloud) = body.get("default_cloud").and_then(|v| v.as_str()) {
+        println!("Default cloud: {}", cloud);
+    }
+    if let Some(drivers) = body.get("active_drivers").and_then(|v| v.as_array()) {
+        let names: Vec<&str> = drivers.iter().filter_map(|d| d.as_str()).collect();
+        println!("Active drivers: {}", names.join(", "));
+    }
     println!("{}", serde_json::to_string_pretty(&body)?);
     Ok(())
 }
@@ -111,9 +186,11 @@ pub async fn graph(
     output_format: GraphOutput,
     filter_enclave: Option<String>,
     remote: Option<String>,
+    token: Option<String>,
 ) -> Result<()> {
+    let token = resolve_token(token)?;
     let url = server_url(remote);
-    let client = reqwest::Client::new();
+    let client = authed_client(&token);
     let filter = filter_enclave.as_deref();
 
     match output_format {
@@ -152,33 +229,113 @@ pub async fn graph(
     Ok(())
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Token helpers ─────────────────────────────────────────────────────────────
 
-/// Resolve the server URL: explicit --remote / NCLAV_URL, or the local default.
+/// Generate a cryptographically random token as a 64-character hex string.
+fn generate_token() -> String {
+    let a = Uuid::new_v4().to_string().replace('-', "");
+    let b = Uuid::new_v4().to_string().replace('-', "");
+    format!("{}{}", a, b)
+}
+
+/// Resolve the token to use for API calls.
+///
+/// Priority: explicit value (from --token / NCLAV_TOKEN) → ~/.nclav/token file
+fn resolve_token(explicit: Option<String>) -> Result<String> {
+    if let Some(t) = explicit {
+        return Ok(t);
+    }
+    let path = default_token_path();
+    std::fs::read_to_string(&path)
+        .map(|s| s.trim().to_string())
+        .with_context(|| {
+            format!(
+                "No token provided and could not read token file at {}. \
+                 Use --token, NCLAV_TOKEN, or run `nclav bootstrap` first.",
+                path.display()
+            )
+        })
+}
+
+/// Write the token to the token file with owner-only permissions.
+fn write_token(path: &PathBuf, token: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+    }
+    std::fs::write(path, token)
+        .with_context(|| format!("Failed to write token to {}", path.display()))?;
+
+    // Set owner-only read/write permissions (unix only)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to set permissions on {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+/// Default path for the token file.
+fn default_token_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".nclav").join("token")
+}
+
+/// Build a reqwest Client with the Authorization header pre-configured.
+fn authed_client(token: &str) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    let bearer = format!("Bearer {}", token);
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        reqwest::header::HeaderValue::from_str(&bearer)
+            .expect("token contains invalid header characters"),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("failed to build HTTP client")
+}
+
+// ── Other helpers ─────────────────────────────────────────────────────────────
+
 fn server_url(remote: Option<String>) -> String {
     remote.unwrap_or_else(|| "http://localhost:8080".into())
 }
 
-async fn api_reconcile(url: &str, enclaves_dir: &PathBuf, dry_run: bool) -> Result<()> {
+fn resolve_store_path(store_path: Option<String>) -> PathBuf {
+    if let Some(p) = store_path {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".nclav").join("state.redb")
+}
+
+async fn api_reconcile(
+    url: &str,
+    enclaves_dir: &PathBuf,
+    dry_run: bool,
+    token: &str,
+) -> Result<()> {
     let endpoint = if dry_run {
         format!("{}/reconcile/dry-run", url.trim_end_matches('/'))
     } else {
         format!("{}/reconcile", url.trim_end_matches('/'))
     };
 
-    let client = reqwest::Client::new();
     let body = serde_json::json!({
         "enclaves_dir": enclaves_dir.display().to_string(),
     });
 
-    let resp = client
+    let report: serde_json::Value = authed_client(token)
         .post(&endpoint)
         .json(&body)
         .send()
         .await
-        .with_context(|| format!("Failed to reach server at {url}"))?;
-
-    let report: serde_json::Value = resp.json().await?;
+        .with_context(|| format!("Failed to reach server at {url}"))?
+        .json()
+        .await?;
 
     if let Some(changes) = report.get("changes").and_then(|c| c.as_array()) {
         for c in changes {

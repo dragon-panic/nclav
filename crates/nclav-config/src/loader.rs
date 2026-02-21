@@ -53,7 +53,8 @@ fn collect_enclaves(dir: &Path, out: &mut Vec<Enclave>) -> Result<(), ConfigErro
             path: config_path.display().to_string(),
             source: e,
         })?;
-        // Check if it looks like an enclave (has `cloud` field)
+        // Heuristic: a file is an enclave config if it has the required `id` field
+        // (cloud is optional — absent means inherit the API's default cloud)
         if let Ok(raw) = serde_yaml::from_str::<RawEnclave>(&content) {
             debug!("Loading enclave from {}", config_path.display());
             let enclave = convert_enclave(raw, dir, &config_path)?;
@@ -80,7 +81,7 @@ fn convert_enclave(
     dir: &Path,
     config_path: &Path,
 ) -> Result<Enclave, ConfigError> {
-    let cloud = parse_cloud(&raw.cloud, config_path)?;
+    let cloud = raw.cloud.as_deref().map(|s| parse_cloud(s, config_path)).transpose()?;
     let imports = raw
         .imports
         .into_iter()

@@ -13,9 +13,10 @@ pub fn render_dot_live(states: &[EnclaveState], filter_enclave: Option<&str>) ->
             }
         }
         let enc = &s.desired;
+        let cloud_tag = s.resolved_cloud.as_ref().map(|c| format!(" [{}]", c)).unwrap_or_default();
         out.push_str(&format!(
-            "  subgraph cluster_{} {{\n    label=\"{} [{}]\";\n",
-            sanitize(&enc.id.0), enc.name, s.meta.status,
+            "  subgraph cluster_{} {{\n    label=\"{}{} [{}]\";\n",
+            sanitize(&enc.id.0), enc.name, cloud_tag, s.meta.status,
         ));
         for part in &enc.partitions {
             let pstatus = s.partitions.get(&part.id)
@@ -61,9 +62,10 @@ pub fn render_graph_text_live(states: &[EnclaveState], filter_enclave: Option<&s
             }
         }
         let enc = &s.desired;
+        let cloud_tag = s.resolved_cloud.as_ref().map(|c| format!(" [{}]", c)).unwrap_or_default();
         out.push_str(&format!(
-            "Enclave: {} ({}) [{}]\n",
-            enc.name, enc.id, s.meta.status
+            "Enclave: {}{} ({}) [{}]\n",
+            enc.name, cloud_tag, enc.id, s.meta.status
         ));
         if let Some(err) = &s.meta.last_error {
             out.push_str(&format!("  ! error: {}\n", err.message));

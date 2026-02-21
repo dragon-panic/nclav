@@ -43,12 +43,22 @@ impl std::fmt::Display for PartitionId {
 
 // ── Enums ─────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CloudTarget {
     Local,
     Gcp,
     Azure,
+}
+
+impl std::fmt::Display for CloudTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CloudTarget::Local => write!(f, "local"),
+            CloudTarget::Gcp => write!(f, "gcp"),
+            CloudTarget::Azure => write!(f, "azure"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,7 +223,8 @@ pub struct DnsConfig {
 pub struct Enclave {
     pub id: EnclaveId,
     pub name: String,
-    pub cloud: CloudTarget,
+    /// Cloud target for this enclave. None means inherit the API's default cloud.
+    pub cloud: Option<CloudTarget>,
     pub region: String,
     pub identity: Option<String>,
     pub network: Option<NetworkConfig>,

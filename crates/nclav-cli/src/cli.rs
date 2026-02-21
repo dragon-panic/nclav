@@ -13,6 +13,10 @@ pub struct Cli {
     #[arg(long, env = "NCLAV_URL", global = true)]
     pub remote: Option<String>,
 
+    /// API bearer token. Falls back to reading ~/.nclav/token. Env: NCLAV_TOKEN
+    #[arg(long, env = "NCLAV_TOKEN", global = true)]
+    pub token: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -24,6 +28,21 @@ pub enum Command {
         /// Cloud target to initialise for.
         #[arg(long, default_value = "local")]
         cloud: CloudArg,
+
+        /// Use an in-memory (ephemeral) store instead of persisting to disk.
+        /// State is lost when the server stops.
+        #[arg(long)]
+        ephemeral: bool,
+
+        /// Force generation of a new API token, replacing any existing one.
+        /// By default the existing token is reused so restarts don't invalidate clients.
+        #[arg(long)]
+        rotate_token: bool,
+
+        /// Path to the redb state file. Defaults to ~/.nclav/state.redb.
+        /// Ignored when --ephemeral is set. Env: NCLAV_STORE_PATH
+        #[arg(long, env = "NCLAV_STORE_PATH")]
+        store_path: Option<String>,
 
         /// GCP parent resource ("folders/123" or "organizations/456").
         /// Required when --cloud gcp. Env: NCLAV_GCP_PARENT
@@ -48,6 +67,11 @@ pub enum Command {
         /// TCP port to bind the HTTP API server on. Env: NCLAV_PORT
         #[arg(long, env = "NCLAV_PORT", default_value = "8080")]
         port: u16,
+
+        /// Address to bind the HTTP API server on. Defaults to 127.0.0.1 (loopback only).
+        /// Use 0.0.0.0 to expose on all interfaces. Env: NCLAV_BIND
+        #[arg(long, env = "NCLAV_BIND", default_value = "127.0.0.1")]
+        bind: String,
     },
 
     /// Reconcile and apply all changes.

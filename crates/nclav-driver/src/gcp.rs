@@ -1301,7 +1301,7 @@ mod tests {
         Enclave {
             id:         EnclaveId::new("test-proj"),
             name:       "Test Project".into(),
-            cloud:      CloudTarget::Local,
+            cloud:      Some(CloudTarget::Gcp),
             region:     "us-central1".into(),
             identity:   None,
             network:    None,
@@ -1837,7 +1837,7 @@ mod tests {
         let importer = Enclave {
             id:         EnclaveId::new("importer-proj"),
             name:       "Importer".into(),
-            cloud:      CloudTarget::Local,
+            cloud:      Some(CloudTarget::Gcp),
             region:     "us-central1".into(),
             identity:   None,
             network:    None,
