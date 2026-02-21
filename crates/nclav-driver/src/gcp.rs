@@ -660,7 +660,7 @@ impl Driver for GcpDriver {
                     "{}/v2/projects/{}/locations/{}/services?serviceId={}",
                     self.base.run, project_id, region, partition_id
                 );
-                let op = self
+                match self
                     .post_json(
                         &url,
                         &token,
@@ -672,15 +672,22 @@ impl Driver for GcpDriver {
                             "ingress": "INGRESS_TRAFFIC_INTERNAL_ONLY",
                         }),
                     )
-                    .await?;
-
-                // Poll the operation if it isn't immediately done
-                if op.get("done").is_some() && !op["done"].as_bool().unwrap_or(true) {
-                    let op_name = op["name"]
-                        .as_str()
-                        .ok_or_else(|| DriverError::ProvisionFailed("Cloud Run op: no name".into()))?;
-                    let op_url = format!("{}/v2/{}", self.base.run, op_name);
-                    self.wait_for_operation(&op_url).await?;
+                    .await
+                {
+                    Ok(op) => {
+                        // Poll the operation if it isn't immediately done
+                        if op.get("done").is_some() && !op["done"].as_bool().unwrap_or(true) {
+                            let op_name = op["name"].as_str().ok_or_else(|| {
+                                DriverError::ProvisionFailed("Cloud Run op: no name".into())
+                            })?;
+                            let op_url = format!("{}/v2/{}", self.base.run, op_name);
+                            self.wait_for_operation(&op_url).await?;
+                        }
+                    }
+                    Err(e) if e.to_string().to_lowercase().contains("already exists") => {
+                        info!(project_id, partition_id, "Cloud Run service already exists, fetching existing");
+                    }
+                    Err(e) => return Err(e),
                 }
 
                 // Fetch the service to read the generated URL
@@ -1729,6 +1736,43 @@ mod tests {
             .await;
 
         // GET service (for URL)
+        Mock::given(method("GET"))
+            .and(path("/v2/projects/test-proj/locations/us-central1/services/api"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "uri":        "https://api-hash-uc.a.run.app",
+                "conditions": [{ "type": "Ready", "status": "True" }],
+            })))
+            .mount(&server)
+            .await;
+
+        let result = driver(&server)
+            .provision_partition(&dummy_enclave(), &http_partition(), &HashMap::new(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.handle["type"], "cloud_run");
+        assert_eq!(result.outputs["hostname"], "api-hash-uc.a.run.app");
+        assert_eq!(result.outputs["port"], "443");
+    }
+
+    #[tokio::test]
+    async fn provision_partition_http_already_exists_is_idempotent() {
+        let server = MockServer::start().await;
+
+        // POST → ALREADY_EXISTS (service was created in a previous run)
+        Mock::given(method("POST"))
+            .and(path("/v2/projects/test-proj/locations/us-central1/services"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": {
+                    "code":    409,
+                    "status":  "ALREADY_EXISTS",
+                    "message": "Resource 'api' already exists.",
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        // GET service (fetched to retrieve the URL after ALREADY_EXISTS)
         Mock::given(method("GET"))
             .and(path("/v2/projects/test-proj/locations/us-central1/services/api"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
