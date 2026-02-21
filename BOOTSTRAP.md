@@ -48,11 +48,31 @@ modes covering different operator needs:
 |---|---|---|---|
 | Ephemeral | `--ephemeral` | In-memory; lost on restart | CI, quick tests, throwaway runs |
 | Persistent | *(default)* | redb at `~/.nclav/state.redb` | Daily single-operator dev |
-| Postgres | `--store postgres --store-url <url>` | External Postgres | Multi-operator or production-local |
 
-Local bootstrap always registers LocalDriver. If GCP credentials and config are
-also provided (via flags or env vars), GcpDriver is registered too — enabling
-enclaves with `cloud: gcp` to provision into GCP from a locally-running API.
+Every driver must be explicitly opted in — nothing is registered automatically. The
+default cloud (`--cloud`) registers its driver; additional drivers require `--enable-cloud`:
+
+```bash
+# local only (default)
+nclav bootstrap --cloud local
+
+# local default + GCP also available for mixed enclaves
+nclav bootstrap --cloud local \
+  --enable-cloud gcp \
+  --gcp-parent folders/123 \
+  --gcp-billing-account billingAccounts/XXX
+
+# GCP default only (no local unless explicitly requested)
+nclav bootstrap --cloud gcp \
+  --gcp-parent folders/123 \
+  --gcp-billing-account billingAccounts/XXX
+
+# GCP default + local also available
+nclav bootstrap --cloud gcp \
+  --gcp-parent folders/123 \
+  --gcp-billing-account billingAccounts/XXX \
+  --enable-cloud local
+```
 
 ---
 

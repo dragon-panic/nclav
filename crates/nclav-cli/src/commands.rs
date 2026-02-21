@@ -14,12 +14,13 @@ use crate::output;
 
 pub async fn bootstrap(
     cloud: CloudArg,
+    enable_cloud: Vec<CloudArg>,
     remote: Option<String>,
     ephemeral: bool,
     rotate_token: bool,
     store_path: Option<String>,
-    gcp_parent: Option<String>,
-    gcp_billing_account: Option<String>,
+    mut gcp_parent: Option<String>,
+    mut gcp_billing_account: Option<String>,
     gcp_default_region: String,
     gcp_project_prefix: Option<String>,
     port: u16,
@@ -69,66 +70,73 @@ pub async fn bootstrap(
         )
     };
 
-    match cloud {
-        CloudArg::Azure => {
-            anyhow::bail!("Azure bootstrap not yet implemented");
-        }
-        CloudArg::Local => {
-            let driver = Arc::new(LocalDriver::new());
-            let mut registry = DriverRegistry::new(CloudTarget::Local);
-            registry.register(CloudTarget::Local, driver);
-            let registry = Arc::new(registry);
-
-            let addr = format!("{bind}:{port}");
-            println!("Starting nclav API server on http://{addr} (default cloud: local)");
-            let app = nclav_api::build_app(store, registry, Arc::new(token));
-
-            let listener = tokio::net::TcpListener::bind(&addr)
-                .await
-                .with_context(|| format!("Failed to bind to {addr}"))?;
-            println!("Listening on http://{addr}");
-            axum::serve(listener, app).await.context("Server error")?;
-        }
-        CloudArg::Gcp => {
-            let parent = gcp_parent
-                .context("--gcp-parent (or NCLAV_GCP_PARENT) is required for --cloud gcp")?;
-            let billing_account = gcp_billing_account.context(
-                "--gcp-billing-account (or NCLAV_GCP_BILLING_ACCOUNT) is required for --cloud gcp",
-            )?;
-
-            let config = GcpDriverConfig {
-                parent,
-                billing_account,
-                default_region: gcp_default_region,
-                project_prefix: gcp_project_prefix,
-            };
-
-            println!("Initialising GCP driver (ADC)…");
-            let gcp_driver = Arc::new(
-                GcpDriver::from_adc(config)
-                    .await
-                    .context("Failed to initialise GCP driver")?,
-            );
-
-            let local_driver = Arc::new(LocalDriver::new());
-            let mut registry = DriverRegistry::new(CloudTarget::Gcp);
-            registry.register(CloudTarget::Gcp, gcp_driver);
-            registry.register(CloudTarget::Local, local_driver);
-            let registry = Arc::new(registry);
-
-            let addr = format!("{bind}:{port}");
-            println!("Starting nclav API server on http://{addr} (default cloud: gcp)");
-            let app = nclav_api::build_app(store, registry, Arc::new(token));
-
-            let listener = tokio::net::TcpListener::bind(&addr)
-                .await
-                .with_context(|| format!("Failed to bind to {addr}"))?;
-            println!("Listening on http://{addr}");
-            axum::serve(listener, app).await.context("Server error")?;
+    // Build the ordered, deduplicated list of clouds to register.
+    // The default cloud comes first; --enable-cloud entries follow.
+    let mut clouds: Vec<CloudArg> = vec![cloud.clone()];
+    for c in enable_cloud {
+        if !clouds.contains(&c) {
+            clouds.push(c);
         }
     }
 
+    let default_target = cloud_arg_to_target(&cloud);
+    let mut registry = DriverRegistry::new(default_target.clone());
+
+    for c in clouds {
+        match c {
+            CloudArg::Local => {
+                registry.register(CloudTarget::Local, Arc::new(LocalDriver::new()));
+            }
+            CloudArg::Gcp => {
+                let parent = gcp_parent.take()
+                    .context("--gcp-parent (or NCLAV_GCP_PARENT) is required for the gcp driver")?;
+                let billing_account = gcp_billing_account.take()
+                    .context("--gcp-billing-account (or NCLAV_GCP_BILLING_ACCOUNT) is required for the gcp driver")?;
+                let config = GcpDriverConfig {
+                    parent,
+                    billing_account,
+                    default_region: gcp_default_region.clone(),
+                    project_prefix: gcp_project_prefix.clone(),
+                };
+                println!("Initialising GCP driver (ADC)…");
+                let driver = Arc::new(
+                    GcpDriver::from_adc(config)
+                        .await
+                        .context("Failed to initialise GCP driver")?,
+                );
+                registry.register(CloudTarget::Gcp, driver);
+            }
+            CloudArg::Azure => {
+                anyhow::bail!("Azure driver not yet implemented");
+            }
+        }
+    }
+
+    let active: Vec<String> = registry.active_clouds().iter().map(|c| c.to_string()).collect();
+    let registry = Arc::new(registry);
+
+    let addr = format!("{bind}:{port}");
+    println!(
+        "Starting nclav API server on http://{addr} (default: {default_target}, drivers: {drivers})",
+        default_target = default_target,
+        drivers = active.join(", "),
+    );
+
+    let app = nclav_api::build_app(store, registry, Arc::new(token));
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("Failed to bind to {addr}"))?;
+    axum::serve(listener, app).await.context("Server error")?;
+
     Ok(())
+}
+
+fn cloud_arg_to_target(arg: &CloudArg) -> CloudTarget {
+    match arg {
+        CloudArg::Local => CloudTarget::Local,
+        CloudArg::Gcp => CloudTarget::Gcp,
+        CloudArg::Azure => CloudTarget::Azure,
+    }
 }
 
 // ── Apply ─────────────────────────────────────────────────────────────────────

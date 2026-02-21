@@ -25,9 +25,17 @@ pub struct Cli {
 pub enum Command {
     /// Initialize and start the nclav server.
     Bootstrap {
-        /// Cloud target to initialise for.
+        /// Default cloud for enclaves that omit `cloud:` in their YAML.
+        /// The driver for this cloud is automatically registered.
         #[arg(long, default_value = "local")]
         cloud: CloudArg,
+
+        /// Register an additional cloud driver without changing the default.
+        /// Repeat to enable multiple clouds:
+        ///   --cloud local --enable-cloud gcp --gcp-parent folders/123 ...
+        /// Each enabled cloud must have its required flags present.
+        #[arg(long = "enable-cloud", value_name = "CLOUD")]
+        enable_cloud: Vec<CloudArg>,
 
         /// Use an in-memory (ephemeral) store instead of persisting to disk.
         /// State is lost when the server stops.
@@ -45,12 +53,14 @@ pub enum Command {
         store_path: Option<String>,
 
         /// GCP parent resource ("folders/123" or "organizations/456").
-        /// Required when --cloud gcp. Env: NCLAV_GCP_PARENT
+        /// Required when gcp is the default (--cloud gcp) or an additional
+        /// driver (--enable-cloud gcp). Env: NCLAV_GCP_PARENT
         #[arg(long, env = "NCLAV_GCP_PARENT")]
         gcp_parent: Option<String>,
 
         /// GCP billing account ("billingAccounts/XXXX-YYYY-ZZZZ").
-        /// Required when --cloud gcp. Env: NCLAV_GCP_BILLING_ACCOUNT
+        /// Required when gcp is the default or an additional driver.
+        /// Env: NCLAV_GCP_BILLING_ACCOUNT
         #[arg(long, env = "NCLAV_GCP_BILLING_ACCOUNT")]
         gcp_billing_account: Option<String>,
 
@@ -101,7 +111,7 @@ pub enum Command {
     },
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
 pub enum CloudArg {
     Local,
     Gcp,

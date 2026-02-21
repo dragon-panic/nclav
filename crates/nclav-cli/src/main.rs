@@ -19,6 +19,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Bootstrap {
             cloud,
+            enable_cloud,
             ephemeral,
             rotate_token,
             store_path,
@@ -31,6 +32,7 @@ async fn main() -> Result<()> {
         } => {
             commands::bootstrap(
                 cloud,
+                enable_cloud,
                 cli.remote,
                 ephemeral,
                 rotate_token,

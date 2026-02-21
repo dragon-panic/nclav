@@ -106,17 +106,22 @@ nclav bootstrap --cloud local --ephemeral
 
 # Persistent — redb at ~/.nclav/state.redb (default; single-operator dev)
 nclav bootstrap --cloud local
+
+# Local default + GCP also registered for mixed enclave environments
+nclav bootstrap --cloud local \
+  --enable-cloud gcp \
+  --gcp-parent folders/123 \
+  --gcp-billing-account billingAccounts/XXX-YYYY-ZZZZ
 ```
 
-Binds `http://127.0.0.1:8080` by default. Use `--bind 0.0.0.0` (or `NCLAV_BIND`) to
-expose on all interfaces. Override the port with `--port` / `NCLAV_PORT`.
+Every driver must be explicitly requested — `--cloud` registers the default driver,
+`--enable-cloud` adds more. Binds `http://127.0.0.1:8080` by default; use
+`--bind 0.0.0.0` / `NCLAV_BIND` to expose on all interfaces, `--port` / `NCLAV_PORT`
+to change the port.
 
 On first run a 64-character bearer token is generated and written to `~/.nclav/token`
-(mode 0600). Subsequent restarts reuse the same token automatically — clients stay
-connected. Pass `--rotate-token` to force a new token (invalidates existing clients).
-
-LocalDriver is always available; enclaves with `cloud: local` (or no `cloud:` when the
-default is local) use it.
+(mode 0600). Subsequent restarts reuse the same token — clients stay connected.
+Pass `--rotate-token` to force a new token (invalidates existing clients).
 
 #### GCP bootstrap
 
