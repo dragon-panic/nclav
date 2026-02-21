@@ -476,37 +476,18 @@ from nclav's perspective.
 
 ## Bootstrap
 
-One-time setup using cloud admin credentials.
+Bootstrap provisions the nclav **platform** — the API server and its state
+store — so the system runs persistently without a local process. It is a
+one-time, idempotent operation distinct from enclave provisioning.
 
-```
-$ nclav bootstrap --cloud azure --region eastus2
+The platform location (`bootstrap --cloud`) and each enclave's target cloud
+(`cloud:` in YAML) are independent. An API running on GCP can provision
+enclaves into GCP, local, or Azure simultaneously. Enclaves omitting `cloud:`
+inherit the API's configured default.
 
-✓ Created subscription: nclav-platform
-✓ Created resource group: nclav-core
-✓ Created vnet: 10.255.0.0/16
-✓ Provisioned postgres
-✓ Deployed nclav service
-✓ Configured exports: api (http, token), web (http, none)
-✓ Created seed identity
-
-nclav endpoint: https://nclav.acme.com
-Admin token:    nclav_xxxxxxxx
-
-Save this token. You can now revoke your cloud admin credentials.
-```
-
-For local:
-
-```
-$ nclav bootstrap --cloud local
-
-✓ Provisioned local postgres
-✓ Started nclav service
-✓ Configured local resolver
-
-nclav endpoint: http://localhost:8080
-Admin token:    nclav_xxxxxxxx
-```
+See [BOOTSTRAP.md](BOOTSTRAP.md) for full design rationale, local/GCP
+bootstrap specs, per-enclave cloud targeting, the DriverRegistry architecture,
+and all design decisions.
 
 ---
 

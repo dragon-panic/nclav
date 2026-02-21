@@ -86,44 +86,92 @@ nclav graph --output json
 nclav graph --enclave product-a-dev
 ```
 
-### `nclav bootstrap --cloud local`
+### `nclav bootstrap`
 
-Starts the nclav HTTP API server on `http://0.0.0.0:8080` with an in-memory store. Use this when you want to run the server and drive it via the REST API or `--remote` flag.
+Bootstrap provisions the nclav **platform** — the API server and its state
+store. It is a one-time, idempotent operation. After bootstrap completes,
+the API runs continuously and all other CLI commands talk to it via HTTP.
 
-### `nclav bootstrap --cloud gcp`
+The platform location (set by `--cloud`) and each enclave's target cloud
+(`cloud:` in YAML) are **independent**. An API running on GCP can provision
+enclaves into GCP, local, or Azure simultaneously. See [BOOTSTRAP.md](BOOTSTRAP.md)
+for full design rationale.
 
-Starts the server backed by the GCP driver. Authenticates via [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials) (`gcloud auth application-default login` or a service account key).
+#### Local bootstrap
 
-**Required flags / env vars:**
+```bash
+# Ephemeral — in-memory state, lost on restart (CI / quick tests)
+nclav bootstrap --cloud local --ephemeral
+
+# Persistent — redb at ~/.nclav/state.redb (default; single-operator dev)
+nclav bootstrap --cloud local
+
+# Postgres-backed — multi-operator or production-like local setup
+nclav bootstrap --cloud local --store postgres --store-url "postgres://localhost/nclav"
+```
+
+Binds `http://0.0.0.0:8080` (override with `--port`). LocalDriver is always
+available; enclaves with `cloud: local` (or no `cloud:` when the default is
+local) use it.
+
+#### GCP bootstrap
+
+Provisions a **platform GCP project** containing:
+
+| Resource | Purpose |
+|---|---|
+| Cloud Run service `nclav-api` | The nclav HTTP API |
+| Cloud SQL Postgres `nclav-state` | Persistent state store |
+| Service Account `nclav-runner@…` | Identity used by the API to provision enclave projects |
+
+Authenticates via [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials).
+Bootstrap always runs **locally** — after it completes, the API's service
+account takes over and your credentials are no longer needed day-to-day.
+
+**Flags / env vars:**
 
 | Flag | Env var | Required | Description |
 |---|---|:---:|---|
-| `--gcp-parent` | `NCLAV_GCP_PARENT` | yes | Resource parent for new GCP Projects, e.g. `folders/123` or `organizations/456` |
-| `--gcp-billing-account` | `NCLAV_GCP_BILLING_ACCOUNT` | yes | Billing account to attach, e.g. `billingAccounts/XXXX-YYYY-ZZZZ` |
-| `--gcp-default-region` | `NCLAV_GCP_DEFAULT_REGION` | no | Default region (default: `us-central1`) |
-| `--gcp-project-prefix` | `NCLAV_GCP_PROJECT_PREFIX` | no | Prefix prepended to every GCP project ID, e.g. `acme` → `acme-product-a-dev`. Avoids global project ID collisions without changing enclave YAML IDs. |
+| `--gcp-parent` | `NCLAV_GCP_PARENT` | yes | Resource parent: `folders/123` or `organizations/456` |
+| `--gcp-billing-account` | `NCLAV_GCP_BILLING_ACCOUNT` | yes | Billing account: `billingAccounts/XXXX-YYYY-ZZZZ` |
+| `--gcp-project-prefix` | `NCLAV_GCP_PROJECT_PREFIX` | no | Prefix for GCP project IDs: `acme` → `acme-product-a-dev`. Platform project: `acme-nclav`. |
+| `--gcp-platform-region` | `NCLAV_GCP_PLATFORM_REGION` | no | Region for the platform Cloud Run service (default: `us-central1`) |
+| `--gcp-default-region` | `NCLAV_GCP_DEFAULT_REGION` | no | Default region for enclave projects (default: `us-central1`) |
 
 ```bash
 export NCLAV_GCP_PARENT="folders/123456789"
 export NCLAV_GCP_BILLING_ACCOUNT="billingAccounts/ABCD-1234-EFGH-5678"
+export NCLAV_GCP_PROJECT_PREFIX="acme"
 
-cargo run -p nclav-cli -- bootstrap --cloud gcp
-# or with flags:
-cargo run -p nclav-cli -- bootstrap --cloud gcp \
-  --gcp-parent folders/123456789 \
-  --gcp-billing-account billingAccounts/ABCD-1234-EFGH-5678 \
-  --gcp-default-region us-east1
+nclav bootstrap --cloud gcp
 ```
 
-**Partition type mapping:**
+Output:
+```
+Provisioning nclav platform on GCP…
+  ✓ Platform project:   acme-nclav
+  ✓ APIs enabled
+  ✓ Service account:    nclav-runner@acme-nclav.iam.gserviceaccount.com
+  ✓ Cloud SQL:          nclav-state (us-central1)
+  ✓ Cloud Run:          nclav-api   (us-central1)
 
-| Partition `produces` | GCP resource provisioned |
+nclav endpoint:   https://nclav-api-abc123-uc.a.run.app
+default cloud:    gcp
+
+export NCLAV_URL="https://nclav-api-abc123-uc.a.run.app"
+```
+
+After that, all CLI commands use `NCLAV_URL` to talk to the Cloud Run API.
+
+**Partition type mapping (GCP driver):**
+
+| Partition `produces` | GCP resource |
 |---|---|
 | `http` | Cloud Run service |
-| `tcp` | Externally managed — nclav validates wiring and reads `hostname`/`port` from partition `inputs:` |
+| `tcp` | Externally managed — reads `hostname`/`port` from partition `inputs:` |
 | `queue` | Pub/Sub topic + subscription |
 
-**Teardown:** removing an enclave from YAML and re-running `nclav apply` will delete the corresponding GCP Project (and all resources inside it).
+See [GCP.md](GCP.md) for full GCP driver and bootstrap reference.
 
 ### `nclav status`
 
@@ -186,7 +234,7 @@ enclaves/
 ```yaml
 id: product-a-dev
 name: Product A (Development)
-cloud: local          # local | gcp | azure  (operator-level; sets driver for bootstrap)
+cloud: local          # local | gcp | azure  — optional; omit to use the API's default cloud
 region: local-1
 identity: product-a-dev-identity
 

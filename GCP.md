@@ -710,6 +710,100 @@ the same way before surfacing it as a `DriverError::ProvisionFailed`.
 
 ---
 
+## GCP bootstrap (platform provisioning)
+
+`nclav bootstrap --cloud gcp` provisions a dedicated **platform GCP project**
+that hosts the nclav API and its state store. This is separate from the enclave
+projects the driver creates during `nclav apply`.
+
+### What the platform project contains
+
+| Resource | Name | Purpose |
+|---|---|---|
+| GCP Project | `{prefix}-nclav` | Billing and IAM boundary for the platform |
+| Cloud Run service | `nclav-api` | The nclav HTTP API |
+| Cloud SQL Postgres | `nclav-state` | Persistent state store (enclave handles, outputs, audit log) |
+| Service Account | `nclav-runner@{platform-project}.iam.gserviceaccount.com` | Identity the API uses to provision enclave projects |
+
+The platform project is created using the same `--gcp-parent` and
+`--gcp-billing-account` as enclave projects. Override the parent with
+`--gcp-platform-parent` if you need the platform in a separate folder.
+
+### Platform project naming
+
+| Config | Platform project ID |
+|---|---|
+| `--gcp-project-prefix acme` | `acme-nclav` |
+| `--gcp-platform-project my-nclav` | `my-nclav` (explicit override) |
+| No prefix | `nclav` (globally unique; only safe in a dedicated org) |
+
+Enclave projects are named `{prefix}-{enclave-id}` (e.g. `acme-product-a-dev`).
+Platform and enclave projects follow the same naming convention but the
+platform always has the suffix `-nclav`.
+
+### Platform bootstrap sequence
+
+1. **Create platform project** under `--gcp-parent`
+2. **Link billing account**
+3. **Enable APIs**: `run.googleapis.com`, `sqladmin.googleapis.com`, `iam.googleapis.com`, `cloudresourcemanager.googleapis.com`
+4. **Create platform service account** `nclav-runner` with required IAM roles (see below)
+5. **Provision Cloud SQL Postgres** `nclav-state` (private IP, same VPC as the platform project)
+6. **Deploy Cloud Run service** `nclav-api` using the `nclav-runner` SA, injecting the Cloud SQL connection string
+7. **Print API endpoint** — operator sets `NCLAV_URL` to this value
+
+Bootstrap is idempotent: each step checks for the resource before creating it.
+
+### Required IAM roles for `nclav-runner` SA
+
+These must be granted at the **organization or folder level** (the `--gcp-parent`
+folder) so the API can create and manage enclave projects beneath it:
+
+| Role | Why |
+|---|---|
+| `roles/resourcemanager.projectCreator` | Create one project per enclave |
+| `roles/billing.user` | Attach billing account to new projects |
+| `roles/iam.serviceAccountAdmin` | Create per-enclave service accounts |
+| `roles/compute.networkAdmin` | Create VPCs and subnets in enclave projects |
+| `roles/run.admin` | Deploy Cloud Run services in enclave projects |
+| `roles/pubsub.admin` | Create Pub/Sub topics in enclave projects |
+| `roles/dns.admin` | Create Cloud DNS zones in enclave projects |
+
+The bootstrap operator (who runs `nclav bootstrap`) needs these same roles
+locally to set up the platform. After bootstrap, the `nclav-runner` SA handles
+all subsequent GCP calls.
+
+### Authentication during bootstrap vs. runtime
+
+| Phase | Who authenticates | How |
+|---|---|---|
+| `nclav bootstrap --cloud gcp` | Operator (local) | ADC: `gcloud auth application-default login` or SA key |
+| `nclav apply` / `nclav diff` (post-bootstrap) | `nclav-runner` SA | Cloud Run workload identity / attached SA |
+
+Bootstrap is always a **local CLI operation** — it never runs on Cloud Run.
+After the Cloud Run service is deployed, the API's SA takes over and the
+operator's credentials are no longer needed for routine use.
+
+### Cloud SQL details
+
+| Setting | Value |
+|---|---|
+| Engine | Postgres 16 |
+| Tier | `db-n1-standard-2` (default; override via `--gcp-platform-sql-tier`) |
+| Edition | Enterprise |
+| Network | Private IP only; no public IP |
+| Region | Same as `--gcp-platform-region` (default: `us-central1`) |
+
+### Platform Cloud Run details
+
+| Setting | Value |
+|---|---|
+| Region | `--gcp-platform-region` (default: `us-central1`) |
+| Ingress | `INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER` |
+| Auth | Cloud IAM (operators authenticate with their GCP identity) |
+| URL | Auto-assigned `.run.app` URL (custom DNS: future, `--gcp-platform-dns-name`) |
+
+---
+
 ## What's explicitly out of scope for the first GCP driver iteration
 
 - GKE-backed partitions (Cloud Run covers the initial http/tcp surface)
