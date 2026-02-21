@@ -56,6 +56,9 @@ async fn main() -> Result<()> {
         Command::Graph { output, enclave } => {
             commands::graph(output, enclave, cli.remote, cli.token).await
         }
+        Command::Destroy { enclave_ids, all } => {
+            commands::destroy(enclave_ids, all, cli.remote, cli.token).await
+        }
         Command::Iac { command } => match command {
             IacCommand::Runs { enclave_id, partition_id } => {
                 commands::iac_runs(enclave_id, partition_id, cli.remote, cli.token).await

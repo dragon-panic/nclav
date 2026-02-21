@@ -204,6 +204,14 @@ terraform destroy -auto-approve -no-color
 Runs in the same workspace directory with the same environment. State is deleted from the state
 store after successful destroy.
 
+Teardown is triggered in two ways:
+
+- **Declarative** — remove the enclave from YAML, then run `nclav apply`. The reconciler detects
+  the diff and tears down IaC partitions before deleting the enclave from state.
+- **Imperative** — `nclav destroy <enclave-id>` (or `--all` to nuke every enclave). Calls
+  `DELETE /enclaves/:id` on the API, which follows the identical teardown path. Useful for testing
+  and environment resets without editing YAML.
+
 ### 2h. Drift observation (`observe_partition`)
 
 Run `terraform output -json` (no plan, no apply). If it fails (state missing / workspace not
@@ -240,7 +248,7 @@ State key format: `"{enclave_id}/{partition_id}"`.
 GET    /terraform/state/:enclave_id/:partition_id        → 200 + body, or 204 (no state)
 POST   /terraform/state/:enclave_id/:partition_id        → 200 (state updated)
 DELETE /terraform/state/:enclave_id/:partition_id        → 200 (state deleted)
-POST   /terraform/state/:enclave_id/:partition_id/lock   → 200 (locked) or 423 (locked by other)
+POST   /terraform/state/:enclave_id/:partition_id/lock   → 200 (locked) or 409 (locked by other)
 DELETE /terraform/state/:enclave_id/:partition_id/lock   → 200 (unlocked)
 ```
 

@@ -4,12 +4,14 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use nclav_domain::{EnclaveId, PartitionId};
+use nclav_domain::{EnclaveId, PartitionBackend, PartitionId};
+use nclav_driver::TerraformBackend;
 use nclav_reconciler::{reconcile, ReconcileRequest};
 use nclav_store::StoreError;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -79,6 +81,65 @@ pub async fn get_enclave(
         .await?
         .ok_or_else(|| ApiError::not_found(format!("enclave '{}' not found", eid)))?;
     Ok(Json(json!(enclave)))
+}
+
+pub async fn delete_enclave(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let eid = EnclaveId::new(&id);
+    let existing = state
+        .store
+        .get_enclave(&eid)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("enclave '{}' not found", id)))?;
+
+    let cloud = existing
+        .resolved_cloud
+        .clone()
+        .unwrap_or_else(|| state.registry.default_cloud.clone());
+
+    let driver = state
+        .registry
+        .for_cloud(cloud)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let tf_backend = TerraformBackend {
+        api_base: (*state.api_base).clone(),
+        auth_token: state.auth_token.clone(),
+        store: state.store.clone(),
+    };
+
+    let mut errors: Vec<String> = Vec::new();
+
+    if let Some(enc_handle) = &existing.enclave_handle {
+        // Teardown IaC partitions first
+        let auth_env = driver.auth_env(&existing.desired, enc_handle);
+        for (part_id, part_state) in &existing.partitions {
+            match &part_state.desired.backend {
+                PartitionBackend::Terraform(_) | PartitionBackend::OpenTofu(_) => {
+                    if let Err(e) = tf_backend
+                        .teardown(&existing.desired, &part_state.desired, &auth_env, None)
+                        .await
+                    {
+                        warn!(enclave_id = %id, partition_id = %part_id, error = %e, "IaC teardown failed");
+                        errors.push(format!("teardown {}/{}: {}", id, part_id, e));
+                    }
+                }
+                PartitionBackend::Managed => {}
+            }
+        }
+
+        // Teardown the enclave itself
+        if let Err(e) = driver.teardown_enclave(&existing.desired, enc_handle).await {
+            warn!(enclave_id = %id, error = %e, "enclave teardown failed");
+            errors.push(format!("enclave teardown {}: {}", id, e));
+        }
+    }
+
+    state.store.delete_enclave(&eid).await?;
+
+    Ok(Json(json!({ "destroyed": id, "errors": errors })))
 }
 
 pub async fn get_enclave_graph(

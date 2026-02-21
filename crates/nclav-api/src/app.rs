@@ -28,7 +28,10 @@ pub fn build_app(
         .route("/reconcile/dry-run", post(handlers::post_reconcile_dry_run))
         // Enclaves
         .route("/enclaves", get(handlers::list_enclaves))
-        .route("/enclaves/:id", get(handlers::get_enclave))
+        .route(
+            "/enclaves/:id",
+            get(handlers::get_enclave).delete(handlers::delete_enclave),
+        )
         .route("/enclaves/:id/graph", get(handlers::get_enclave_graph))
         // IaC run logs
         .route("/enclaves/:id/partitions/:part/iac/runs", get(handlers::list_iac_runs))

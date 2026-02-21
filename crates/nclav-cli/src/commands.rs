@@ -238,6 +238,80 @@ pub async fn graph(
     Ok(())
 }
 
+// ── Destroy ───────────────────────────────────────────────────────────────────
+
+pub async fn destroy(
+    enclave_ids: Vec<String>,
+    all: bool,
+    remote: Option<String>,
+    token: Option<String>,
+) -> Result<()> {
+    let token = resolve_token(token)?;
+    let url = server_url(remote);
+    let client = authed_client(&token);
+    let base = url.trim_end_matches('/');
+
+    // Resolve the list of IDs to destroy
+    let ids: Vec<String> = if all {
+        let states: Vec<serde_json::Value> = client
+            .get(format!("{}/enclaves", base))
+            .send()
+            .await
+            .with_context(|| format!("Failed to reach server at {url}"))?
+            .json()
+            .await
+            .context("Failed to parse enclave list")?;
+
+        let ids: Vec<String> = states
+            .iter()
+            .filter_map(|s| s.get("desired").and_then(|d| d.get("id")).and_then(|v| v.as_str()).map(String::from))
+            .collect();
+
+        if ids.is_empty() {
+            println!("No enclaves to destroy.");
+            return Ok(());
+        }
+        ids
+    } else {
+        enclave_ids
+    };
+
+    let mut any_error = false;
+    for id in &ids {
+        print!("Destroying {}… ", id);
+        let resp = client
+            .delete(format!("{}/enclaves/{}", base, id))
+            .send()
+            .await
+            .with_context(|| format!("Failed to reach server at {url}"))?;
+
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+
+        if status.is_success() {
+            let errors = body.get("errors").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            if errors.is_empty() {
+                println!("done.");
+            } else {
+                println!("done (with errors):");
+                for e in &errors {
+                    println!("  ! {}", e.as_str().unwrap_or(&e.to_string()));
+                }
+                any_error = true;
+            }
+        } else {
+            let msg = body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+            println!("failed: {} — {}", status, msg);
+            any_error = true;
+        }
+    }
+
+    if any_error {
+        anyhow::bail!("one or more enclave destroys failed");
+    }
+    Ok(())
+}
+
 // ── Iac ───────────────────────────────────────────────────────────────────────
 
 pub async fn iac_runs(

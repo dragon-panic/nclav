@@ -1,0 +1,9 @@
+id: db
+name: Database
+produces: tcp
+imports: []
+inputs: {}
+declared_outputs:
+  - hostname
+  - port
+exports: []

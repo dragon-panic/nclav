@@ -115,6 +115,21 @@ pub enum Command {
         #[command(subcommand)]
         command: IacCommand,
     },
+
+    /// Destroy one or more enclaves, tearing down all their infrastructure.
+    ///
+    /// Runs terraform destroy for IaC partitions, then tears down the enclave
+    /// itself. State is removed from the server. Use --all to nuke everything
+    /// (handy for resetting a test environment).
+    Destroy {
+        /// Enclave IDs to destroy. Required unless --all is given.
+        #[arg(required_unless_present = "all")]
+        enclave_ids: Vec<String>,
+
+        /// Destroy every enclave known to the server.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

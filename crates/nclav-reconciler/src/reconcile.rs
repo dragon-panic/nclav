@@ -546,7 +546,7 @@ mod tests {
 
     #[tokio::test]
     async fn dry_run_returns_changes_without_persisting() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../enclaves");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/enclaves");
         if !dir.exists() { return; }
 
         let store = Arc::new(InMemoryStore::new());
@@ -561,7 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_sets_active_status() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../enclaves");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/enclaves");
         if !dir.exists() { return; }
 
         let store = Arc::new(InMemoryStore::new());
@@ -595,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn idempotent_apply_skips_unchanged() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../enclaves");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/enclaves");
         if !dir.exists() { return; }
 
         let store = Arc::new(InMemoryStore::new());
