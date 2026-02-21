@@ -27,10 +27,11 @@ cd nclav
 # Build everything
 cargo build --workspace
 
-# Start the HTTP API server (binds :8080, in-memory store)
+# Start the HTTP API server — binds 127.0.0.1:8080, persists state to ~/.nclav/state.redb
+# Prints a bearer token and writes it to ~/.nclav/token on first run
 cargo run -p nclav-cli -- bootstrap --cloud local
 
-# In another terminal — see what would change
+# In another terminal — see what would change (token read automatically from ~/.nclav/token)
 cargo run -p nclav-cli -- diff ./enclaves
 
 # Apply changes (provisions resources via the running server)
@@ -105,28 +106,23 @@ nclav bootstrap --cloud local --ephemeral
 
 # Persistent — redb at ~/.nclav/state.redb (default; single-operator dev)
 nclav bootstrap --cloud local
-
-# Postgres-backed — multi-operator or production-like local setup
-nclav bootstrap --cloud local --store postgres --store-url "postgres://localhost/nclav"
 ```
 
-Binds `http://0.0.0.0:8080` (override with `--port`). LocalDriver is always
-available; enclaves with `cloud: local` (or no `cloud:` when the default is
-local) use it.
+Binds `http://127.0.0.1:8080` by default. Use `--bind 0.0.0.0` (or `NCLAV_BIND`) to
+expose on all interfaces. Override the port with `--port` / `NCLAV_PORT`.
+
+On first run a 64-character bearer token is generated and written to `~/.nclav/token`
+(mode 0600). Subsequent restarts reuse the same token automatically — clients stay
+connected. Pass `--rotate-token` to force a new token (invalidates existing clients).
+
+LocalDriver is always available; enclaves with `cloud: local` (or no `cloud:` when the
+default is local) use it.
 
 #### GCP bootstrap
 
-Provisions a **platform GCP project** containing:
-
-| Resource | Purpose |
-|---|---|
-| Cloud Run service `nclav-api` | The nclav HTTP API |
-| Cloud SQL Postgres `nclav-state` | Persistent state store |
-| Service Account `nclav-runner@…` | Identity used by the API to provision enclave projects |
-
-Authenticates via [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials).
-Bootstrap always runs **locally** — after it completes, the API's service
-account takes over and your credentials are no longer needed day-to-day.
+Initialises the GCP driver (via Application Default Credentials) and starts the API
+server locally with GCP as the default cloud. Enclave provisioning targets real GCP
+projects; the API process itself still runs on your machine.
 
 **Flags / env vars:**
 
@@ -134,8 +130,7 @@ account takes over and your credentials are no longer needed day-to-day.
 |---|---|:---:|---|
 | `--gcp-parent` | `NCLAV_GCP_PARENT` | yes | Resource parent: `folders/123` or `organizations/456` |
 | `--gcp-billing-account` | `NCLAV_GCP_BILLING_ACCOUNT` | yes | Billing account: `billingAccounts/XXXX-YYYY-ZZZZ` |
-| `--gcp-project-prefix` | `NCLAV_GCP_PROJECT_PREFIX` | no | Prefix for GCP project IDs: `acme` → `acme-product-a-dev`. Platform project: `acme-nclav`. |
-| `--gcp-platform-region` | `NCLAV_GCP_PLATFORM_REGION` | no | Region for the platform Cloud Run service (default: `us-central1`) |
+| `--gcp-project-prefix` | `NCLAV_GCP_PROJECT_PREFIX` | no | Prefix for GCP project IDs: `acme` → `acme-product-a-dev` |
 | `--gcp-default-region` | `NCLAV_GCP_DEFAULT_REGION` | no | Default region for enclave projects (default: `us-central1`) |
 
 ```bash
@@ -146,22 +141,12 @@ export NCLAV_GCP_PROJECT_PREFIX="acme"
 nclav bootstrap --cloud gcp
 ```
 
-Output:
+GCP credentials must include the `cloud-billing` scope:
+
+```bash
+gcloud auth application-default login \
+  --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/cloud-billing
 ```
-Provisioning nclav platform on GCP…
-  ✓ Platform project:   acme-nclav
-  ✓ APIs enabled
-  ✓ Service account:    nclav-runner@acme-nclav.iam.gserviceaccount.com
-  ✓ Cloud SQL:          nclav-state (us-central1)
-  ✓ Cloud Run:          nclav-api   (us-central1)
-
-nclav endpoint:   https://nclav-api-abc123-uc.a.run.app
-default cloud:    gcp
-
-export NCLAV_URL="https://nclav-api-abc123-uc.a.run.app"
-```
-
-After that, all CLI commands use `NCLAV_URL` to talk to the Cloud Run API.
 
 **Partition type mapping (GCP driver):**
 
@@ -175,16 +160,18 @@ See [GCP.md](GCP.md) for full GCP driver and bootstrap reference.
 
 ### `nclav status`
 
-Prints a summary of enclave health from the server (requires `--remote`).
+Prints a summary of enclave health from the server. Includes enclave count, default cloud,
+and active drivers.
 
 ## HTTP API
 
-Start the server with `nclav bootstrap`, then:
+Start the server with `nclav bootstrap`, then use the token from `~/.nclav/token`.
+All endpoints except `/health` and `/ready` require `Authorization: Bearer <token>`.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Always 200 OK |
-| `GET` | `/ready` | 200 if store is reachable |
+| `GET` | `/health` | Always 200 OK (no auth required) |
+| `GET` | `/ready` | 200 if store is reachable (no auth required) |
 | `POST` | `/reconcile` | Apply changes |
 | `POST` | `/reconcile/dry-run` | Diff only |
 | `GET` | `/enclaves` | List all enclave states |
@@ -192,27 +179,31 @@ Start the server with `nclav bootstrap`, then:
 | `GET` | `/enclaves/{id}/graph` | Import/export graph for one enclave |
 | `GET` | `/graph` | System-wide dependency graph |
 | `GET` | `/events` | Audit log (`?enclave_id=&limit=`) |
-| `GET` | `/status` | Summary: count, last reconcile |
+| `GET` | `/status` | Summary: enclave count, default cloud, active drivers |
 
 ```bash
 # Start the server
 cargo run -p nclav-cli -- bootstrap --cloud local &
 
+TOKEN=$(cat ~/.nclav/token)
+
 # Apply via HTTP
 curl -X POST http://localhost:8080/reconcile \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"enclaves_dir": "./enclaves"}'
 
 # Dry-run via HTTP
 curl -X POST http://localhost:8080/reconcile/dry-run \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"enclaves_dir": "./enclaves"}'
 
 # Check status
-curl http://localhost:8080/status
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/status
 
 # Audit log
-curl 'http://localhost:8080/events?limit=20'
+curl -H "Authorization: Bearer $TOKEN" 'http://localhost:8080/events?limit=20'
 ```
 
 ## Writing enclave YAML
@@ -299,15 +290,15 @@ declared_outputs:
 
 ## Workspace layout
 
-```
+```text
 crates/
   nclav-domain/       Pure types — no I/O
   nclav-config/       YAML parsing, Raw* -> domain conversion
   nclav-graph/        Petgraph validation: dangling imports, access control, cycles, topo sort
-  nclav-store/        StateStore trait + InMemoryStore
-  nclav-driver/       Driver trait + LocalDriver (stub) + GcpDriver
+  nclav-store/        StateStore trait + InMemoryStore + RedbStore (persistent local)
+  nclav-driver/       Driver trait + DriverRegistry + LocalDriver + GcpDriver
   nclav-reconciler/   Reconcile loop: diff -> provision -> persist
-  nclav-api/          Axum HTTP server
+  nclav-api/          Axum HTTP server (bearer token auth)
   nclav-cli/          Clap binary
 ```
 
@@ -333,6 +324,7 @@ RUST_LOG=nclav_reconciler=info cargo run -p nclav-cli -- apply ./enclaves
 ## What's not implemented yet
 
 - **Azure driver** — the `Driver` trait is defined; the Azure implementation is deferred
-- **Postgres store** — `StateStore` is designed for it; feature-flag planned
 - **AWS driver**
+- **Postgres store** — `StateStore` is designed for it; feature-flag planned
+- **GCP platform bootstrap** — deploying the nclav API itself to Cloud Run + Cloud SQL (currently `--cloud gcp` runs the API server locally with the GCP driver for enclave provisioning)
 - **Web UI**
