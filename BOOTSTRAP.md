@@ -160,5 +160,141 @@ needing SQL. SQLite is skipped entirely; there is no middle tier between redb
 and Postgres.
 
 The `StateStore` trait is already cloud-agnostic. Implementation additions
-needed: `RedbStore` (local dev) and `PostgresStore` (production). Store
-selection does not affect which drivers are available.
+needed: `RedbStore` (local dev — **done**) and `PostgresStore` (production).
+Store selection does not affect which drivers are available.
+
+---
+
+## Platform secrets
+
+Bootstrap generates a bearer token that all CLI-to-API communication requires.
+The token must survive process restarts and, for GCP, must be readable by
+stateless Cloud Run instances without ever appearing in plaintext in environment
+variables, deployment manifests, or container image layers.
+
+### The `SecretStore` abstraction
+
+The driver layer exposes a `SecretStore` trait that lives alongside `Driver` in
+`nclav-driver`. Both implementations are registered in the `DriverRegistry`:
+
+```rust
+// nclav-driver/src/secret_store.rs (to be created)
+#[async_trait]
+pub trait SecretStore: Send + Sync {
+    /// Write (or overwrite) a named secret value.
+    async fn write(&self, name: &str, value: &str) -> Result<(), DriverError>;
+    /// Read a named secret. Returns None if it does not exist.
+    async fn read(&self, name: &str) -> Result<Option<String>, DriverError>;
+    /// Delete a named secret entirely.
+    async fn delete(&self, name: &str) -> Result<(), DriverError>;
+}
+```
+
+The `DriverRegistry` holds one `Arc<dyn SecretStore>` bound to the default
+cloud (the platform). Secrets are a **platform-level concern**, not per-enclave:
+the same store is used regardless of which cloud individual enclaves target.
+
+```rust
+// Extension to DriverRegistry (nclav-driver/src/registry.rs)
+pub struct DriverRegistry {
+    pub default_cloud: CloudTarget,
+    drivers: HashMap<CloudTarget, Arc<dyn Driver>>,
+    secret_store: Arc<dyn SecretStore>,   // ← new field
+}
+
+impl DriverRegistry {
+    pub fn secret_store(&self) -> Arc<dyn SecretStore> {
+        Arc::clone(&self.secret_store)
+    }
+}
+```
+
+Bootstrap constructs the registry with the appropriate secret store before
+starting the server.
+
+### Per-mode secret backend
+
+| Bootstrap mode | Secret backend | Token location |
+|---|---|---|
+| `local --ephemeral` | `LocalSecretStore` | `~/.nclav/secrets/nclav-api-token` (same file as today; in-memory option would be lossy) |
+| `local` | `LocalSecretStore` | `~/.nclav/secrets/nclav-api-token` |
+| `gcp` | `GcpSecretStore` | `projects/{platform-project}/secrets/nclav-api-token/versions/latest` |
+
+`LocalSecretStore` is a thin wrapper over the current file-based approach.
+The token file path `~/.nclav/token` can be migrated to `~/.nclav/secrets/nclav-api-token`
+as part of this work, or kept at its current location (just change who writes it).
+
+### Token lifecycle
+
+1. **First bootstrap:** generate token → `secret_store.write("nclav-api-token", token)`
+2. **Restart, no `--rotate-token`:** `secret_store.read("nclav-api-token")` → reuse if present
+3. **`--rotate-token`:** generate new token → `secret_store.write(...)` overwrites (or adds a new Secret Manager version)
+4. **GCP Cloud Run startup:** the running binary calls `secret_store.read("nclav-api-token")` via the `nclav-runner` SA; no token is passed as an environment variable
+
+### Effect on `build_app` and API startup
+
+Currently `commands::bootstrap` resolves the token from the local file and
+passes it explicitly to `build_app(store, registry, Arc::new(token))`. This
+contract does not change — `build_app` still takes a concrete `Arc<String>`.
+
+What changes is **who resolves the token and when**:
+
+- **Local bootstrap:** unchanged. CLI reads/generates token from file, passes it in.
+- **GCP Cloud Run binary:** on startup, before calling `build_app`, the binary calls:
+  ```rust
+  let token = registry.secret_store()
+      .read("nclav-api-token")
+      .await?
+      .context("nclav-api-token missing from Secret Manager — was bootstrap run?")?;
+  let app = nclav_api::build_app(store, registry, Arc::new(token));
+  ```
+
+The Cloud Run entrypoint is a separate binary path (or a `--serve` flag) that
+does not write the token — it only reads it. Bootstrap always runs locally
+and always writes the token first.
+
+### LocalSecretStore implementation sketch
+
+```rust
+pub struct LocalSecretStore {
+    dir: PathBuf,   // ~/.nclav/secrets/
+}
+
+impl LocalSecretStore {
+    pub fn new(dir: PathBuf) -> Self { Self { dir } }
+}
+
+#[async_trait]
+impl SecretStore for LocalSecretStore {
+    async fn write(&self, name: &str, value: &str) -> Result<(), DriverError> {
+        let path = self.dir.join(name);
+        fs::create_dir_all(&self.dir)?;
+        fs::write(&path, value)?;
+        // chmod 600
+        Ok(())
+    }
+    async fn read(&self, name: &str) -> Result<Option<String>, DriverError> {
+        match fs::read_to_string(self.dir.join(name)) {
+            Ok(s) => Ok(Some(s.trim().to_string())),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(DriverError::from(e)),
+        }
+    }
+    async fn delete(&self, name: &str) -> Result<(), DriverError> {
+        let path = self.dir.join(name);
+        if path.exists() { fs::remove_file(path)?; }
+        Ok(())
+    }
+}
+```
+
+### Files to create / modify
+
+| File | Action |
+|---|---|
+| `nclav-driver/src/secret_store.rs` | New — `SecretStore` trait + `LocalSecretStore` |
+| `nclav-driver/src/gcp_secret.rs` | New — `GcpSecretStore` (Secret Manager REST) |
+| `nclav-driver/src/registry.rs` | Add `secret_store` field; `new()` takes `Arc<dyn SecretStore>` |
+| `nclav-driver/src/lib.rs` | Export new modules |
+| `nclav-cli/src/commands.rs` | Bootstrap builds `LocalSecretStore` or `GcpSecretStore`; reads/writes token through it |
+| `nclav-api/src/app.rs` | No change — still takes `Arc<String>`; token resolution happens before `build_app` |

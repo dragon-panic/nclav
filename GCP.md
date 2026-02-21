@@ -54,6 +54,13 @@ servicenetworking.googleapis.com # Private service access / PSC
 cloudbilling.googleapis.com     # Billing account linkage
 ```
 
+The **platform project** additionally requires:
+
+```
+secretmanager.googleapis.com    # Stores the nclav API bearer token
+sqladmin.googleapis.com         # Cloud SQL (platform state store — future)
+```
+
 ---
 
 ## Required IAM roles for the nclav runner
@@ -71,6 +78,17 @@ The service account or user running nclav needs these at the **organization or f
 | `roles/run.admin` | Deploy and configure Cloud Run services |
 | `roles/pubsub.admin` | Create topics and subscriptions |
 | `roles/servicenetworking.networksAdmin` | Configure Private Service Connect |
+
+The `nclav-runner` SA also needs these on the **platform project** specifically:
+
+| Role | Scope | Why |
+|---|---|---|
+| `roles/secretmanager.admin` | Platform project | Create and version the `nclav-api-token` secret at bootstrap time |
+| `roles/secretmanager.secretAccessor` | `nclav-api-token` secret (or project) | Read the token at Cloud Run startup |
+
+The **bootstrap operator** (human or bootstrap SA) needs `roles/secretmanager.admin` on
+the platform project to perform the initial secret write. After bootstrap, `nclav-runner`
+takes over all Secret Manager operations.
 
 ---
 
@@ -724,6 +742,7 @@ projects the driver creates during `nclav apply`.
 | Cloud Run service | `nclav-api` | The nclav HTTP API |
 | Cloud SQL Postgres | `nclav-state` | Persistent state store (enclave handles, outputs, audit log) |
 | Service Account | `nclav-runner@{platform-project}.iam.gserviceaccount.com` | Identity the API uses to provision enclave projects |
+| Secret Manager secret | `nclav-api-token` | Bearer token read by Cloud Run at startup; never in env vars |
 
 The platform project is created using the same `--gcp-parent` and
 `--gcp-billing-account` as enclave projects. Override the parent with
@@ -745,13 +764,38 @@ platform always has the suffix `-nclav`.
 
 1. **Create platform project** under `--gcp-parent`
 2. **Link billing account**
-3. **Enable APIs**: `run.googleapis.com`, `sqladmin.googleapis.com`, `iam.googleapis.com`, `cloudresourcemanager.googleapis.com`
+3. **Enable APIs**: `run.googleapis.com`, `sqladmin.googleapis.com`, `iam.googleapis.com`,
+   `cloudresourcemanager.googleapis.com`, `secretmanager.googleapis.com`
 4. **Create platform service account** `nclav-runner` with required IAM roles (see below)
-5. **Provision Cloud SQL Postgres** `nclav-state` (private IP, same VPC as the platform project)
-6. **Deploy Cloud Run service** `nclav-api` using the `nclav-runner` SA, injecting the Cloud SQL connection string
-7. **Print API endpoint** — operator sets `NCLAV_URL` to this value
+5. **Generate API token** (or reuse from `--rotate-token` flag)
+6. **Write token to Secret Manager**
+   ```
+   POST https://secretmanager.googleapis.com/v1/projects/{platform-project}/secrets
+   { "replication": { "automatic": {} } }
+   ```
+   then add the first version:
+   ```
+   POST .../secrets/nclav-api-token:addVersion
+   { "payload": { "data": "<base64(token)>" } }
+   ```
+   then grant `nclav-runner` accessor on that secret:
+   ```
+   POST .../secrets/nclav-api-token:setIamPolicy
+   { "policy": { "bindings": [{
+     "role": "roles/secretmanager.secretAccessor",
+     "members": ["serviceAccount:nclav-runner@{platform-project}.iam.gserviceaccount.com"]
+   }]}}
+   ```
+7. **Provision Cloud SQL Postgres** `nclav-state` (private IP, same VPC as the platform project)
+8. **Deploy Cloud Run service** `nclav-api` using the `nclav-runner` SA, injecting the Cloud SQL
+   connection string. The binary reads the token from Secret Manager at startup — the token is
+   **not** passed as an environment variable.
+9. **Print API endpoint** — operator sets `NCLAV_URL` to this value; prints token for
+   `~/.nclav/token` so CLI commands work immediately
 
-Bootstrap is idempotent: each step checks for the resource before creating it.
+Bootstrap is idempotent: each step checks for the resource before creating it. For the
+token specifically: if `nclav-api-token` already exists in Secret Manager and `--rotate-token`
+was not passed, the existing value is preserved.
 
 ### Required IAM roles for `nclav-runner` SA
 
@@ -801,6 +845,96 @@ operator's credentials are no longer needed for routine use.
 | Ingress | `INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER` |
 | Auth | Cloud IAM (operators authenticate with their GCP identity) |
 | URL | Auto-assigned `.run.app` URL (custom DNS: future, `--gcp-platform-dns-name`) |
+
+---
+
+## Secret Manager integration
+
+The `GcpSecretStore` implements the `SecretStore` trait using the Secret Manager REST API.
+It is registered in `DriverRegistry` when `--cloud gcp` is used and is used exclusively for
+**platform-level secrets** (currently just the API bearer token). It is not used to store
+enclave-level secrets or partition inputs.
+
+### `GcpSecretStore` struct
+
+```rust
+pub struct GcpSecretStore {
+    client: reqwest::Client,
+    project: String,   // platform project ID, e.g. "acme-nclav"
+    // token_provider: same gcp_auth token source as GcpDriver
+}
+```
+
+### `write(name, value)` sequence
+
+1. Attempt to create the secret (idempotent — `ALREADY_EXISTS` is success):
+   ```
+   POST https://secretmanager.googleapis.com/v1/projects/{project}/secrets
+   {
+     "secretId": "{name}",
+     "replication": { "automatic": {} }
+   }
+   ```
+2. Add a new version:
+   ```
+   POST https://secretmanager.googleapis.com/v1/projects/{project}/secrets/{name}:addVersion
+   {
+     "payload": { "data": "<base64(value)>" }
+   }
+   ```
+   Each call to `write` creates a new version. Old versions are not auto-disabled;
+   `read` always fetches `versions/latest`.
+
+### `read(name)` sequence
+
+```
+GET https://secretmanager.googleapis.com/v1/projects/{project}/secrets/{name}/versions/latest:access
+```
+
+Response body: `{ "payload": { "data": "<base64(value)>" } }`.
+
+Return `None` if the secret does not exist (HTTP 404). Propagate other errors as `DriverError`.
+
+### `delete(name)` sequence
+
+```
+DELETE https://secretmanager.googleapis.com/v1/projects/{project}/secrets/{name}
+```
+
+Returns success if the secret does not exist (idempotent).
+
+### Token rotation on GCP
+
+`--rotate-token` with `--cloud gcp` calls `secret_store.write("nclav-api-token", new_token)`,
+which adds a new Secret Manager version. To pick up the new token, the Cloud Run service must
+restart. The operator can trigger this with:
+
+```bash
+gcloud run services update nclav-api \
+  --region us-central1 \
+  --project {platform-project} \
+  --update-env-vars NCLAV_RESTART=$(date +%s)
+```
+
+Or simply wait for the next cold start. The old token is invalid immediately after rotation —
+any in-flight CLI commands will receive 401 until restarted against the new token.
+
+### Cloud Run startup read
+
+The GCP-mode API binary reads the token before starting the HTTP server:
+
+```rust
+// in the GCP Cloud Run entrypoint (not local bootstrap)
+let token = registry
+    .secret_store()
+    .read("nclav-api-token")
+    .await?
+    .context("nclav-api-token not found in Secret Manager")?;
+let app = nclav_api::build_app(store, registry, Arc::new(token));
+```
+
+The `GOOGLE_CLOUD_PROJECT` environment variable (set automatically by Cloud Run) is used
+to determine the platform project for Secret Manager lookups — no extra configuration needed.
 
 ---
 

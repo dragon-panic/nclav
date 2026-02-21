@@ -182,6 +182,11 @@ DriverInterface
 
 The domain model describes intent. Drivers produce cloud-specific handles — opaque receipts stored in state so the driver can locate its resources on subsequent reconciles. The reconciler never reads inside handles. Only the driver that produced them reads them.
 
+The `DriverRegistry` dispatches each enclave to the driver matching its resolved `cloud:` value.
+The `SecretStore` is a **platform-level** capability held by the registry — one store for the
+whole installation, bound to the default cloud — used to securely persist the API bearer token
+across restarts and Cloud Run instances. It is not used for per-enclave secrets or partition inputs.
+
 Drivers implement two categories of methods:
 
 - **Mutating** (`provision_*`, `teardown_*`) — create, update, or delete cloud resources; called by the reconcile loop
@@ -456,21 +461,36 @@ destroy in-flight changes during a deployment.
 - Full cloud resource attribute maps (that is the driver's concern via the Handle)
 - Terraform state (Terraform manages its own state; nclav stores the outputs)
 - Historical versions of desired config (the Git log is the history)
-- Credentials or secrets (injected at runtime, never persisted)
+- Per-enclave credentials or secrets (injected at runtime, never persisted in StateStore)
+
+**Exception — platform secrets:** The API bearer token is stored in the driver's
+`SecretStore` (a local file for local mode; GCP Secret Manager for GCP mode).
+This is the only secret nclav persists, and it is kept outside the `StateStore`
+specifically because the store holds enclave data that is logically separate from
+platform authentication.
 
 ---
 
 ## Storage
 
-Postgres stores:
+The `StateStore` persists:
 - Enclave and partition state records (`ResourceMeta` + `Handle` + `resolved_outputs`)
 - Export and import handles (wiring receipts, keyed by name and alias)
 - Append-only audit event log (reconcile runs, provision outcomes, drift events)
 
-The in-memory store (`InMemoryStore`) implements the same `StateStore` trait
-and is used for local mode and all tests. Postgres is the production backend.
+Three implementations share the same `StateStore` trait:
+
+| Implementation | Use case |
+|---|---|
+| `InMemoryStore` | Tests and ephemeral CI runs (`--ephemeral`) |
+| `RedbStore` | Local persistent dev (`~/.nclav/state.redb`; default for local bootstrap) |
+| `PostgresStore` | Production / multi-operator (future) |
+
 State is never stored in the YAML directory — the GitOps directory is read-only
 from nclav's perspective.
+
+The API bearer token is **not** stored in `StateStore`. It lives in the `SecretStore`
+(see Driver Architecture above).
 
 ---
 
@@ -486,8 +506,8 @@ enclaves into GCP, local, or Azure simultaneously. Enclaves omitting `cloud:`
 inherit the API's configured default.
 
 See [BOOTSTRAP.md](BOOTSTRAP.md) for full design rationale, local/GCP
-bootstrap specs, per-enclave cloud targeting, the DriverRegistry architecture,
-and all design decisions.
+bootstrap specs, per-enclave cloud targeting, the DriverRegistry and SecretStore
+architecture, and all design decisions.
 
 ---
 
