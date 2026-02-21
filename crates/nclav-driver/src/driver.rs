@@ -97,4 +97,18 @@ pub trait Driver: Send + Sync + 'static {
         partition: &Partition,
         handle: &Handle,
     ) -> Result<ObservedState, DriverError>;
+
+    // ── IaC support ───────────────────────────────────────────────────────────
+
+    /// Cloud-specific Terraform variable values (written to `nclav_context.auto.tfvars`).
+    /// Implementations should extract values like `project_id` and `region` from
+    /// the enclave handle produced by `provision_enclave`.
+    fn context_vars(&self, enclave: &Enclave, handle: &Handle) -> HashMap<String, String>;
+
+    /// Environment variables to set on the Terraform subprocess for cloud
+    /// authentication. These are read by the provider SDK automatically and
+    /// are never written to disk or tfvars files.
+    ///
+    /// Example (GCP): `GOOGLE_IMPERSONATE_SERVICE_ACCOUNT`, `GOOGLE_PROJECT`.
+    fn auth_env(&self, enclave: &Enclave, handle: &Handle) -> HashMap<String, String>;
 }

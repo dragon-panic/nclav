@@ -4,15 +4,19 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nclav_domain::{EnclaveId, PartitionId};
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::error::StoreError;
-use crate::state::{AuditEvent, EnclaveState, PartitionState};
+use crate::state::{AuditEvent, EnclaveState, IacRun, PartitionState};
 use crate::store::StateStore;
 
 #[derive(Debug, Default)]
 struct Inner {
     enclaves: HashMap<EnclaveId, EnclaveState>,
     events: Vec<AuditEvent>,
+    tf_state: HashMap<String, Vec<u8>>,
+    tf_locks: HashMap<String, serde_json::Value>,
+    iac_runs: HashMap<Uuid, IacRun>,
 }
 
 /// In-memory implementation of [`StateStore`].
@@ -108,6 +112,83 @@ impl StateStore for InMemoryStore {
 
         let start = filtered.len().saturating_sub(limit as usize);
         Ok(filtered[start..].to_vec())
+    }
+
+    // ── Terraform HTTP state backend ──────────────────────────────────────────
+
+    async fn get_tf_state(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let guard = self.inner.read().await;
+        Ok(guard.tf_state.get(key).cloned())
+    }
+
+    async fn put_tf_state(&self, key: &str, state: Vec<u8>) -> Result<(), StoreError> {
+        let mut guard = self.inner.write().await;
+        guard.tf_state.insert(key.to_string(), state);
+        Ok(())
+    }
+
+    async fn delete_tf_state(&self, key: &str) -> Result<(), StoreError> {
+        let mut guard = self.inner.write().await;
+        guard.tf_state.remove(key);
+        guard.tf_locks.remove(key);
+        Ok(())
+    }
+
+    async fn lock_tf_state(
+        &self,
+        key: &str,
+        lock_info: serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let mut guard = self.inner.write().await;
+        if let Some(existing) = guard.tf_locks.get(key) {
+            let holder = existing["ID"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string();
+            return Err(StoreError::LockConflict { holder });
+        }
+        guard.tf_locks.insert(key.to_string(), lock_info);
+        Ok(())
+    }
+
+    async fn unlock_tf_state(&self, key: &str, lock_id: &str) -> Result<(), StoreError> {
+        let mut guard = self.inner.write().await;
+        if let Some(existing) = guard.tf_locks.get(key) {
+            if existing["ID"].as_str().unwrap_or("") == lock_id {
+                guard.tf_locks.remove(key);
+            }
+        }
+        Ok(())
+    }
+
+    // ── IaC run log ───────────────────────────────────────────────────────────
+
+    async fn upsert_iac_run(&self, run: &IacRun) -> Result<(), StoreError> {
+        let mut guard = self.inner.write().await;
+        guard.iac_runs.insert(run.id, run.clone());
+        Ok(())
+    }
+
+    async fn list_iac_runs(
+        &self,
+        enclave_id: &EnclaveId,
+        partition_id: &PartitionId,
+    ) -> Result<Vec<IacRun>, StoreError> {
+        let guard = self.inner.read().await;
+        let mut runs: Vec<IacRun> = guard
+            .iac_runs
+            .values()
+            .filter(|r| &r.enclave_id == enclave_id && &r.partition_id == partition_id)
+            .cloned()
+            .collect();
+        runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        runs.truncate(100);
+        Ok(runs)
+    }
+
+    async fn get_iac_run(&self, run_id: Uuid) -> Result<Option<IacRun>, StoreError> {
+        let guard = self.inner.read().await;
+        Ok(guard.iac_runs.get(&run_id).cloned())
     }
 }
 

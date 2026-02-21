@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use nclav_domain::{EnclaveId, PartitionId};
 use serde::{Deserialize, Serialize};
@@ -7,6 +8,29 @@ use serde::{Deserialize, Serialize};
 pub struct ReconcileRequest {
     pub enclaves_dir: PathBuf,
     pub dry_run: bool,
+    /// Base URL of the nclav API server (e.g. "http://127.0.0.1:8080").
+    /// Used to configure the Terraform HTTP state backend.
+    #[serde(default = "default_api_base")]
+    pub api_base: String,
+    /// nclav bearer token. Passed as TF_HTTP_PASSWORD to IaC subprocesses.
+    /// Not serialized — callers must supply it directly.
+    #[serde(skip, default)]
+    pub auth_token: Arc<String>,
+}
+
+fn default_api_base() -> String {
+    "http://127.0.0.1:8080".into()
+}
+
+impl Default for ReconcileRequest {
+    fn default() -> Self {
+        Self {
+            enclaves_dir: std::path::PathBuf::new(),
+            dry_run: false,
+            api_base: default_api_base(),
+            auth_token: Arc::new(String::new()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

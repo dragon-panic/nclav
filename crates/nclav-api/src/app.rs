@@ -15,8 +15,9 @@ pub fn build_app(
     store: Arc<dyn StateStore>,
     registry: Arc<DriverRegistry>,
     auth_token: Arc<String>,
+    api_base: String,
 ) -> Router {
-    let state = AppState { store, registry, auth_token };
+    let state = AppState { store, registry, auth_token, api_base: Arc::new(api_base) };
 
     Router::new()
         // Health
@@ -29,6 +30,21 @@ pub fn build_app(
         .route("/enclaves", get(handlers::list_enclaves))
         .route("/enclaves/:id", get(handlers::get_enclave))
         .route("/enclaves/:id/graph", get(handlers::get_enclave_graph))
+        // IaC run logs
+        .route("/enclaves/:id/partitions/:part/iac/runs", get(handlers::list_iac_runs))
+        .route("/enclaves/:id/partitions/:part/iac/runs/latest", get(handlers::get_latest_iac_run))
+        .route("/enclaves/:id/partitions/:part/iac/runs/:run_id", get(handlers::get_iac_run))
+        // Terraform HTTP state backend
+        .route(
+            "/terraform/state/:enc/:part",
+            get(handlers::get_tf_state)
+                .post(handlers::put_tf_state)
+                .delete(handlers::delete_tf_state),
+        )
+        .route(
+            "/terraform/state/:enc/:part/lock",
+            post(handlers::lock_tf_state).delete(handlers::unlock_tf_state),
+        )
         // Graphs
         .route("/graph", get(handlers::get_system_graph))
         // Events
@@ -59,7 +75,7 @@ mod tests {
         let mut registry = DriverRegistry::new(CloudTarget::Local);
         registry.register(CloudTarget::Local, driver);
         let registry = Arc::new(registry);
-        build_app(store, registry, Arc::new(TEST_TOKEN.to_string()))
+        build_app(store, registry, Arc::new(TEST_TOKEN.to_string()), "http://127.0.0.1:8080".into())
     }
 
     fn authed(req: axum::http::request::Builder) -> axum::http::request::Builder {

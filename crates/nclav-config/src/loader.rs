@@ -2,7 +2,7 @@ use std::path::Path;
 
 use nclav_domain::{
     AuthType, CloudTarget, DnsConfig, Enclave, EnclaveId, Export, ExportTarget, ExportType, Import,
-    NetworkConfig, Partition, PartitionId, ProducesType,
+    NetworkConfig, Partition, PartitionBackend, PartitionId, ProducesType, TerraformConfig,
 };
 use tracing::debug;
 
@@ -182,6 +182,27 @@ fn convert_partition(raw: RawPartition, path: &Path) -> Result<Partition, Config
         .map(|e| convert_export(e, path))
         .collect::<Result<Vec<_>, _>>()?;
 
+    // The partition directory is the parent of config.yml.
+    let dir = path.parent().unwrap_or(path).to_path_buf();
+
+    let backend = match raw.backend.as_str() {
+        "" | "managed" => PartitionBackend::Managed,
+        "terraform" => PartitionBackend::Terraform(TerraformConfig {
+            tool: raw.terraform.and_then(|t| t.tool),
+            dir,
+        }),
+        "opentofu" => PartitionBackend::OpenTofu(TerraformConfig {
+            tool: raw.terraform.and_then(|t| t.tool),
+            dir,
+        }),
+        other => {
+            return Err(ConfigError::Conversion {
+                path: path.display().to_string(),
+                message: format!("unknown backend '{}'; expected managed, terraform, or opentofu", other),
+            });
+        }
+    };
+
     Ok(Partition {
         id: PartitionId::new(&raw.id),
         name: raw.name,
@@ -190,6 +211,7 @@ fn convert_partition(raw: RawPartition, path: &Path) -> Result<Partition, Config
         exports,
         inputs: raw.inputs,
         declared_outputs: raw.declared_outputs,
+        backend,
     })
 }
 

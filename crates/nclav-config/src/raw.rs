@@ -46,6 +46,17 @@ pub struct RawPartition {
     pub inputs: HashMap<String, String>,
     #[serde(default)]
     pub declared_outputs: Vec<String>,
+    /// "managed" (default), "terraform", or "opentofu".
+    #[serde(default)]
+    pub backend: String,
+    /// Present when `backend` is "terraform" or "opentofu".
+    pub terraform: Option<RawTerraformConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RawTerraformConfig {
+    /// Override the IaC binary. Absent = auto-detect from PATH.
+    pub tool: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -238,6 +238,7 @@ mod tests {
             exports: vec![],
             inputs: Default::default(),
             declared_outputs: declared_outputs.into_iter().map(String::from).collect(),
+            backend: Default::default(),
         }
     }
 

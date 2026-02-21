@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 nclav-domain = { workspace = true }
+nclav-store  = { workspace = true }
 async-trait  = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
@@ -13,6 +14,8 @@ tokio        = { workspace = true }
 tracing      = { workspace = true }
 reqwest      = { workspace = true }
 gcp_auth     = { workspace = true }
+chrono       = { workspace = true }
+uuid         = { workspace = true }
 
 [dev-dependencies]
 wiremock     = "0.6"

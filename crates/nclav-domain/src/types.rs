@@ -170,6 +170,30 @@ impl From<&ProducesType> for ExportType {
     }
 }
 
+// ── Partition backend ─────────────────────────────────────────────────────────
+
+/// How a partition's workload is provisioned.
+/// Orthogonal to the enclave's `cloud` field (which controls *where*).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PartitionBackend {
+    /// Default: the cloud driver handles provisioning with its built-in logic.
+    #[default]
+    Managed,
+    /// Co-located `.tf` files in the partition directory, run via the `terraform` binary.
+    Terraform(TerraformConfig),
+    /// Co-located `.tf` files in the partition directory, run via the `tofu` binary.
+    OpenTofu(TerraformConfig),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerraformConfig {
+    /// Binary override. None = auto-detect from PATH (`terraform` first, then `tofu`).
+    pub tool: Option<String>,
+    /// Absolute path to the partition directory containing the `.tf` files.
+    /// Set by the config loader; not present in YAML.
+    pub dir: std::path::PathBuf,
+}
+
 // ── Core structs ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +230,9 @@ pub struct Partition {
     pub inputs: HashMap<String, String>,
     /// Output keys this partition declares it will produce.
     pub declared_outputs: Vec<String>,
+    /// How this partition's workload is provisioned. Defaults to `Managed`.
+    #[serde(default)]
+    pub backend: PartitionBackend,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

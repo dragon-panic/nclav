@@ -4,14 +4,22 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nclav_domain::{EnclaveId, PartitionId};
 use redb::{Database, ReadableTable, TableDefinition};
+use uuid::Uuid;
 
 use crate::error::StoreError;
-use crate::state::{AuditEvent, EnclaveState, PartitionState};
+use crate::state::{AuditEvent, EnclaveState, IacRun, PartitionState};
 use crate::store::StateStore;
 
-const ENCLAVES: TableDefinition<&str, &[u8]> = TableDefinition::new("enclaves");
-const EVENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("events");
-const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+const ENCLAVES: TableDefinition<&str, &[u8]>  = TableDefinition::new("enclaves");
+const EVENTS:   TableDefinition<u64, &[u8]>   = TableDefinition::new("events");
+const META:     TableDefinition<&str, u64>     = TableDefinition::new("meta");
+// Terraform state backend
+const TF_STATE: TableDefinition<&str, &[u8]>  = TableDefinition::new("tf_state");
+const TF_LOCKS: TableDefinition<&str, &[u8]>  = TableDefinition::new("tf_locks");
+// IaC run log — keyed by "{enclave_id}/{partition_id}/{started_at_rfc3339}/{run_id}"
+// for efficient partition-scoped queries in chronological order.
+const IAC_RUNS:         TableDefinition<&str, &[u8]> = TableDefinition::new("iac_runs");
+const IAC_RUNS_BY_PART: TableDefinition<&str, &str>  = TableDefinition::new("iac_runs_by_part");
 
 /// Persistent state store backed by a redb database file.
 ///
@@ -39,6 +47,10 @@ impl RedbStore {
             wtxn.open_table(ENCLAVES).map_err(|e| StoreError::Internal(e.to_string()))?;
             wtxn.open_table(EVENTS).map_err(|e| StoreError::Internal(e.to_string()))?;
             wtxn.open_table(META).map_err(|e| StoreError::Internal(e.to_string()))?;
+            wtxn.open_table(TF_STATE).map_err(|e| StoreError::Internal(e.to_string()))?;
+            wtxn.open_table(TF_LOCKS).map_err(|e| StoreError::Internal(e.to_string()))?;
+            wtxn.open_table(IAC_RUNS).map_err(|e| StoreError::Internal(e.to_string()))?;
+            wtxn.open_table(IAC_RUNS_BY_PART).map_err(|e| StoreError::Internal(e.to_string()))?;
             wtxn.commit().map_err(|e| StoreError::Internal(e.to_string()))?;
         }
 
@@ -160,6 +172,156 @@ impl StateStore for RedbStore {
         }
         let start = all.len().saturating_sub(limit as usize);
         Ok(all[start..].to_vec())
+    }
+
+    // ── Terraform HTTP state backend ──────────────────────────────────────────
+
+    async fn get_tf_state(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let rtxn = self.db.begin_read().map_err(|e| StoreError::Internal(e.to_string()))?;
+        let table = rtxn.open_table(TF_STATE).map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(table
+            .get(key)
+            .map_err(|e| StoreError::Internal(e.to_string()))?
+            .map(|g| g.value().to_vec()))
+    }
+
+    async fn put_tf_state(&self, key: &str, state: Vec<u8>) -> Result<(), StoreError> {
+        let wtxn = self.db.begin_write().map_err(|e| StoreError::Internal(e.to_string()))?;
+        {
+            let mut table = wtxn.open_table(TF_STATE).map_err(|e| StoreError::Internal(e.to_string()))?;
+            table.insert(key, state.as_slice()).map_err(|e| StoreError::Internal(e.to_string()))?;
+        }
+        wtxn.commit().map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn delete_tf_state(&self, key: &str) -> Result<(), StoreError> {
+        let wtxn = self.db.begin_write().map_err(|e| StoreError::Internal(e.to_string()))?;
+        {
+            let mut state_table = wtxn.open_table(TF_STATE).map_err(|e| StoreError::Internal(e.to_string()))?;
+            state_table.remove(key).map_err(|e| StoreError::Internal(e.to_string()))?;
+            let mut lock_table = wtxn.open_table(TF_LOCKS).map_err(|e| StoreError::Internal(e.to_string()))?;
+            lock_table.remove(key).map_err(|e| StoreError::Internal(e.to_string()))?;
+        }
+        wtxn.commit().map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn lock_tf_state(
+        &self,
+        key: &str,
+        lock_info: serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let wtxn = self.db.begin_write().map_err(|e| StoreError::Internal(e.to_string()))?;
+        {
+            let mut table = wtxn.open_table(TF_LOCKS).map_err(|e| StoreError::Internal(e.to_string()))?;
+            // Copy bytes out of the guard immediately so the immutable borrow is
+            // released before we attempt any mutable operation on `table`.
+            let existing_bytes: Option<Vec<u8>> = table
+                .get(key)
+                .map_err(|e| StoreError::Internal(e.to_string()))?
+                .map(|g| g.value().to_vec());
+            if let Some(bytes) = existing_bytes {
+                let existing: serde_json::Value = serde_json::from_slice(&bytes)?;
+                let holder = existing["ID"].as_str().unwrap_or("unknown").to_string();
+                return Err(StoreError::LockConflict { holder });
+            }
+            let bytes = serde_json::to_vec(&lock_info)?;
+            table.insert(key, bytes.as_slice()).map_err(|e| StoreError::Internal(e.to_string()))?;
+        }
+        wtxn.commit().map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn unlock_tf_state(&self, key: &str, lock_id: &str) -> Result<(), StoreError> {
+        let wtxn = self.db.begin_write().map_err(|e| StoreError::Internal(e.to_string()))?;
+        {
+            let mut table = wtxn.open_table(TF_LOCKS).map_err(|e| StoreError::Internal(e.to_string()))?;
+            let existing_bytes: Option<Vec<u8>> = table
+                .get(key)
+                .map_err(|e| StoreError::Internal(e.to_string()))?
+                .map(|g| g.value().to_vec());
+            if let Some(bytes) = existing_bytes {
+                let existing: serde_json::Value = serde_json::from_slice(&bytes)?;
+                if existing["ID"].as_str().unwrap_or("") == lock_id {
+                    table.remove(key).map_err(|e| StoreError::Internal(e.to_string()))?;
+                }
+            }
+        }
+        wtxn.commit().map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    // ── IaC run log ───────────────────────────────────────────────────────────
+
+    async fn upsert_iac_run(&self, run: &IacRun) -> Result<(), StoreError> {
+        let bytes = serde_json::to_vec(run)?;
+        let run_id = run.id.to_string();
+        // Secondary index key: "{enclave_id}/{partition_id}/{started_at}/{run_id}"
+        // Lexicographic iteration gives chronological order; reverse for newest-first.
+        let index_key = format!(
+            "{}/{}/{}/{}",
+            run.enclave_id.as_str(),
+            run.partition_id.as_str(),
+            run.started_at.to_rfc3339(),
+            run_id,
+        );
+
+        let wtxn = self.db.begin_write().map_err(|e| StoreError::Internal(e.to_string()))?;
+        {
+            let mut runs = wtxn.open_table(IAC_RUNS).map_err(|e| StoreError::Internal(e.to_string()))?;
+            runs.insert(run_id.as_str(), bytes.as_slice()).map_err(|e| StoreError::Internal(e.to_string()))?;
+            let mut idx = wtxn.open_table(IAC_RUNS_BY_PART).map_err(|e| StoreError::Internal(e.to_string()))?;
+            idx.insert(index_key.as_str(), run_id.as_str()).map_err(|e| StoreError::Internal(e.to_string()))?;
+        }
+        wtxn.commit().map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_iac_runs(
+        &self,
+        enclave_id: &EnclaveId,
+        partition_id: &PartitionId,
+    ) -> Result<Vec<IacRun>, StoreError> {
+        let prefix = format!("{}/{}/", enclave_id.as_str(), partition_id.as_str());
+        let rtxn = self.db.begin_read().map_err(|e| StoreError::Internal(e.to_string()))?;
+        let idx = rtxn.open_table(IAC_RUNS_BY_PART).map_err(|e| StoreError::Internal(e.to_string()))?;
+        let runs_table = rtxn.open_table(IAC_RUNS).map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        // Collect run IDs from the index in chronological order, then reverse.
+        let mut run_ids: Vec<String> = idx
+            .range(prefix.as_str()..)
+            .map_err(|e| StoreError::Internal(e.to_string()))?
+            .filter_map(|entry| {
+                let (k, v) = entry.ok()?;
+                if k.value().starts_with(prefix.as_str()) {
+                    Some(v.value().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        run_ids.reverse(); // newest first
+        run_ids.truncate(100);
+
+        let mut runs = Vec::with_capacity(run_ids.len());
+        for id in run_ids {
+            if let Some(g) = runs_table.get(id.as_str()).map_err(|e| StoreError::Internal(e.to_string()))? {
+                let run: IacRun = serde_json::from_slice(g.value())?;
+                runs.push(run);
+            }
+        }
+        Ok(runs)
+    }
+
+    async fn get_iac_run(&self, run_id: Uuid) -> Result<Option<IacRun>, StoreError> {
+        let id = run_id.to_string();
+        let rtxn = self.db.begin_read().map_err(|e| StoreError::Internal(e.to_string()))?;
+        let table = rtxn.open_table(IAC_RUNS).map_err(|e| StoreError::Internal(e.to_string()))?;
+        match table.get(id.as_str()).map_err(|e| StoreError::Internal(e.to_string()))? {
+            Some(g) => Ok(Some(serde_json::from_slice(g.value())?)),
+            None => Ok(None),
+        }
     }
 }
 

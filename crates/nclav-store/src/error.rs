@@ -10,4 +10,8 @@ pub enum StoreError {
 
     #[error("internal store error: {0}")]
     Internal(String),
+
+    /// Returned when a TF state lock is already held by another holder.
+    #[error("state lock conflict: already locked by {holder}")]
+    LockConflict { holder: String },
 }

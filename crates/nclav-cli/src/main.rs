@@ -3,7 +3,7 @@ mod commands;
 mod output;
 
 use anyhow::Result;
-use cli::{Cli, Command};
+use cli::{Cli, Command, IacCommand};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -56,5 +56,13 @@ async fn main() -> Result<()> {
         Command::Graph { output, enclave } => {
             commands::graph(output, enclave, cli.remote, cli.token).await
         }
+        Command::Iac { command } => match command {
+            IacCommand::Runs { enclave_id, partition_id } => {
+                commands::iac_runs(enclave_id, partition_id, cli.remote, cli.token).await
+            }
+            IacCommand::Logs { enclave_id, partition_id, run_id } => {
+                commands::iac_logs(enclave_id, partition_id, run_id, cli.remote, cli.token).await
+            }
+        },
     }
 }

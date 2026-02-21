@@ -109,6 +109,35 @@ pub enum Command {
         #[arg(long)]
         enclave: Option<String>,
     },
+
+    /// Inspect IaC (Terraform/OpenTofu) run logs for a partition.
+    Iac {
+        #[command(subcommand)]
+        command: IacCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IacCommand {
+    /// List IaC runs for a partition (newest first).
+    Runs {
+        /// Enclave ID.
+        enclave_id: String,
+        /// Partition ID.
+        partition_id: String,
+    },
+
+    /// Print the full log from an IaC run.
+    ///
+    /// If no run ID is given, prints the most recent run's log.
+    Logs {
+        /// Enclave ID.
+        enclave_id: String,
+        /// Partition ID.
+        partition_id: String,
+        /// Specific run ID (UUID). Omit to use the latest run.
+        run_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]

@@ -1,6 +1,7 @@
 id: db
 name: Database
 produces: tcp
+backend: terraform
 imports: []
 inputs: {}
 declared_outputs:

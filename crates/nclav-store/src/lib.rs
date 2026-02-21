@@ -6,7 +6,7 @@ pub mod redb_store;
 
 pub use error::StoreError;
 pub use state::{
-    AuditEvent, EnclaveState, PartitionState,
+    AuditEvent, EnclaveState, IacOperation, IacRun, IacRunStatus, PartitionState,
     ProvisioningStatus, ResourceError, ResourceMeta,
     compute_desired_hash,
 };

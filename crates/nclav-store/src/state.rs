@@ -225,6 +225,62 @@ impl EnclaveState {
     }
 }
 
+// ── IaC run log ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IacOperation {
+    Provision,
+    Update,
+    Teardown,
+}
+
+impl std::fmt::Display for IacOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IacOperation::Provision => write!(f, "provision"),
+            IacOperation::Update => write!(f, "update"),
+            IacOperation::Teardown => write!(f, "teardown"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IacRunStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl std::fmt::Display for IacRunStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IacRunStatus::Running => write!(f, "running"),
+            IacRunStatus::Succeeded => write!(f, "succeeded"),
+            IacRunStatus::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+/// A record of a single IaC tool invocation (init + apply/destroy) for a partition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IacRun {
+    pub id: Uuid,
+    pub enclave_id: EnclaveId,
+    pub partition_id: PartitionId,
+    pub operation: IacOperation,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub status: IacRunStatus,
+    /// Exit code of the IaC tool process (None while still Running).
+    pub exit_code: Option<i32>,
+    /// Combined stdout+stderr in arrival order.
+    pub log: String,
+    /// The reconcile run that triggered this IaC run, if any.
+    pub reconcile_run_id: Option<Uuid>,
+}
+
 // ── AuditEvent ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1219,6 +1219,42 @@ impl Driver for GcpDriver {
             }
         }
     }
+
+    // ── IaC support ───────────────────────────────────────────────────────────
+
+    fn context_vars(&self, enclave: &Enclave, handle: &Handle) -> HashMap<String, String> {
+        let mut vars = HashMap::new();
+        // Prefer the project_id stored in the enclave handle (written by provision_enclave),
+        // fall back to deriving it from the enclave ID in case the handle is absent.
+        let project_id = handle["project_id"]
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| self.gcp_project_id(enclave.id.as_str()));
+        let region = handle["region"]
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| self.region(enclave).to_string());
+        vars.insert("nclav_project_id".into(), project_id);
+        vars.insert("nclav_region".into(), region);
+        vars
+    }
+
+    fn auth_env(&self, enclave: &Enclave, handle: &Handle) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        let project_id = handle["project_id"]
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| self.gcp_project_id(enclave.id.as_str()));
+
+        // Use service account impersonation on top of the operator's ADC credentials.
+        // The enclave identity is the SA name; we construct the full email.
+        if let Some(identity) = &enclave.identity {
+            let sa_email = format!("{}@{}.iam.gserviceaccount.com", identity, project_id);
+            env.insert("GOOGLE_IMPERSONATE_SERVICE_ACCOUNT".into(), sa_email);
+        }
+        env.insert("GOOGLE_PROJECT".into(), project_id);
+        env
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1328,6 +1364,7 @@ mod tests {
             exports:          vec![],
             inputs:           HashMap::new(),
             declared_outputs: vec!["hostname".into(), "port".into()],
+            backend:          Default::default(),
         }
     }
 
@@ -1340,6 +1377,7 @@ mod tests {
             exports:          vec![],
             inputs:           HashMap::new(),
             declared_outputs: vec!["hostname".into(), "port".into()],
+            backend:          Default::default(),
         }
     }
 
@@ -1352,6 +1390,7 @@ mod tests {
             exports:          vec![],
             inputs:           HashMap::new(),
             declared_outputs: vec!["queue_url".into()],
+            backend:          Default::default(),
         }
     }
 

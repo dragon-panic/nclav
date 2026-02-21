@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
-use nclav_domain::{Enclave, EnclaveId};
+use nclav_domain::{Enclave, EnclaveId, PartitionBackend};
 use nclav_store::{
     AuditEvent, EnclaveState, PartitionState, ProvisioningStatus, StateStore,
     compute_desired_hash,
 };
-use nclav_driver::DriverRegistry;
+use nclav_driver::{DriverRegistry, TerraformBackend};
 use nclav_graph::validate;
 use uuid::Uuid;
 use tracing::{debug, info, warn};
@@ -20,6 +20,11 @@ pub async fn reconcile(
     store: Arc<dyn StateStore>,
     registry: Arc<DriverRegistry>,
 ) -> Result<ReconcileReport, ReconcileError> {
+    let tf_backend = Arc::new(TerraformBackend {
+        api_base: req.api_base.clone(),
+        auth_token: req.auth_token.clone(),
+        store: store.clone(),
+    });
     let mut report = ReconcileReport::new(req.dry_run);
 
     // 1. Load YAML
@@ -165,6 +170,30 @@ pub async fn reconcile(
             let cloud = existing.resolved_cloud.clone().unwrap_or_else(|| registry.default_cloud.clone());
             if let Ok(driver) = registry.for_cloud(cloud) {
                 if let Some(handle) = &existing.enclave_handle {
+                    // Teardown IaC partitions before tearing down the enclave itself
+                    let auth_env = driver.auth_env(&existing.desired, handle);
+                    for (part_id, part_state) in &existing.partitions {
+                        match &part_state.desired.backend {
+                            PartitionBackend::Terraform(_) | PartitionBackend::OpenTofu(_) => {
+                                if let Err(e) = tf_backend
+                                    .teardown(&existing.desired, &part_state.desired, &auth_env, Some(run_id))
+                                    .await
+                                {
+                                    warn!(
+                                        enclave_id = %id,
+                                        partition_id = %part_id,
+                                        error = %e,
+                                        "IaC partition teardown failed during enclave removal"
+                                    );
+                                    report.errors.push(format!(
+                                        "teardown {}/{}: {}", id, part_id, e
+                                    ));
+                                }
+                            }
+                            PartitionBackend::Managed => {}
+                        }
+                    }
+
                     driver.teardown_enclave(&existing.desired, handle).await?;
                 }
             }
@@ -263,15 +292,32 @@ pub async fn reconcile(
             enc_state.partitions.insert(part.id.clone(), part_state.clone());
             store.upsert_enclave(&enc_state).await?;
 
-            match driver
-                .provision_partition(
-                    enc,
-                    part,
-                    &resolved_inputs,
-                    part_state.partition_handle.as_ref(),
-                )
-                .await
-            {
+            let provision_result = match &part.backend {
+                PartitionBackend::Managed => {
+                    driver
+                        .provision_partition(enc, part, &resolved_inputs, part_state.partition_handle.as_ref())
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                PartitionBackend::Terraform(_) | PartitionBackend::OpenTofu(_) => {
+                    let context_vars = enc_state
+                        .enclave_handle
+                        .as_ref()
+                        .map(|h| driver.context_vars(enc, h))
+                        .unwrap_or_default();
+                    let auth_env = enc_state
+                        .enclave_handle
+                        .as_ref()
+                        .map(|h| driver.auth_env(enc, h))
+                        .unwrap_or_default();
+                    tf_backend
+                        .provision(enc, part, &resolved_inputs, &context_vars, &auth_env, Some(run_id))
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            };
+
+            match provision_result {
                 Ok(result) => {
                     let now = Utc::now();
                     let ps = enc_state.partitions.entry(part.id.clone()).or_insert_with(|| PartitionState::new(part.clone()));
@@ -288,8 +334,7 @@ pub async fn reconcile(
                         })
                         .await?;
                 }
-                Err(e) => {
-                    let msg = e.to_string();
+                Err(msg) => {
                     warn!(partition_id = %part.id, error = %msg, "partition provision failed");
                     let ps = enc_state.partitions.entry(part.id.clone()).or_insert_with(|| PartitionState::new(part.clone()));
                     ps.meta.mark_error(Utc::now(), msg.clone());
@@ -506,7 +551,7 @@ mod tests {
 
         let store = Arc::new(InMemoryStore::new());
         let registry = test_registry();
-        let req = ReconcileRequest { enclaves_dir: dir, dry_run: true };
+        let req = ReconcileRequest { enclaves_dir: dir, dry_run: true, ..Default::default() };
 
         let report = reconcile(req, store.clone(), registry).await.unwrap();
         assert!(report.dry_run);
@@ -521,7 +566,7 @@ mod tests {
 
         let store = Arc::new(InMemoryStore::new());
         let registry = test_registry();
-        let req = ReconcileRequest { enclaves_dir: dir, dry_run: false };
+        let req = ReconcileRequest { enclaves_dir: dir, dry_run: false, ..Default::default() };
 
         let report = reconcile(req, store.clone(), registry).await.unwrap();
         assert!(report.errors.is_empty(), "expected no errors: {:?}", report.errors);
@@ -555,7 +600,7 @@ mod tests {
 
         let store = Arc::new(InMemoryStore::new());
         let registry = test_registry();
-        let req = ReconcileRequest { enclaves_dir: dir.clone(), dry_run: false };
+        let req = ReconcileRequest { enclaves_dir: dir.clone(), dry_run: false, ..Default::default() };
 
         reconcile(req.clone(), store.clone(), registry.clone()).await.unwrap();
         let report2 = reconcile(req, store.clone(), registry).await.unwrap();

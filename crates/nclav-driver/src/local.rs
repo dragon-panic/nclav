@@ -200,6 +200,14 @@ impl Driver for LocalDriver {
             raw: handle.clone(),
         })
     }
+
+    fn context_vars(&self, _enclave: &Enclave, _handle: &Handle) -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    fn auth_env(&self, _enclave: &Enclave, _handle: &Handle) -> HashMap<String, String> {
+        HashMap::new()
+    }
 }
 
 #[cfg(test)]
@@ -231,6 +239,7 @@ mod tests {
             exports: vec![],
             inputs: HashMap::new(),
             declared_outputs: vec!["hostname".into(), "port".into()],
+            backend: Default::default(),
         }
     }
 

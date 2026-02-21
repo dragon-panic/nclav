@@ -122,7 +122,8 @@ pub async fn bootstrap(
         drivers = active.join(", "),
     );
 
-    let app = nclav_api::build_app(store, registry, Arc::new(token));
+    let api_base = format!("http://{addr}");
+    let app = nclav_api::build_app(store, registry, Arc::new(token), api_base);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("Failed to bind to {addr}"))?;
@@ -232,6 +233,135 @@ pub async fn graph(
                 GraphOutput::Json => unreachable!(),
             }
         }
+    }
+
+    Ok(())
+}
+
+// ── Iac ───────────────────────────────────────────────────────────────────────
+
+pub async fn iac_runs(
+    enclave_id: String,
+    partition_id: String,
+    remote: Option<String>,
+    token: Option<String>,
+) -> Result<()> {
+    let token = resolve_token(token)?;
+    let url = server_url(remote);
+    let endpoint = format!(
+        "{}/enclaves/{}/partitions/{}/iac/runs",
+        url.trim_end_matches('/'),
+        enclave_id,
+        partition_id,
+    );
+    let runs: serde_json::Value = authed_client(&token)
+        .get(&endpoint)
+        .send()
+        .await
+        .with_context(|| format!("Failed to reach server at {url}"))?
+        .json()
+        .await
+        .context("Failed to parse IaC runs response")?;
+
+    let runs = runs.as_array().cloned().unwrap_or_default();
+    if runs.is_empty() {
+        println!("No IaC runs found for {}/{}", enclave_id, partition_id);
+        return Ok(());
+    }
+
+    // Sort newest first by started_at (API returns chronological order)
+    let mut runs = runs;
+    runs.sort_by(|a, b| {
+        b.get("started_at")
+            .and_then(|v| v.as_str())
+            .cmp(&a.get("started_at").and_then(|v| v.as_str()))
+    });
+
+    // Table header
+    println!(
+        "{:<38} {:<12} {:<12} {:<22} {}",
+        "ID", "OPERATION", "STATUS", "STARTED", "EXIT"
+    );
+    println!("{}", "-".repeat(90));
+
+    for run in &runs {
+        let id = run.get("id").and_then(|v| v.as_str()).unwrap_or("-");
+        let op = run.get("operation").and_then(|v| v.as_str()).unwrap_or("-");
+        let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("-");
+        let started = run
+            .get("started_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        // Trim to first 19 chars (2024-01-15T10:30:00) for display
+        let started_short = if started.len() >= 19 { &started[..19] } else { started };
+        let exit = run
+            .get("exit_code")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".into());
+
+        println!(
+            "{:<38} {:<12} {:<12} {:<22} {}",
+            id, op, status, started_short, exit
+        );
+    }
+
+    Ok(())
+}
+
+pub async fn iac_logs(
+    enclave_id: String,
+    partition_id: String,
+    run_id: Option<String>,
+    remote: Option<String>,
+    token: Option<String>,
+) -> Result<()> {
+    let token = resolve_token(token)?;
+    let url = server_url(remote);
+    let base = url.trim_end_matches('/');
+
+    let endpoint = match &run_id {
+        Some(id) => format!(
+            "{}/enclaves/{}/partitions/{}/iac/runs/{}",
+            base, enclave_id, partition_id, id
+        ),
+        None => format!(
+            "{}/enclaves/{}/partitions/{}/iac/runs/latest",
+            base, enclave_id, partition_id
+        ),
+    };
+
+    let resp = authed_client(&token)
+        .get(&endpoint)
+        .send()
+        .await
+        .with_context(|| format!("Failed to reach server at {url}"))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("No IaC run found for {}/{}", enclave_id, partition_id);
+    }
+
+    let run: serde_json::Value = resp.json().await.context("Failed to parse IaC run")?;
+
+    // Print metadata header
+    let id = run.get("id").and_then(|v| v.as_str()).unwrap_or("-");
+    let op = run.get("operation").and_then(|v| v.as_str()).unwrap_or("-");
+    let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("-");
+    let started = run.get("started_at").and_then(|v| v.as_str()).unwrap_or("-");
+    let exit = run
+        .get("exit_code")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".into());
+
+    println!("Run:       {}", id);
+    println!("Operation: {}  Status: {}  Exit: {}", op, status, exit);
+    println!("Started:   {}", started);
+    println!("{}", "─".repeat(60));
+
+    // Print the log
+    let log = run.get("log").and_then(|v| v.as_str()).unwrap_or("");
+    print!("{}", log);
+    if !log.ends_with('\n') {
+        println!();
     }
 
     Ok(())
