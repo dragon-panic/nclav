@@ -2,9 +2,11 @@ id: db
 name: Database
 produces: tcp
 backend: terraform
-imports: []
-inputs: {}
+
+inputs:
+  project_id: "{{ nclav_project_id }}"
+  region: "{{ nclav_region }}"
+
 declared_outputs:
   - hostname
   - port
-exports: []

@@ -188,11 +188,13 @@ fn convert_partition(raw: RawPartition, path: &Path) -> Result<Partition, Config
     let backend = match raw.backend.as_str() {
         "" | "managed" => PartitionBackend::Managed,
         "terraform" => PartitionBackend::Terraform(TerraformConfig {
-            tool: raw.terraform.and_then(|t| t.tool),
+            tool: raw.terraform.as_ref().and_then(|t| t.tool.clone()),
+            source: raw.terraform.as_ref().and_then(|t| t.source.clone()),
             dir,
         }),
         "opentofu" => PartitionBackend::OpenTofu(TerraformConfig {
-            tool: raw.terraform.and_then(|t| t.tool),
+            tool: raw.terraform.as_ref().and_then(|t| t.tool.clone()),
+            source: raw.terraform.as_ref().and_then(|t| t.source.clone()),
             dir,
         }),
         other => {

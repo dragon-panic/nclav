@@ -57,6 +57,8 @@ pub struct RawPartition {
 pub struct RawTerraformConfig {
     /// Override the IaC binary. Absent = auto-detect from PATH.
     pub tool: Option<String>,
+    /// Module source URL. When present, nclav generates all `.tf` files.
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

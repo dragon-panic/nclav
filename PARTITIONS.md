@@ -1,161 +1,266 @@
-# Partition Backends — Design Plan
+# Partition Backends
 
-A partition's `produces` type (http / tcp / queue) defines its **interface contract** with the rest of
-the enclave graph. Its **backend** defines *how that workload is provisioned*. These are orthogonal.
+A partition's `produces` type (`http` / `tcp` / `queue`) defines its **interface
+contract** with the rest of the enclave graph. Its `backend` defines *how that workload
+is provisioned*. These two concerns are independent — any backend can produce any type.
 
 ---
 
-## 1. New `backend` field
+## Backends at a glance
 
-Add `backend` to `RawPartition` / `Partition`. Default is `managed` (current behaviour — the cloud
-driver handles everything with its own built-in logic, e.g. Cloud Run, Pub/Sub).
+| `backend` | Who provisions | Files in partition directory |
+|---|---|---|
+| `managed` (default) | Cloud driver built-in logic (Cloud Run, Pub/Sub, …) | None |
+| `terraform` | `terraform` binary | `.tf` files you write |
+| `opentofu` | `tofu` binary | `.tf` files you write |
+| `terraform` + `source:` | `terraform` binary, module fetched from URL | None — nclav generates everything |
+| `opentofu` + `source:` | `tofu` binary, module fetched from URL | None — nclav generates everything |
+
+---
+
+## Managed partitions
+
+The default. The cloud driver provisions the workload using its own built-in logic
+(e.g. Cloud Run for `http`, Pub/Sub for `queue`). No extra files are needed.
 
 ```yaml
-# enclaves/product-a/dev/db/config.yml
-id: db
-name: Database
-produces: tcp
-backend: terraform          # new; absent or "managed" = current behaviour
-terraform:
-  tool: terraform            # or "opentofu"; absent = auto-detect binary on PATH
+id: api
+name: API Service
+produces: http
 declared_outputs:
   - hostname
   - port
-inputs:
-  db_name: myapp
-  db_tier: db-f1-micro
 ```
-
-The `.tf` files live alongside `config.yml` in the partition directory. Because these are standard
-Terraform files, users can reference any module source natively — git URLs, local paths, the
-Terraform Registry — without nclav needing to understand or replicate module sourcing:
-
-```hcl
-# enclaves/product-a/dev/db/main.tf
-module "rds" {
-  source  = "git::https://github.com/myorg/platform-modules.git//rds?ref=v1.2.0"
-  db_name = var.db_name
-  db_tier = var.db_tier
-}
-
-output "hostname" { value = module.rds.hostname }
-output "port"     { value = module.rds.port }
-```
-
-nclav does not implement module sourcing. Terraform's own mechanisms handle it.
-
-### Supported backend values
-
-| `backend` | binary |
-|---|---|
-| `managed` (default) | — (cloud driver built-in logic) |
-| `terraform` | `terraform` |
-| `opentofu` | `tofu` |
-
-The `terraform:` sub-block is optional and only read when `backend` is `terraform` or `opentofu`.
-If absent, the binary is auto-detected from PATH (`terraform` first, then `tofu`).
 
 ---
 
-## 2. Execution flow
+## IaC-backed partitions
 
-All IaC execution happens through a **workspace** under `~/.nclav/workspaces/{enclave_id}/{partition_id}/`.
-User source files are never modified.
+Set `backend: terraform` or `backend: opentofu` to hand provisioning off to Terraform
+or OpenTofu. nclav manages the workspace, state backend, credentials, and run logs —
+you only write the infrastructure code.
 
-### 2a. Workspace setup
+### Writing your own `.tf` files
+
+Place `.tf` files alongside `config.yml` in the partition directory. nclav symlinks
+them into the workspace and runs `terraform apply` against them.
+
+```text
+enclaves/product-a/dev/db/
+  config.yml    ← partition declaration
+  main.tf       ← your terraform code
+  variables.tf  ← your variable declarations
+```
+
+```yaml
+# config.yml
+id: db
+name: Database
+produces: tcp
+backend: terraform
+
+inputs:
+  db_name: myapp
+  db_host: "{{ database.hostname }}"   # resolved from cross-partition import
+
+declared_outputs:
+  - hostname
+  - port
+```
+
+```hcl
+# main.tf
+variable "db_name" {}
+variable "db_host" {}
+
+resource "google_sql_database_instance" "main" {
+  name   = var.db_name
+  # ...
+}
+
+output "hostname" { value = google_sql_database_instance.main.ip_address[0].ip_address }
+output "port"     { value = 5432 }
+```
+
+### Referencing an external module
+
+Add `source:` to the `terraform:` block to point at a Terraform module by URL instead
+of writing `.tf` files. nclav generates the entire workspace — the partition directory
+must contain no `.tf` files.
+
+```yaml
+# config.yml
+id: db
+name: Database
+produces: tcp
+backend: terraform
+
+terraform:
+  source: "git::https://github.com/myorg/platform-modules.git//postgres?ref=v1.2.0"
+
+inputs:
+  db_name: myapp
+  db_tier: db-f1-micro
+  subnet: "{{ network.subnet_id }}"
+
+declared_outputs:
+  - hostname
+  - port
+```
+
+Ref pinning and all other source options use Terraform's native URL syntax
+(`?ref=`, `?depth=`, etc.) — nclav passes the value through verbatim.
+
+If `source:` is set and any `.tf` files are found in the partition directory, nclav
+errors before running any Terraform command. Use `backend: terraform` without `source:`
+if you want to manage the `.tf` files yourself.
+
+**The platform module is plain Terraform** — no nclav-specific variables or conventions
+are required:
+
+```hcl
+# git::https://github.com/myorg/platform-modules.git//postgres
+variable "db_name" {}
+variable "db_tier" {}
+variable "subnet"  {}
+
+# ... provider, resources ...
+
+output "hostname" { value = google_sql_database_instance.main.ip_address[0].ip_address }
+output "port"     { value = 5432 }
+```
+
+### Overriding the binary
+
+Use `tool:` in the `terraform:` block to pin a specific binary path:
+
+```yaml
+terraform:
+  tool: /usr/local/bin/terraform-1.9
+```
+
+When `tool:` is absent, nclav auto-detects: `terraform` is tried first, then `tofu`.
+
+---
+
+## `inputs:` and template substitution
+
+The `inputs:` map supplies variable values to the partition. Every value is resolved
+through the template engine before provisioning runs — the Terraform subprocess always
+receives plain strings.
+
+Three forms are supported:
+
+| Form | Example | Resolves to |
+|---|---|---|
+| Literal value | `db_name: myapp` | `"myapp"` |
+| Cross-partition import | `db_host: "{{ database.hostname }}"` | Output of the aliased import |
+| nclav context token | `project: "{{ nclav_project_id }}"` | Cloud project ID for the enclave |
+
+**Available `{{ nclav_* }}` tokens:**
+
+| Token | Value |
+|---|---|
+| `{{ nclav_enclave_id }}` | Enclave ID |
+| `{{ nclav_partition_id }}` | Partition ID |
+| `{{ nclav_project_id }}` | Cloud project ID (GCP: enclave's GCP project; local: `""`) |
+| `{{ nclav_region }}` | Cloud region (GCP: configured region; local: `""`) |
+
+Only the keys that appear in `inputs:` are written to the workspace — nothing is
+injected automatically. If your `.tf` files don't declare a variable, don't put it in
+`inputs:`.
+
+For module-sourced partitions, resolved `inputs:` values become module arguments in the
+generated `nclav_module.tf` instead of `auto.tfvars` entries. The template resolution
+step is identical.
+
+---
+
+## `declared_outputs`
+
+List the output keys the partition will produce after provisioning. These must match
+`terraform output` keys in your `.tf` files (or in the referenced module). nclav reads
+them after `terraform apply` and makes them available to downstream partitions via
+import resolution.
+
+```yaml
+declared_outputs:
+  - hostname
+  - port
+```
+
+Required outputs by `produces` type:
+
+| `produces` | Required output keys |
+|---|---|
+| `http` | `hostname`, `port` |
+| `tcp` | `hostname`, `port` |
+| `queue` | `queue_url` |
+
+---
+
+## Workspace layout
+
+nclav maintains a workspace for each IaC-backed partition under
+`~/.nclav/workspaces/{enclave_id}/{partition_id}/`. User source files are never
+modified.
+
+**Raw `.tf` mode:**
 
 ```text
 ~/.nclav/workspaces/product-a-dev/db/
-  nclav_backend.tf          ← generated: declares backend "http" {}
-  nclav_context.auto.tfvars ← generated: resolved_inputs + nclav context vars
-  *.tf  (symlinks)          ← symlinks to all .tf files in the partition directory
-  .terraform/               ← terraform cache (stays in workspace, not user source)
+  nclav_backend.tf            ← generated: HTTP state backend
+  nclav_context.auto.tfvars   ← generated: resolved inputs
+  main.tf  →  (symlink)       ← symlink to your partition directory
+  variables.tf  →  (symlink)
+  .terraform/                 ← Terraform cache
 ```
 
-All `*.tf` files in the partition directory are symlinked into the workspace. User source files
-are never modified. The two generated files (`nclav_backend.tf`, `nclav_context.auto.tfvars`)
-exist only in the workspace.
+**Module-sourced mode:**
 
-### 2b. Generated `nclav_backend.tf`
+```text
+~/.nclav/workspaces/product-a-dev/db/
+  nclav_backend.tf    ← generated: HTTP state backend
+  nclav_module.tf     ← generated: module block with resolved inputs as arguments
+  nclav_outputs.tf    ← generated: output forwarding from module to root
+  .terraform/         ← Terraform cache (module source fetched here)
+```
+
+The generated `nclav_backend.tf` in both modes:
 
 ```hcl
+# Generated by nclav — do not edit
 terraform {
   backend "http" {}
 }
 ```
 
-The backend address is provided via `-backend-config` flags at `terraform init` time (see §4).
+The backend URL, lock addresses, and auth token are supplied via `-backend-config`
+flags at `terraform init` time and are never written to disk.
 
-### 2c. Generated `nclav_context.auto.tfvars`
+---
 
-Contains two things merged together:
+## Cloud provider authentication
 
-1. **nclav context variables** — injected by nclav, prefixed `nclav_*`
-2. **Resolved partition inputs** — the partition's `inputs:` map after `{{ alias.key }}`
-   substitution. This is the same `resolve_inputs()` path used by managed partitions, so
-   cross-partition import values (e.g. a database hostname exported by another partition) flow
-   through automatically. The user declares them in `inputs:` using template syntax; by the time
-   the tfvars file is written they are already fully resolved strings.
+Credentials are injected as **environment variables** on the Terraform subprocess — not
+as tfvars and not as CLI flags. Your `.tf` files require no explicit credential
+configuration; the provider picks them up automatically from the environment.
 
-```hcl
-# nclav context — do not edit
-nclav_enclave_id   = "product-a-dev"
-nclav_partition_id = "api"
-nclav_region       = "us-central1"
-nclav_project_id   = "myorg-product-a-dev"   # GCP: from enclave handle; "" for local
-
-# resolved partition inputs (includes values resolved from cross-partition imports)
-db_host = "10.0.1.5"      # resolved from {{ database.hostname }}
-db_port = "5432"           # resolved from {{ database.port }}
-db_name = "myapp"
-```
-
-The user's `.tf` files declare these as ordinary variables:
-
-```hcl
-variable "db_host" {}
-variable "db_port" {}
-variable "db_name" {}
-```
-
-`nclav_project_id` (and future cloud-specific vars) is extracted from the enclave handle by a new
-`Driver::context_vars(&self, enclave: &Enclave, handle: &Handle) -> HashMap<String, String>`
-method. LocalDriver returns an empty map; GcpDriver extracts `project_id`, `region`, etc.
-
-### 2d. Cloud identity — `auth_env`
-
-Authentication to the cloud provider is injected as **environment variables** on the terraform
-subprocess, not as tfvars. This is a deliberate separation:
-
-- **`context_vars`** → data the user's `.tf` files can reference as `var.nclav_*`
-- **`auth_env`** → credentials the provider SDK reads automatically from the environment;
-  the user's `.tf` files do not reference these at all
-
-The variables are produced by `Driver::auth_env(&self, enclave: &Enclave, handle: &Handle)
--> HashMap<String, String>`. The GCP driver has two modes:
-
-**Local dev (ADC mode)** — when no SA key file is present (`~/.nclav/gcp-credentials.json`
-does not exist), the operator is project owner and Terraform authenticates directly via ADC.
-No impersonation is needed:
+**GCP — local dev (Application Default Credentials):**
 
 ```
 GOOGLE_PROJECT = myorg-product-a-dev
 ```
 
-**Production (SA key mode)** — when `~/.nclav/gcp-credentials.json` was written by
-`provision_platform`, the nclav-server SA key is used and the enclave SA is impersonated
-for scoped permissions:
+**GCP — production (service account key):**
 
 ```
-GOOGLE_APPLICATION_CREDENTIALS    = /home/user/.nclav/gcp-credentials.json
+GOOGLE_APPLICATION_CREDENTIALS    = ~/.nclav/gcp-credentials.json
 GOOGLE_IMPERSONATE_SERVICE_ACCOUNT = product-a-dev-sa@myorg-product-a-dev.iam.gserviceaccount.com
 GOOGLE_PROJECT                     = myorg-product-a-dev
 ```
 
-The full SA email is `{enclave.identity}@{project_id}.iam.gserviceaccount.com`, where
-`project_id` comes from the enclave handle written by `provision_enclave`.
-
-The user's `google` provider picks this up with no explicit configuration:
+Your `google` provider block therefore needs no `credentials` or `project` attributes:
 
 ```hcl
 terraform {
@@ -163,33 +268,29 @@ terraform {
     google = { source = "hashicorp/google" }
   }
 }
-# No provider block required — nclav injects GOOGLE_PROJECT (and in production
-# mode GOOGLE_APPLICATION_CREDENTIALS + GOOGLE_IMPERSONATE_SERVICE_ACCOUNT).
 ```
 
-**LocalDriver** returns an empty map (no auth needed).
+Future cloud drivers (Azure, AWS) follow the same pattern with their own standard env
+vars (`ARM_CLIENT_ID`, `AWS_ROLE_ARN`, etc.).
 
-Future cloud drivers (Azure, AWS) implement `auth_env` with their own standard env vars
-(`ARM_CLIENT_ID`, `AWS_ROLE_ARN`, etc.) following the same pattern.
+---
 
-### 2e. Command sequence
+## Terraform state
 
-`auth_env` variables are merged with `TF_HTTP_PASSWORD` and `TF_INPUT=0` and set on every
-subprocess. `stdin` is set to `/dev/null` so Terraform never blocks waiting for user input.
-A 30-minute hard timeout kills a hung process and returns a clear error.
+nclav implements the [Terraform HTTP backend protocol][tf-http] directly in its API
+server. State blobs are stored in the same redb database used for enclave state. No
+separate S3 bucket, GCS bucket, or Terraform Cloud account is required.
+
+[tf-http]: https://developer.hashicorp.com/terraform/language/backend/http
+
+The complete command sequence for a provision run:
 
 ```
-# Environment set on all terraform subprocesses:
-#   TF_HTTP_PASSWORD=<nclav_token>
-#   TF_IN_AUTOMATION=1
-#   TF_INPUT=0
-#   + all entries from Driver::auth_env()  (e.g. GOOGLE_PROJECT)
-
 terraform init \
   -reconfigure \
-  -backend-config="address=http://127.0.0.1:8080/terraform/state/product-a-dev/db" \
-  -backend-config="lock_address=http://127.0.0.1:8080/terraform/state/product-a-dev/db/lock" \
-  -backend-config="unlock_address=http://127.0.0.1:8080/terraform/state/product-a-dev/db/lock" \
+  -backend-config="address=http://127.0.0.1:8080/terraform/state/{enclave}/{partition}" \
+  -backend-config="lock_address=…/lock" \
+  -backend-config="unlock_address=…/lock" \
   -backend-config="lock_method=POST" \
   -backend-config="unlock_method=DELETE" \
   -backend-config="username=nclav"
@@ -199,306 +300,59 @@ terraform apply -auto-approve -no-color
 terraform output -json
 ```
 
-The nclav token and cloud identity credentials are never written to disk or passed as CLI flags.
-
-### 2f. Output extraction
-
-`terraform output -json` returns a map of `{ "key": { "value": ..., "type": ... } }`. nclav
-extracts the keys listed in `declared_outputs` and returns them as `ProvisionResult.outputs`.
-Missing declared output keys are a `DriverError`.
-
-### 2g. Teardown
-
-```
-terraform destroy -auto-approve -no-color
-```
-
-Runs in the same workspace directory with the same environment. State is deleted from the state
-store after successful destroy.
-
-Teardown is triggered in two ways:
-
-- **Declarative** — remove the enclave from YAML, then run `nclav apply`. The reconciler detects
-  the diff and tears down IaC partitions before deleting the enclave from state.
-- **Imperative** — `nclav destroy <enclave-id>` (or `--all` to nuke every enclave). Calls
-  `DELETE /enclaves/:id` on the API, which follows the identical teardown path. Useful for testing
-  and environment resets without editing YAML.
-
-### 2h. Drift observation (`observe_partition`)
-
-Run `terraform output -json` (no plan, no apply). If it fails (state missing / workspace not
-initialised), report `exists: false`.
+All subprocess environment variables include `TF_IN_AUTOMATION=1` and `TF_INPUT=0`.
+stdin is `/dev/null`. A 30-minute hard timeout kills a hung process.
 
 ---
 
-## 3. State store — Terraform HTTP backend
+## IaC run logs
 
-nclav implements the [Terraform HTTP backend protocol][tf-http] inside its existing API server.
-State blobs are stored in redb (local) / postgres (future). No external state backend is needed.
+Every Terraform invocation (provision, update, teardown) is recorded as an `IacRun`
+with combined stdout+stderr captured in arrival order. Logs are stored in the nclav
+state store and viewable immediately after the run completes.
 
-[tf-http]: https://developer.hashicorp.com/terraform/language/backend/http
+```bash
+# List runs for a partition (newest first)
+nclav iac runs product-a-dev db
 
-### New `StateStore` trait methods
+# Print the most recent run log
+nclav iac logs product-a-dev db
 
-```rust
-// Raw state blob (JSON bytes as-is from Terraform)
-async fn get_tf_state(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError>;
-async fn put_tf_state(&self, key: &str, state: Vec<u8>) -> Result<(), StoreError>;
-async fn delete_tf_state(&self, key: &str) -> Result<(), StoreError>;
-
-// Advisory locking (Terraform lock protocol)
-async fn lock_tf_state(&self, key: &str, lock_info: serde_json::Value)
-    -> Result<(), StoreError>;   // Err(Conflict) if already locked
-async fn unlock_tf_state(&self, key: &str, lock_id: &str) -> Result<(), StoreError>;
+# Print a specific run log
+nclav iac logs product-a-dev db 3f6d9e1a-c4b2-4d91-a8f0-123456789abc
 ```
 
-State key format: `"{enclave_id}/{partition_id}"`.
-
-### New API routes (all protected by bearer-token auth)
+Runs are also accessible via the HTTP API:
 
 ```
-GET    /terraform/state/:enclave_id/:partition_id        → 200 + body, or 204 (no state)
-POST   /terraform/state/:enclave_id/:partition_id        → 200 (state updated)
-DELETE /terraform/state/:enclave_id/:partition_id        → 200 (state deleted)
-POST   /terraform/state/:enclave_id/:partition_id/lock   → 200 (locked) or 409 (locked by other)
-DELETE /terraform/state/:enclave_id/:partition_id/lock   → 200 (unlocked)
+GET /enclaves/{id}/partitions/{part}/iac/runs
+GET /enclaves/{id}/partitions/{part}/iac/runs/latest
+GET /enclaves/{id}/partitions/{part}/iac/runs/{run-id}
 ```
+
+A single `IacRun` record covers the full `init` + `apply` (or `destroy`) sequence, with
+a separator line in the log between phases.
 
 ---
 
-## 4. Reconciler dispatch
+## Teardown
 
-The reconciler, before calling `driver.provision_partition`, checks `partition.backend`:
+When an enclave is removed — either by deleting it from YAML and running `nclav apply`,
+or by running `nclav destroy <enclave-id>` — nclav runs `terraform destroy
+-auto-approve` in the workspace before removing the enclave from state. The same log
+capture and `IacRun` recording applies.
 
-```
-if managed  → driver.provision_partition(...)       // existing path
-if terraform/opentofu → TerraformBackend::provision(...)  // new path
-```
-
-The `Driver` trait is **not called** for IaC-backed partitions — the driver is only responsible for
-enclave-level infra (VPC, project, IAM) and managed partition types. This means all clouds
-automatically get IaC partition support without any driver changes (except `context_vars` and
-`auth_env`).
+The workspace directory is left in place after teardown so the run log remains
+inspectable. It is reused if the enclave is re-provisioned.
 
 ---
 
-## 5. IaC run logs
+## Future work
 
-Every terraform invocation (provision, update, teardown) produces a structured `IacRun` record
-stored in the state store. stdout and stderr are captured interleaved in arrival order, accumulated
-into a single `log` string, and written atomically when the run finishes (succeeded or failed).
-Live streaming is future work.
-
-### `IacRun` struct (`nclav-store`)
-
-```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IacRun {
-    pub id: Uuid,
-    pub enclave_id: EnclaveId,
-    pub partition_id: PartitionId,
-    pub operation: IacOperation,      // Provision | Update | Teardown
-    pub started_at: DateTime<Utc>,
-    pub finished_at: Option<DateTime<Utc>>,
-    pub status: IacRunStatus,         // Running | Succeeded | Failed
-    pub exit_code: Option<i32>,
-    pub log: String,                  // combined stdout+stderr, interleaved in order
-    pub reconcile_run_id: Option<Uuid>,  // links to the reconcile that triggered this
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum IacOperation { Provision, Update, Teardown }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum IacRunStatus { Running, Succeeded, Failed }
-```
-
-### New `StateStore` trait methods
-
-```rust
-async fn append_iac_run(&self, run: &IacRun) -> Result<(), StoreError>;
-async fn list_iac_runs(
-    &self,
-    enclave_id: &EnclaveId,
-    partition_id: &PartitionId,
-) -> Result<Vec<IacRun>, StoreError>;   // ordered newest-first, capped at last 100
-async fn get_iac_run(&self, run_id: Uuid) -> Result<Option<IacRun>, StoreError>;
-```
-
-redb: new `IAC_RUNS` table keyed by `run_id` (UUID bytes); a secondary index table
-`IAC_RUNS_BY_PARTITION` keyed by `"{enclave_id}/{partition_id}/{started_at_rfc3339}/{run_id}"`
-(lexicographic sort gives newest-first when reversed).
-
-### Log capture in `TerraformBackend`
-
-```rust
-// Conceptual — merge stdout+stderr with tokio::process
-let mut child = Command::new(&self.binary)
-    .args(&["apply", "-auto-approve", "-no-color"])
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()?;
-
-// Read both streams line-by-line, interleave into log buffer,
-// and mirror each line to tracing::debug!() so it appears in nclav's own logs.
-```
-
-The run record is written to the store twice:
-1. **Start**: `status: Running`, `finished_at: None`, `log: ""` — allows future streaming to query.
-2. **End**: `status: Succeeded/Failed`, `finished_at`, full `log`, `exit_code`.
-
-`init` and `apply` (or `destroy`) are concatenated into one log with a separator line, under a
-single `IacRun` per reconcile operation.
-
-### New API routes
-
-```
-GET /enclaves/:enclave_id/partitions/:partition_id/iac/runs
-    → 200 [ IacRun summary (id, operation, status, started_at, finished_at) ... ]
-    newest-first, last 100
-
-GET /enclaves/:enclave_id/partitions/:partition_id/iac/runs/:run_id
-    → 200 IacRun (full, including log)
-
-GET /enclaves/:enclave_id/partitions/:partition_id/iac/runs/latest
-    → 200 IacRun (full log of the most recent run)
-```
-
-All routes protected by bearer-token auth.
-
-### CLI subcommands
-
-```
-nclav iac runs <enclave_id> <partition_id>
-    Table output: RUN_ID | OPERATION | STATUS | STARTED | DURATION
-
-nclav iac logs <enclave_id> <partition_id> <run_id>
-    Prints the full log to stdout.
-
-nclav iac logs <enclave_id> <partition_id> --last
-    Shorthand for the most recent run.
-```
-
-### Future work
-
-- SSE endpoint `GET /iac/runs/:run_id/stream` to tail a live run in real time.
-- Log retention policy / pruning older than N runs or N days.
-
----
-
-## 6. New `TerraformBackend` struct (`nclav-driver`)
-
-```rust
-pub struct TerraformBackend {
-    /// "terraform" or "tofu"
-    pub binary: String,
-    /// nclav API base URL (for state backend config and run-log writes)
-    pub api_base: String,
-    /// nclav auth token (for TF_HTTP_PASSWORD)
-    pub auth_token: Arc<String>,
-    /// Store handle for writing IacRun records
-    pub store: Arc<dyn StateStore>,
-}
-
-impl TerraformBackend {
-    pub async fn provision(
-        &self,
-        enclave: &Enclave,
-        partition: &Partition,
-        tf_config: &TerraformConfig,
-        resolved_inputs: &HashMap<String, String>,
-        context_vars: &HashMap<String, String>,  // from Driver::context_vars — written to tfvars
-        auth_env: &HashMap<String, String>,       // from Driver::auth_env — set on subprocess env
-        reconcile_run_id: Option<Uuid>,
-    ) -> Result<ProvisionResult, DriverError>;
-
-    pub async fn teardown(
-        &self,
-        enclave: &Enclave,
-        partition: &Partition,
-        auth_env: &HashMap<String, String>,
-        reconcile_run_id: Option<Uuid>,
-    ) -> Result<(), DriverError>;
-
-    pub async fn observe(
-        &self,
-        enclave: &Enclave,
-        partition: &Partition,
-        auth_env: &HashMap<String, String>,
-        handle: &Handle,
-    ) -> Result<ObservedState, DriverError>;
-}
-```
-
----
-
-## 7. Domain / config changes
-
-### `nclav-domain/src/types.rs`
-
-```rust
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum PartitionBackend {
-    #[default]
-    Managed,
-    Terraform(TerraformConfig),
-    OpenTofu(TerraformConfig),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TerraformConfig {
-    /// Binary override ("terraform" or "tofu"). None = auto-detect from PATH.
-    pub tool: Option<String>,
-}
-```
-
-`Partition` gains `pub backend: PartitionBackend`.
-
-### `nclav-config/src/raw.rs`
-
-```rust
-pub struct RawPartition {
-    // existing fields ...
-    #[serde(default)]
-    pub backend: String,           // "managed" | "terraform" | "opentofu"
-    pub terraform: Option<RawTerraformConfig>,
-}
-
-pub struct RawTerraformConfig {
-    pub tool: Option<String>,
-}
-```
-
----
-
-## 8. Files to create / modify
-
-| File | Change |
-|---|---|
-| `nclav-domain/src/types.rs` | Add `PartitionBackend`, `TerraformConfig`; add `backend` to `Partition` |
-| `nclav-config/src/raw.rs` | Add `backend`, `terraform` to `RawPartition`; add `RawTerraformConfig` |
-| `nclav-config/src/loader.rs` | Parse `backend` + `terraform` block → `PartitionBackend` |
-| `nclav-store/src/store.rs` | Add TF state methods + `IacRun` types + `append/list/get_iac_run` |
-| `nclav-store/src/memory.rs` | In-memory impl for TF state, locks, and IaC run log |
-| `nclav-store/src/redb_store.rs` | redb impl: `TF_STATE`, `TF_LOCKS`, `IAC_RUNS`, `IAC_RUNS_BY_PARTITION` tables |
-| `nclav-driver/src/terraform.rs` | New `TerraformBackend`: workspace setup (symlinks + generated files), process execution, log capture |
-| `nclav-driver/src/driver.rs` | Add `context_vars` and `auth_env` methods to `Driver` trait |
-| `nclav-driver/src/local.rs` | Implement both (return empty maps) |
-| `nclav-driver/src/gcp.rs` | `context_vars`: extracts `project_id`, `region` from handle; `auth_env`: sets `GOOGLE_IMPERSONATE_SERVICE_ACCOUNT` + `GOOGLE_PROJECT` from `enclave.identity` |
-| `nclav-driver/src/lib.rs` | Re-export `TerraformBackend` |
-| `nclav-reconciler/src/reconcile.rs` | Backend dispatch; pass `reconcile_run_id` to `TerraformBackend` |
-| `nclav-api/src/handlers.rs` | TF HTTP state backend routes + IaC run log routes |
-| `nclav-api/src/app.rs` | Register new routes |
-| `nclav-api/src/state.rs` | Pass `api_base` + `auth_token` + `store` to `TerraformBackend` |
-
----
-
-## 9. Out of scope (future)
-
-- `backend: script` — arbitrary `provision.sh` / `teardown.sh` (security implications need design)
-- Soft-delete / destroy protection flag
-- Pulumi, CDK, Helm backends
-- Workspace pruning / cleanup policy for stale workspaces
-- SSE streaming of live IaC run output (`GET /iac/runs/:run_id/stream`)
-- IaC run log retention policy (prune older than N runs or N days)
+- Live log streaming via SSE (`GET /iac/runs/{run-id}/stream`)
+- IaC run log retention / pruning policy
+- Module registry — operator-managed catalog mapping short names to source URLs, with
+  per-enclave policy controlling which modules are permitted
+- `backend: script` — arbitrary `provision.sh` / `teardown.sh`
+- Pulumi, Helm, CDK backends
+- Workspace pruning policy for stale workspaces

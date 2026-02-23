@@ -189,6 +189,11 @@ pub enum PartitionBackend {
 pub struct TerraformConfig {
     /// Binary override. None = auto-detect from PATH (`terraform` first, then `tofu`).
     pub tool: Option<String>,
+    /// Module source URL. When present, nclav generates all workspace `.tf` files from
+    /// this module and the partition directory must contain no `.tf` files.
+    /// Ref pinning and other options are expressed inline using Terraform's native URL
+    /// syntax, e.g. `git::https://…//module?ref=v1.2.0`. Passed verbatim to Terraform.
+    pub source: Option<String>,
     /// Absolute path to the partition directory containing the `.tf` files.
     /// Set by the config loader; not present in YAML.
     pub dir: std::path::PathBuf,

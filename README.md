@@ -313,13 +313,18 @@ declared_outputs:
 
 ### Partition `config.yml` — IaC backend (Terraform / OpenTofu)
 
-Set `backend: terraform` (or `opentofu`) to hand provisioning off to an IaC tool:
+Set `backend: terraform` (or `opentofu`) to hand provisioning off to an IaC tool. Place `.tf` files alongside `config.yml` in the partition directory, and declare the variables you need via `inputs:`:
 
 ```yaml
 id: db
 name: Database
 produces: tcp
 backend: terraform    # terraform | opentofu
+
+inputs:
+  project_id: "{{ nclav_project_id }}"   # opt in to context tokens you need
+  region:     "{{ nclav_region }}"
+  db_host:    "{{ database.hostname }}"  # cross-partition import value
 
 declared_outputs:
   - hostname
@@ -330,27 +335,43 @@ When nclav reconciles this partition it:
 
 1. Creates a workspace at `~/.nclav/workspaces/{enclave_id}/{partition_id}/`
 2. Symlinks all `.tf` files from the partition directory into the workspace
-3. Writes `nclav_backend.tf` (configures the Terraform HTTP state backend, stored in nclav itself — no separate backend setup required) and declares four standard variables
-4. Writes `nclav_context.auto.tfvars` with resolved values for those variables and any resolved cross-partition import values
+3. Writes `nclav_backend.tf` (configures the Terraform HTTP state backend — no separate backend setup required)
+4. Writes `nclav_context.auto.tfvars` with only the keys declared in `inputs:`, after resolving all template tokens
 5. Runs `terraform init` then `terraform apply -auto-approve`
 6. Reads the declared outputs and stores them for downstream partitions to consume
 7. Records the full combined log as an `IacRun` record (viewable with `nclav iac logs`)
 
-**Variables automatically available in every `.tf` file:**
+**`inputs:` template tokens:**
 
-| Variable | Value |
+| Token | Value |
 |---|---|
-| `nclav_enclave_id` | Enclave ID from YAML |
-| `nclav_partition_id` | Partition ID from YAML |
-| `nclav_project_id` | Cloud project ID (GCP: the enclave's GCP project) |
-| `nclav_region` | Cloud region |
+| `{{ nclav_enclave_id }}` | Enclave ID |
+| `{{ nclav_partition_id }}` | Partition ID |
+| `{{ nclav_project_id }}` | Cloud project ID (GCP: enclave's GCP project; local: `""`) |
+| `{{ nclav_region }}` | Cloud region (GCP: configured region; local: `""`) |
+| `{{ alias.key }}` | Output of a declared cross-partition import |
 
-Resolved import values are also injected. If a partition imports an alias `database` with output `hostname`, the tfvar `database_hostname` is available.
+Only the keys listed in `inputs:` are written to `nclav_context.auto.tfvars`. Your `.tf` files must declare matching `variable` blocks for whatever keys you use.
+
+**Referencing an external module** — add `terraform.source` instead of writing `.tf` files. nclav generates the entire workspace; the partition directory must contain no `.tf` files:
+
+```yaml
+backend: terraform
+terraform:
+  source: "git::https://github.com/myorg/platform-modules.git//postgres?ref=v1.2.0"
+
+inputs:
+  project_id: "{{ nclav_project_id }}"
+  region:     "{{ nclav_region }}"
+
+declared_outputs:
+  - hostname
+  - port
+```
 
 **Override the binary** (e.g. to pin a version or use a wrapper):
 
 ```yaml
-backend: terraform
 terraform:
   tool: /usr/local/bin/terraform-1.6
 ```

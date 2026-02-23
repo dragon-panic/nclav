@@ -1,12 +1,7 @@
 # Cloud SQL (PostgreSQL 15) for the product-a-dev db partition.
 #
-# nclav auto-generates nclav_backend.tf alongside this file, which:
-#   - configures the Terraform HTTP state backend (state stored in nclav)
-#   - declares variables: nclav_project_id, nclav_region,
-#                         nclav_enclave_id, nclav_partition_id
-#
-# nclav also writes nclav_context.auto.tfvars with the resolved values,
-# so var.nclav_project_id and var.nclav_region are available below.
+# Variables are supplied by nclav via nclav_context.auto.tfvars.
+# Declare only the ones you use; see inputs: in config.yml.
 
 terraform {
   required_providers {
@@ -17,9 +12,12 @@ terraform {
   }
 }
 
+variable "project_id" {}
+variable "region" {}
+
 provider "google" {
-  project = var.nclav_project_id
-  region  = var.nclav_region
+  project = var.project_id
+  region  = var.region
 }
 
 # ── VPC ───────────────────────────────────────────────────────────────────────
@@ -27,7 +25,7 @@ provider "google" {
 # Reference the VPC that the nclav GCP driver created for this enclave.
 data "google_compute_network" "nclav" {
   name    = "nclav-vpc"
-  project = var.nclav_project_id
+  project = var.project_id
 }
 
 # ── Private services access ───────────────────────────────────────────────────
@@ -53,7 +51,7 @@ resource "google_service_networking_connection" "private_vpc" {
 resource "google_sql_database_instance" "db" {
   name             = "db"
   database_version = "POSTGRES_15"
-  region           = var.nclav_region
+  region           = var.region
 
   settings {
     tier              = "db-f1-micro"

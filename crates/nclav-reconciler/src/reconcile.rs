@@ -279,7 +279,13 @@ pub async fn reconcile(
                 continue;
             }
 
-            let resolved_inputs = resolve_inputs(&part.inputs, &enc_state);
+            // context_vars powers {{ nclav_* }} template substitution for all backends
+            let context_vars = enc_state
+                .enclave_handle
+                .as_ref()
+                .map(|h| driver.context_vars(enc, h))
+                .unwrap_or_default();
+            let resolved_inputs = resolve_inputs(&part.inputs, &enc_state, &context_vars);
 
             let mut part_state = part_existing
                 .unwrap_or_else(|| PartitionState::new(part.clone()));
@@ -300,18 +306,13 @@ pub async fn reconcile(
                         .map_err(|e| e.to_string())
                 }
                 PartitionBackend::Terraform(_) | PartitionBackend::OpenTofu(_) => {
-                    let context_vars = enc_state
-                        .enclave_handle
-                        .as_ref()
-                        .map(|h| driver.context_vars(enc, h))
-                        .unwrap_or_default();
                     let auth_env = enc_state
                         .enclave_handle
                         .as_ref()
                         .map(|h| driver.auth_env(enc, h))
                         .unwrap_or_default();
                     tf_backend
-                        .provision(enc, part, &resolved_inputs, &context_vars, &auth_env, Some(run_id))
+                        .provision(enc, part, &resolved_inputs, &auth_env, Some(run_id))
                         .await
                         .map_err(|e| e.to_string())
                 }
@@ -482,18 +483,27 @@ pub async fn reconcile(
     Ok(report)
 }
 
-/// Resolve `{{ alias.key }}` template variables from import handles.
+/// Resolve template variables in `inputs:` values.
+///
+/// Two forms are supported:
+/// - `{{ alias.key }}` — resolved from cross-partition import handles
+/// - `{{ nclav_token }}` (no dot) — resolved from `context_vars` (e.g. `nclav_project_id`)
 fn resolve_inputs(
     inputs: &HashMap<String, String>,
     enc_state: &EnclaveState,
+    context_vars: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     inputs
         .iter()
-        .map(|(k, v)| (k.clone(), resolve_template(v, enc_state)))
+        .map(|(k, v)| (k.clone(), resolve_template(v, enc_state, context_vars)))
         .collect()
 }
 
-fn resolve_template(template: &str, enc_state: &EnclaveState) -> String {
+fn resolve_template(
+    template: &str,
+    enc_state: &EnclaveState,
+    context_vars: &HashMap<String, String>,
+) -> String {
     let mut result = template.to_string();
     let mut search_start = 0;
     loop {
@@ -505,6 +515,7 @@ fn resolve_template(template: &str, enc_state: &EnclaveState) -> String {
         let inner = result[abs_start + 2..abs_end - 2].trim();
         let parts: Vec<&str> = inner.splitn(2, '.').collect();
         if parts.len() == 2 {
+            // {{ alias.key }} — cross-partition import
             let alias = parts[0];
             let key = parts[1];
             let resolved_val = enc_state
@@ -516,6 +527,14 @@ fn resolve_template(template: &str, enc_state: &EnclaveState) -> String {
                 .map(String::from);
 
             if let Some(val) = resolved_val {
+                result = format!("{}{}{}", &result[..abs_start], val, &result[abs_end..]);
+                search_start = abs_start + val.len();
+                continue;
+            }
+        } else {
+            // {{ token }} — single-token lookup in context_vars (e.g. {{ nclav_project_id }})
+            if let Some(val) = context_vars.get(inner) {
+                let val = val.clone();
                 result = format!("{}{}{}", &result[..abs_start], val, &result[abs_end..]);
                 search_start = abs_start + val.len();
                 continue;
