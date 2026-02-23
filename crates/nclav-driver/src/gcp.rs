@@ -43,6 +43,7 @@ struct BaseUrls {
     pubsub:          String,
     serviceusage:    String,
     cloudbilling:    String,
+    dns:             String,
 }
 
 impl Default for BaseUrls {
@@ -55,6 +56,7 @@ impl Default for BaseUrls {
             pubsub:          "https://pubsub.googleapis.com".into(),
             serviceusage:    "https://serviceusage.googleapis.com".into(),
             cloudbilling:    "https://cloudbilling.googleapis.com".into(),
+            dns:             "https://dns.googleapis.com".into(),
         }
     }
 }
@@ -297,8 +299,23 @@ impl GcpDriver {
                 .await
                 .map_err(|e| DriverError::Internal(format!("poll decode: {}", e)))?;
 
-            if resp["done"].as_bool().unwrap_or(false) {
-                if resp.get("error").is_some() {
+            // Two operation formats in play:
+            //   LRO  (Resource Manager, Service Usage, Cloud Run): "done": true
+            //   Compute API:                                        "status": "DONE"
+            let is_done = resp["done"].as_bool().unwrap_or(false)
+                || resp["status"].as_str() == Some("DONE");
+
+            if is_done {
+                // Compute API errors: { "error": { "errors": [{ "code": "...", "message": "..." }] } }
+                // LRO errors:         { "error": { "code": 403, "status": "...", "message": "..." } }
+                if let Some(errors) = resp["error"]["errors"].as_array() {
+                    if !errors.is_empty() {
+                        let msg = errors[0]["message"].as_str().unwrap_or("operation failed");
+                        return Err(DriverError::ProvisionFailed(
+                            format!("operation failed: {}", msg),
+                        ));
+                    }
+                } else if resp["error"].is_object() {
                     let msg = Self::extract_gcp_error(&json!({ "error": resp["error"] }));
                     return Err(DriverError::ProvisionFailed(
                         format!("operation failed: {}", msg),
@@ -474,6 +491,28 @@ impl Driver for GcpDriver {
                     .json()
                     .await
                     .map_err(|e| DriverError::Internal(e.to_string()))?;
+
+                // If the project is pending GCP's 30-day soft-delete, restore it rather
+                // than failing.  The user is warned because existing resources, IAM
+                // bindings, and billing history will be preserved — not a clean slate.
+                if project["lifecycleState"].as_str() == Some("DELETE_REQUESTED") {
+                    warn!(
+                        project_id,
+                        "GCP project is pending deletion — restoring it instead of creating \
+                         fresh; existing resources, IAM bindings and billing history will be \
+                         preserved"
+                    );
+                    let undelete_url = format!(
+                        "{}/v3/projects/{}:undelete",
+                        self.base.resourcemanager, project_id
+                    );
+                    let op = self.post_json(&undelete_url, &token, &json!({})).await?;
+                    if let Some(op_name) = op["name"].as_str() {
+                        let op_url = format!("{}/v3/{}", self.base.resourcemanager, op_name);
+                        self.wait_for_operation(&op_url).await?;
+                    }
+                }
+
                 project["projectNumber"].as_str().unwrap_or("").to_string()
             }
             Err(e) => return Err(e),
@@ -578,6 +617,84 @@ impl Driver for GcpDriver {
             );
         }
 
+        // 6. Create subnets (one per entry in network.subnets)
+        if let Some(network) = &enclave.network {
+            let subnet_url_base = format!(
+                "{}/compute/v1/projects/{}/regions/{}/subnetworks",
+                self.base.compute, project_id, region
+            );
+            for (i, cidr) in network.subnets.iter().enumerate() {
+                let subnet_name = format!("subnet-{}", i);
+                info!(project_id, subnet_name, cidr, "Creating subnet");
+                let subnet_op = match self
+                    .post_json(
+                        &subnet_url_base,
+                        &token,
+                        &json!({
+                            "name":                 subnet_name,
+                            "network":              vpc_self_link.clone(),
+                            "ipCidrRange":          cidr,
+                            "region":               region,
+                            "privateIpGoogleAccess": true,
+                        }),
+                    )
+                    .await
+                {
+                    Ok(op) => Some(op),
+                    Err(e) if e.to_string().to_lowercase().contains("already exists") => {
+                        info!(project_id, subnet_name = format!("subnet-{}", i), "Subnet already exists");
+                        None
+                    }
+                    Err(e) => return Err(e),
+                };
+                if let Some(op) = subnet_op {
+                    if let Some(op_name) = op["name"].as_str() {
+                        let op_url = format!(
+                            "{}/compute/v1/projects/{}/regions/{}/operations/{}",
+                            self.base.compute, project_id, region, op_name
+                        );
+                        self.wait_for_operation(&op_url).await?;
+                    }
+                }
+            }
+        }
+
+        // 7. Create private DNS zone (if dns.zone is set)
+        let mut dns_zone_name = String::new();
+        if let Some(dns) = &enclave.dns {
+            if let Some(zone) = &dns.zone {
+                info!(project_id, zone, "Creating private DNS zone");
+                let dns_url = format!(
+                    "{}/dns/v1/projects/{}/managedZones",
+                    self.base.dns, project_id
+                );
+                // "nclav-zone" is our fixed internal managed zone name per project.
+                match self
+                    .post_json(
+                        &dns_url,
+                        &token,
+                        &json!({
+                            "name":        "nclav-zone",
+                            "dnsName":     format!("{}.", zone),
+                            "description": "nclav managed private DNS zone",
+                            "visibility":  "private",
+                            "privateVisibilityConfig": {
+                                "networks": [{ "networkUrl": vpc_self_link }]
+                            },
+                        }),
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().to_lowercase().contains("already exists") => {
+                        info!(project_id, "DNS zone already exists");
+                    }
+                    Err(e) => return Err(e),
+                }
+                dns_zone_name = "nclav-zone".to_string();
+            }
+        }
+
         // All steps completed — stamp the handle so future calls can skip re-provisioning.
         let handle = json!({
             "driver":                "gcp",
@@ -586,6 +703,7 @@ impl Driver for GcpDriver {
             "project_number":        project_number,
             "service_account_email": sa_email,
             "vpc_self_link":         vpc_self_link,
+            "dns_zone_name":         dns_zone_name,
             "region":                region,
             "provisioning_complete": true,
         });
@@ -1262,7 +1380,7 @@ impl Driver for GcpDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nclav_domain::{CloudTarget, EnclaveId, PartitionId};
+    use nclav_domain::{CloudTarget, DnsConfig, EnclaveId, NetworkConfig, PartitionId};
     use wiremock::{
         matchers::{method, path},
         Mock, MockServer, ResponseTemplate,
@@ -1333,6 +1451,7 @@ mod tests {
             pubsub:          url.to_string(),
             serviceusage:    url.to_string(),
             cloudbilling:    url.to_string(),
+            dns:             url.to_string(),
         }
     }
 
@@ -1480,6 +1599,50 @@ mod tests {
         let err = d.wait_for_operation(&url).await.unwrap_err();
         assert!(matches!(err, DriverError::ProvisionFailed(_)));
         assert!(err.to_string().contains("PERMISSION_DENIED"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_operation_handles_compute_status_done() {
+        // Compute API operations use "status": "DONE" not "done": true.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/compute/v1/projects/p/regions/r/operations/op-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "kind":     "compute#operation",
+                "name":     "op-1",
+                "status":   "DONE",
+                "progress": 100,
+            })))
+            .mount(&server)
+            .await;
+
+        let d   = driver(&server);
+        let url = format!("{}/compute/v1/projects/p/regions/r/operations/op-1", server.uri());
+        assert!(d.wait_for_operation(&url).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn wait_for_operation_handles_compute_error() {
+        // Compute API operation failures embed errors under error.errors[].
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/compute/v1/projects/p/global/operations/op-err"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "kind":   "compute#operation",
+                "name":   "op-err",
+                "status": "DONE",
+                "error":  {
+                    "errors": [{ "code": "RESOURCE_NOT_FOUND", "message": "network not found" }]
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        let d   = driver(&server);
+        let url = format!("{}/compute/v1/projects/p/global/operations/op-err", server.uri());
+        let err = d.wait_for_operation(&url).await.unwrap_err();
+        assert!(matches!(err, DriverError::ProvisionFailed(_)));
+        assert!(err.to_string().contains("network not found"));
     }
 
     // ── observe_enclave ───────────────────────────────────────────────────────
@@ -2031,6 +2194,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provision_enclave_creates_subnets_and_dns_zone() {
+        let server = MockServer::start().await;
+
+        let enclave = Enclave {
+            network: Some(NetworkConfig {
+                vpc_cidr: Some("10.0.0.0/16".into()),
+                subnets:  vec!["10.0.1.0/24".into(), "10.0.2.0/24".into()],
+            }),
+            dns: Some(DnsConfig { zone: Some("product-a.dev.local".into()) }),
+            ..dummy_enclave()
+        };
+
+        // 1. POST /v3/projects → operation
+        Mock::given(method("POST"))
+            .and(path("/v3/projects"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "operations/proj-op",
+            })))
+            .mount(&server)
+            .await;
+
+        // Poll project operation
+        Mock::given(method("GET"))
+            .and(path("/v3/operations/proj-op"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "done": true,
+                "response": { "projectNumber": "111" },
+            })))
+            .mount(&server)
+            .await;
+
+        // 2. PUT billing
+        Mock::given(method("PUT"))
+            .and(path("/v1/projects/test-proj/billingInfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        // 3. POST batchEnable → operation
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/test-proj/services:batchEnable"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "operations/enable-op",
+            })))
+            .mount(&server)
+            .await;
+
+        // Poll batchEnable operation
+        Mock::given(method("GET"))
+            .and(path("/v1/operations/enable-op"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "done": true, "response": {},
+            })))
+            .mount(&server)
+            .await;
+
+        // 4. POST serviceAccounts
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/test-proj/serviceAccounts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "email": "test-proj@test-proj.iam.gserviceaccount.com",
+            })))
+            .mount(&server)
+            .await;
+
+        // 5. POST global/networks (VPC) → Compute operation (bare name, no "operations/" prefix)
+        Mock::given(method("POST"))
+            .and(path("/compute/v1/projects/test-proj/global/networks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "vpc-op",
+            })))
+            .mount(&server)
+            .await;
+
+        // Poll VPC global operation
+        Mock::given(method("GET"))
+            .and(path("/compute/v1/projects/test-proj/global/operations/vpc-op"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "done": true, "response": {},
+            })))
+            .mount(&server)
+            .await;
+
+        // 6. POST subnetworks (called twice — subnet-0 and subnet-1); same bare op name
+        Mock::given(method("POST"))
+            .and(path("/compute/v1/projects/test-proj/regions/us-central1/subnetworks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "subnet-op",
+            })))
+            .mount(&server)
+            .await;
+
+        // Poll subnet regional operation (wiremock serves both calls from the same mock)
+        Mock::given(method("GET"))
+            .and(path("/compute/v1/projects/test-proj/regions/us-central1/operations/subnet-op"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "done": true, "response": {},
+            })))
+            .mount(&server)
+            .await;
+
+        // 7. POST managedZones (DNS is synchronous — no operation to poll)
+        Mock::given(method("POST"))
+            .and(path("/dns/v1/projects/test-proj/managedZones"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        let result = driver(&server)
+            .provision_enclave(&enclave, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.handle["provisioning_complete"], true);
+        assert_eq!(result.handle["dns_zone_name"], "nclav-zone");
+        assert!(
+            result.handle["vpc_self_link"].as_str().unwrap().contains("nclav-vpc"),
+            "vpc_self_link should reference nclav-vpc"
+        );
+    }
+
+    #[tokio::test]
     async fn provision_enclave_resumes_when_provisioning_incomplete() {
         // A handle without provisioning_complete (e.g. previous run timed out)
         // must fall through and re-run all steps rather than returning early.
@@ -2103,6 +2388,92 @@ mod tests {
 
         assert_eq!(result.handle["provisioning_complete"], true);
         assert_eq!(result.handle["project_id"], "test-proj");
+    }
+
+    #[tokio::test]
+    async fn provision_enclave_undeletes_project_pending_deletion() {
+        // Simulates the post-destroy + re-apply case: the GCP project exists but is
+        // in DELETE_REQUESTED state.  The driver should restore it and continue.
+        let server = MockServer::start().await;
+
+        // 1. POST /v3/projects → ALREADY_EXISTS
+        Mock::given(method("POST"))
+            .and(path("/v3/projects"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": { "code": 409, "status": "ALREADY_EXISTS", "message": "already exists" },
+            })))
+            .mount(&server)
+            .await;
+
+        // GET project → DELETE_REQUESTED
+        Mock::given(method("GET"))
+            .and(path("/v3/projects/test-proj"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "projectId":     "test-proj",
+                "projectNumber": "42",
+                "lifecycleState": "DELETE_REQUESTED",
+            })))
+            .mount(&server)
+            .await;
+
+        // POST :undelete → operation
+        Mock::given(method("POST"))
+            .and(path("/v3/projects/test-proj:undelete"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "operations/undelete-op",
+            })))
+            .mount(&server)
+            .await;
+
+        // Poll undelete operation
+        Mock::given(method("GET"))
+            .and(path("/v3/operations/undelete-op"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "done": true, "response": {},
+            })))
+            .mount(&server)
+            .await;
+
+        // 2. PUT billing
+        Mock::given(method("PUT"))
+            .and(path("/v1/projects/test-proj/billingInfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        // 3. POST batchEnable → operation
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/test-proj/services:batchEnable"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "operations/enable-op",
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/operations/enable-op"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "done": true, "response": {},
+            })))
+            .mount(&server)
+            .await;
+
+        // 4. POST serviceAccounts
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/test-proj/serviceAccounts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "email": "test-proj@test-proj.iam.gserviceaccount.com",
+            })))
+            .mount(&server)
+            .await;
+
+        let result = driver(&server)
+            .provision_enclave(&dummy_enclave(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.handle["provisioning_complete"], true);
+        assert_eq!(result.handle["project_number"], "42");
     }
 
     #[tokio::test]
