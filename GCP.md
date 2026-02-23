@@ -65,14 +65,32 @@ sqladmin.googleapis.com         # Cloud SQL (platform state store — future)
 
 ## Required IAM roles for the nclav runner
 
-The service account or user running nclav needs these at the **organization or folder level**:
+### Local dev (ADC mode)
+
+When running locally with `gcloud auth application-default login`, the **operator's account**
+needs these roles on the **enclave projects** it creates (automatically granted as project
+creator/owner):
+
+| Role | Why |
+|---|---|
+| `roles/resourcemanager.projectCreator` | Create one project per enclave (org/folder level) |
+| `roles/billing.user` | Link billing account to new projects (billing account level) |
+| `roles/owner` (on each enclave project) | Automatically granted to the project creator |
+
+Because the operator is project owner, Terraform runs under their ADC credentials directly —
+**no service account impersonation is needed**.
+
+### Production (SA key mode)
+
+When `provision_platform` has been run and `~/.nclav/gcp-credentials.json` exists, the
+**`nclav-server` service account** needs these at the **organization or folder level**:
 
 | Role | Why |
 |---|---|
 | `roles/resourcemanager.projectCreator` | Create one project per enclave |
 | `roles/billing.user` | Link billing account to new projects |
 | `roles/iam.serviceAccountAdmin` | Create per-enclave service accounts |
-| `roles/iam.serviceAccountTokenCreator` | Impersonate enclave SAs for provisioning |
+| `roles/iam.serviceAccountTokenCreator` | Impersonate enclave SAs for Terraform |
 | `roles/compute.networkAdmin` | Create VPCs, subnets, firewall rules |
 | `roles/dns.admin` | Create Cloud DNS zones and records |
 | `roles/run.admin` | Deploy and configure Cloud Run services |
@@ -484,25 +502,19 @@ order of preference:
 
 ```toml
 [dependencies]
-# HTTP client (already in workspace)
+# HTTP client
 reqwest = { version = "0.12", features = ["json"] }
 
-# GCP auth — obtains access tokens from ADC or a service account key
-google-cloud-auth = "0.17"
+# GCP auth — ADC resolution (gcloud, Workload Identity, SA key file)
+gcp_auth = "0.12"
 
-# Optional: strongly-typed GCP API clients (generated from discovery docs)
-# google-cloud-run  = "0.4"
-# google-cloud-pubsub = "0.27"
-# google-cloud-storage = "0.24"
-# Or use raw REST via reqwest + google-cloud-auth for full control.
-
-# Retry with exponential backoff for long-running operations
-tokio-retry = "0.3"
+# Base64 for SA key decoding (provision_platform)
+base64 = "0.22"
 ```
 
-The simplest approach for the initial implementation: raw REST with `reqwest`
-and `google-cloud-auth` for token acquisition. The typed clients can be adopted
-later per-service once the API surface is stable.
+The driver uses raw REST via `reqwest` + `gcp_auth` for token acquisition.
+`gcp_auth::provider()` resolves ADC; `gcp_auth::CustomServiceAccount::from_file`
+loads a SA key JSON file for production mode.
 
 ---
 
@@ -725,6 +737,48 @@ raw JSON:
 For long-running operations that fail, the error is nested at
 `operation.error` with the same shape. The polling helper extracts it
 the same way before surfacing it as a `DriverError::ProvisionFailed`.
+
+---
+
+## GCP authentication modes
+
+The GCP driver supports two authentication modes, selected automatically at startup:
+
+| Mode | When | How |
+|---|---|---|
+| **ADC (local dev)** | `~/.nclav/gcp-credentials.json` absent | `gcp_auth::provider()` — gcloud ADC, Workload Identity, or `GOOGLE_APPLICATION_CREDENTIALS` |
+| **SA key (production)** | `~/.nclav/gcp-credentials.json` present | `gcp_auth::CustomServiceAccount::from_file` — written by `provision_platform` |
+
+In ADC mode the operator is project owner on all enclave projects and Terraform runs under
+their credentials directly — no impersonation is needed. In SA key mode the `nclav-server`
+SA authenticates for both the GCP driver API calls and (via `GOOGLE_IMPERSONATE_SERVICE_ACCOUNT`)
+for Terraform subprocesses.
+
+ADC must include the `cloud-billing` scope for billing account linkage:
+
+```bash
+gcloud auth application-default login \
+  --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/cloud-billing
+```
+
+---
+
+## `provision_platform` — SA key provisioning
+
+`GcpDriver::provision_platform()` bootstraps a dedicated `nclav-server` service account for
+production use. It is **not called automatically** by `nclav bootstrap`; call it once when an
+operator with Org/Folder Admin rights sets up a new environment:
+
+**What it does:**
+1. Creates the platform project `{prefix}-nclav`
+2. Enables required APIs in the platform project
+3. Creates the `nclav-server` service account
+4. Grants `roles/resourcemanager.projectCreator` at the parent (prints a manual `gcloud` command if `PERMISSION_DENIED`)
+5. Grants `roles/billing.user` on the billing account (same fallback)
+6. Creates and returns a SA key (base64-decoded JSON)
+
+The caller writes the key JSON to `~/.nclav/gcp-credentials.json` (mode 0600). On the next
+`nclav bootstrap --cloud gcp` the key file is detected and the driver switches to SA key mode.
 
 ---
 

@@ -1055,6 +1055,7 @@ name = "nclav-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "nclav-config",
  "nclav-domain",
  "nclav-driver",
@@ -1121,6 +1122,7 @@ name = "nclav-driver"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
  "gcp_auth",
  "nclav-domain",

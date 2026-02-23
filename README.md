@@ -209,7 +209,7 @@ Start the server with `nclav bootstrap`, then use the token from `~/.nclav/token
 | `POST` | `/terraform/state/{enc}/{part}` | TF HTTP backend: save state |
 | `DELETE` | `/terraform/state/{enc}/{part}` | TF HTTP backend: delete state |
 | `POST` | `/terraform/state/{enc}/{part}/lock` | TF HTTP backend: acquire lock |
-| `DELETE` | `/terraform/state/{enc}/{part}/lock` | TF HTTP backend: release lock |
+| `DELETE` | `/terraform/state/{enc}/{part}/lock` | TF HTTP backend: release lock. Send no body to force-unlock (clears any lock regardless of ID) |
 
 ```bash
 TOKEN=$(cat ~/.nclav/token)

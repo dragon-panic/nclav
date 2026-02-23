@@ -243,7 +243,8 @@ impl StateStore for RedbStore {
                 .map(|g| g.value().to_vec());
             if let Some(bytes) = existing_bytes {
                 let existing: serde_json::Value = serde_json::from_slice(&bytes)?;
-                if existing["ID"].as_str().unwrap_or("") == lock_id {
+                // Empty lock_id = force-unlock (no ID check).
+                if lock_id.is_empty() || existing["ID"].as_str().unwrap_or("") == lock_id {
                     table.remove(key).map_err(|e| StoreError::Internal(e.to_string()))?;
                 }
             }

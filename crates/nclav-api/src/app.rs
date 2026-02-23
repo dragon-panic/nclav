@@ -65,6 +65,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
+    use base64::Engine as _;
     use nclav_domain::CloudTarget;
     use nclav_driver::LocalDriver;
     use nclav_store::InMemoryStore;
@@ -103,6 +104,42 @@ mod tests {
                 Request::builder()
                     .uri("/health")
                     .header("Authorization", "Bearer wrong-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn basic_auth_with_correct_token_returns_200() {
+        // Terraform's HTTP backend sends the token as the Basic auth password.
+        let app = test_app();
+        let credentials = base64::engine::general_purpose::STANDARD
+            .encode(format!("nclav:{}", TEST_TOKEN));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Authorization", format!("Basic {}", credentials))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn basic_auth_with_wrong_token_returns_401() {
+        let app = test_app();
+        let credentials = base64::engine::general_purpose::STANDARD.encode("nclav:wrong-token");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Authorization", format!("Basic {}", credentials))
                     .body(Body::empty())
                     .unwrap(),
             )

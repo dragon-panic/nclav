@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -116,21 +117,19 @@ const REQUIRED_APIS: &[&str] = &[
 // ── GcpDriver ─────────────────────────────────────────────────────────────────
 
 pub struct GcpDriver {
-    config: GcpDriverConfig,
-    client: reqwest::Client,
-    token:  Box<dyn TokenProvider>,
-    base:   BaseUrls,
+    config:   GcpDriverConfig,
+    client:   reqwest::Client,
+    token:    Box<dyn TokenProvider>,
+    base:     BaseUrls,
+    /// Path to the nclav-server SA key file, if bootstrap provisioned one.
+    /// When set, `auth_env` passes `GOOGLE_APPLICATION_CREDENTIALS` to Terraform
+    /// so it can authenticate as the nclav-server SA and impersonate the enclave SA.
+    key_file: Option<PathBuf>,
 }
 
 impl GcpDriver {
-    /// Create a `GcpDriver` using Application Default Credentials.
-    ///
-    /// ADC resolution order:
-    /// 1. `GOOGLE_APPLICATION_CREDENTIALS` env var (service account JSON key)
-    /// 2. Workload Identity (when running on GCP)
-    /// 3. `gcloud auth application-default login` for local dev
-    pub async fn from_adc(mut config: GcpDriverConfig) -> Result<Self, DriverError> {
-        // Validate parent format before any API calls
+    /// Validate and normalize a `GcpDriverConfig`.
+    fn validate_config(mut config: GcpDriverConfig) -> Result<GcpDriverConfig, DriverError> {
         let parent = &config.parent;
         let parent_ok = (parent.starts_with("folders/") || parent.starts_with("organizations/"))
             && parent.splitn(2, '/').nth(1).map_or(false, |id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()));
@@ -141,42 +140,64 @@ impl GcpDriver {
                 parent
             )));
         }
-
-        // Normalize and validate billing account.
-        // Accept any casing of the prefix (billingaccounts/, billingAccounts/, etc.)
-        // and canonicalise to the form GCP requires: "billingAccounts/XXXXXX-YYYYYY-ZZZZZZ".
-        {
-            let billing = &config.billing_account;
-            let billing_id = if billing.to_lowercase().starts_with("billingaccounts/") {
-                billing[billing.find('/').unwrap() + 1..].to_string()
-            } else {
-                billing.clone()
-            };
-            let billing_id_ok = {
-                let parts: Vec<&str> = billing_id.split('-').collect();
-                parts.len() == 3
-                    && parts.iter().all(|p| {
-                        p.len() == 6 && p.chars().all(|c| c.is_ascii_alphanumeric())
-                    })
-            };
-            if !billing_id_ok {
-                return Err(DriverError::Internal(format!(
-                    "GCP billing account must be 'billingAccounts/XXXXXX-YYYYYY-ZZZZZZ', got: {:?}. \
-                     Run `gcloud billing accounts list` to find your billing account ID.",
-                    billing
-                )));
-            }
-            config.billing_account = format!("billingAccounts/{}", billing_id);
+        let billing = &config.billing_account;
+        let billing_id = if billing.to_lowercase().starts_with("billingaccounts/") {
+            billing[billing.find('/').unwrap() + 1..].to_string()
+        } else {
+            billing.clone()
+        };
+        let billing_id_ok = {
+            let parts: Vec<&str> = billing_id.split('-').collect();
+            parts.len() == 3 && parts.iter().all(|p| {
+                p.len() == 6 && p.chars().all(|c| c.is_ascii_alphanumeric())
+            })
+        };
+        if !billing_id_ok {
+            return Err(DriverError::Internal(format!(
+                "GCP billing account must be 'billingAccounts/XXXXXX-YYYYYY-ZZZZZZ', got: {:?}. \
+                 Run `gcloud billing accounts list` to find your billing account ID.",
+                billing
+            )));
         }
+        config.billing_account = format!("billingAccounts/{}", billing_id);
+        Ok(config)
+    }
 
+    /// Create a `GcpDriver` using Application Default Credentials.
+    ///
+    /// ADC resolution order:
+    /// 1. `GOOGLE_APPLICATION_CREDENTIALS` env var (service account JSON key)
+    /// 2. Workload Identity (when running on GCP)
+    /// 3. `gcloud auth application-default login` for local dev
+    pub async fn from_adc(config: GcpDriverConfig) -> Result<Self, DriverError> {
+        let config = Self::validate_config(config)?;
         let inner = gcp_auth::provider()
             .await
             .map_err(|e| DriverError::Internal(format!("Failed to initialise GCP ADC: {}", e)))?;
         Ok(Self {
             config,
-            client: reqwest::Client::new(),
-            token:  Box::new(AdcTokenProvider { inner }),
-            base:   BaseUrls::default(),
+            client:   reqwest::Client::new(),
+            token:    Box::new(AdcTokenProvider { inner }),
+            base:     BaseUrls::default(),
+            key_file: None,
+        })
+    }
+
+    /// Create a `GcpDriver` using a service account key file produced by
+    /// `provision_platform`.  The driver uses these SA credentials for all GCP
+    /// API calls, and passes `GOOGLE_APPLICATION_CREDENTIALS` to Terraform
+    /// subprocesses so they can authenticate and impersonate enclave SAs.
+    pub fn from_key_file(config: GcpDriverConfig, key_path: PathBuf) -> Result<Self, DriverError> {
+        let config = Self::validate_config(config)?;
+        let sa = gcp_auth::CustomServiceAccount::from_file(&key_path)
+            .map_err(|e| DriverError::Internal(format!("Failed to load GCP SA key from {:?}: {}", key_path, e)))?;
+        let inner: std::sync::Arc<dyn gcp_auth::TokenProvider> = std::sync::Arc::new(sa);
+        Ok(Self {
+            config,
+            client:   reqwest::Client::new(),
+            token:    Box::new(AdcTokenProvider { inner }),
+            base:     BaseUrls::default(),
+            key_file: Some(key_path),
         })
     }
 
@@ -216,9 +237,10 @@ impl GcpDriver {
     fn with_static_token(config: GcpDriverConfig, token: &str, base: BaseUrls) -> Self {
         Self {
             config,
-            client: reqwest::Client::new(),
-            token:  Box::new(StaticToken(token.to_string())),
+            client:   reqwest::Client::new(),
+            token:    Box::new(StaticToken(token.to_string())),
             base,
+            key_file: None,
         }
     }
 
@@ -367,6 +389,231 @@ impl GcpDriver {
         }
         Ok(resp)
     }
+
+    /// Read-modify-write an IAM policy to ensure `member` has `role` on `resource_url`.
+    /// Uses `{resource_url}:getIamPolicy` / `{resource_url}:setIamPolicy`.
+    /// Idempotent — skips the write if the binding already exists.
+    async fn ensure_iam_role_binding(
+        &self,
+        token: &str,
+        resource_url: &str,
+        member: &str,
+        role: &str,
+    ) -> Result<(), DriverError> {
+        let current_policy = self
+            .post_json(&format!("{}:getIamPolicy", resource_url), token, &json!({}))
+            .await
+            .unwrap_or_else(|_| json!({ "version": 1, "bindings": [] }));
+        let mut bindings: Vec<Value> = current_policy["bindings"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(binding) = bindings.iter_mut().find(|b| b["role"].as_str() == Some(role)) {
+            let members = binding["members"].as_array_mut().unwrap();
+            if members.iter().any(|m| m.as_str() == Some(member)) {
+                debug!(resource_url, role, member, "IAM binding already present, skipping");
+                return Ok(());
+            }
+            members.push(json!(member));
+        } else {
+            bindings.push(json!({ "role": role, "members": [member] }));
+        }
+        self.post_json(
+            &format!("{}:setIamPolicy", resource_url),
+            token,
+            &json!({ "policy": { "version": 1, "bindings": bindings } }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Provision the nclav server platform in GCP.
+    ///
+    /// Called once during `nclav bootstrap --cloud gcp` before the server starts.
+    /// Creates a platform project (`{prefix}-nclav`), a `nclav-server` service
+    /// account with the IAM roles needed to manage enclave projects, and a SA key.
+    ///
+    /// Returns `(sa_email, key_json)`.  The caller writes `key_json` to
+    /// `~/.nclav/gcp-credentials.json` (mode 0o600) then restarts the driver
+    /// with `from_key_file`.
+    pub async fn provision_platform(&self) -> Result<(String, String), DriverError> {
+        let token = self.bearer().await?;
+        let platform_project_id = match &self.config.project_prefix {
+            Some(prefix) if !prefix.is_empty() => {
+                sanitize_project_id(&format!("{}-nclav", prefix))
+            }
+            _ => "nclav".to_string(),
+        };
+        info!(platform_project_id, "Provisioning nclav platform project");
+
+        // 1. Create platform project
+        let create_url = format!("{}/v3/projects", self.base.resourcemanager);
+        match self
+            .post_json(
+                &create_url,
+                &token,
+                &json!({
+                    "projectId":   platform_project_id,
+                    "displayName": "nclav Platform",
+                    "parent":      self.config.parent,
+                }),
+            )
+            .await
+        {
+            Ok(op) => {
+                let op_name = op["name"]
+                    .as_str()
+                    .ok_or_else(|| DriverError::ProvisionFailed("create platform project: no operation name".into()))?;
+                let op_url = format!("{}/v3/{}", self.base.resourcemanager, op_name);
+                self.wait_for_operation(&op_url).await?;
+            }
+            Err(e) if e.to_string().to_lowercase().contains("already exists") => {
+                info!(platform_project_id, "Platform project already exists");
+            }
+            Err(e) => return Err(e),
+        }
+
+        // 2. Enable the minimal APIs the platform project needs
+        info!(platform_project_id, "Enabling APIs in platform project");
+        let enable_url = format!(
+            "{}/v1/projects/{}/services:batchEnable",
+            self.base.serviceusage, platform_project_id
+        );
+        let enable_op = self
+            .post_json(
+                &enable_url,
+                &token,
+                &json!({
+                    "serviceIds": [
+                        "cloudresourcemanager.googleapis.com",
+                        "cloudbilling.googleapis.com",
+                        "iam.googleapis.com",
+                    ]
+                }),
+            )
+            .await?;
+        if let Some(op_name) = enable_op["name"].as_str() {
+            let op_url = format!("{}/v1/{}", self.base.serviceusage, op_name);
+            self.wait_for_operation(&op_url).await?;
+        }
+
+        // 3. Create nclav-server service account
+        info!(platform_project_id, "Creating nclav-server service account");
+        let sa_url = format!(
+            "{}/v1/projects/{}/serviceAccounts",
+            self.base.iam, platform_project_id
+        );
+        let sa_email = match self
+            .post_json(
+                &sa_url,
+                &token,
+                &json!({
+                    "accountId":      "nclav-server",
+                    "serviceAccount": { "displayName": "nclav Server" },
+                }),
+            )
+            .await
+        {
+            Ok(resp) => resp["email"]
+                .as_str()
+                .unwrap_or(&format!(
+                    "nclav-server@{}.iam.gserviceaccount.com",
+                    platform_project_id
+                ))
+                .to_string(),
+            Err(e) if e.to_string().to_lowercase().contains("already exists") => {
+                info!(platform_project_id, "nclav-server SA already exists");
+                format!("nclav-server@{}.iam.gserviceaccount.com", platform_project_id)
+            }
+            Err(e) => return Err(e),
+        };
+
+        // 4. Grant SA roles/resourcemanager.projectCreator at the parent.
+        //    Requires resourcemanager.{organizations,folders}.setIamPolicy — the
+        //    operator may not have this if they are not an Org/Folder Admin.
+        //    On PERMISSION_DENIED we print the manual gcloud command and continue.
+        info!(sa_email, "Granting projectCreator at parent");
+        let parent_resource = format!("{}/v3/{}", self.base.resourcemanager, self.config.parent);
+        if let Err(e) = self.ensure_iam_role_binding(
+            &token,
+            &parent_resource,
+            &format!("serviceAccount:{}", sa_email),
+            "roles/resourcemanager.projectCreator",
+        )
+        .await
+        {
+            if e.to_string().contains("PERMISSION_DENIED") {
+                let (parent_type, parent_id) = self.config.parent
+                    .split_once('/')
+                    .map(|(t, id)| (t, id))
+                    .unwrap_or(("organizations", &self.config.parent));
+                warn!(
+                    "Could not automatically grant projectCreator on {} — \
+                     your account lacks {}.setIamPolicy. \
+                     Run this once manually:\n  \
+                     gcloud {} add-iam-policy-binding {} \\\n    \
+                     --member=\"serviceAccount:{}\" \\\n    \
+                     --role=\"roles/resourcemanager.projectCreator\"",
+                    self.config.parent, parent_type,
+                    parent_type, parent_id, sa_email,
+                );
+            } else {
+                return Err(e);
+            }
+        }
+
+        // 5. Grant SA roles/billing.user on the billing account.
+        //    Requires billing.accounts.setIamPolicy — may need a Billing Admin.
+        //    On PERMISSION_DENIED we print the manual gcloud command and continue.
+        info!(sa_email, "Granting billing.user on billing account");
+        let billing_id = self.config.billing_account
+            .strip_prefix("billingAccounts/")
+            .unwrap_or(&self.config.billing_account);
+        if let Err(e) = self.ensure_iam_role_binding(
+            &token,
+            &format!("{}/v1/{}", self.base.cloudbilling, self.config.billing_account),
+            &format!("serviceAccount:{}", sa_email),
+            "roles/billing.user",
+        )
+        .await
+        {
+            if e.to_string().contains("PERMISSION_DENIED") {
+                warn!(
+                    "Could not automatically grant billing.user on {} — \
+                     your account lacks billing.accounts.setIamPolicy. \
+                     Run this once manually:\n  \
+                     gcloud billing accounts add-iam-policy-binding {} \\\n    \
+                     --member=\"serviceAccount:{}\" \\\n    \
+                     --role=\"roles/billing.user\"",
+                    self.config.billing_account, billing_id, sa_email,
+                );
+            } else {
+                return Err(e);
+            }
+        }
+
+        // 6. Create SA key
+        info!(sa_email, "Creating service account key");
+        let key_url = format!(
+            "{}/v1/projects/{}/serviceAccounts/{}/keys",
+            self.base.iam, platform_project_id, sa_email
+        );
+        let key_resp = self.post_json(&key_url, &token, &json!({})).await?;
+        let key_b64 = key_resp["privateKeyData"]
+            .as_str()
+            .ok_or_else(|| DriverError::ProvisionFailed("SA key creation: no privateKeyData in response".into()))?;
+
+        use base64::Engine as _;
+        let key_bytes = base64::engine::general_purpose::STANDARD
+            .decode(key_b64)
+            .map_err(|e| DriverError::Internal(format!("decode SA key: {e}")))?;
+        let key_json = String::from_utf8(key_bytes)
+            .map_err(|e| DriverError::Internal(format!("SA key is not valid UTF-8: {e}")))?;
+
+        info!(sa_email, "Platform provisioning complete");
+        Ok((sa_email, key_json))
+    }
+
 }
 
 // ── Project ID sanitization ───────────────────────────────────────────────────
@@ -1364,12 +1611,20 @@ impl Driver for GcpDriver {
             .map(String::from)
             .unwrap_or_else(|| self.gcp_project_id(enclave.id.as_str()));
 
-        // Use service account impersonation on top of the operator's ADC credentials.
-        // The enclave identity is the SA name; we construct the full email.
-        if let Some(identity) = &enclave.identity {
-            let sa_email = format!("{}@{}.iam.gserviceaccount.com", identity, project_id);
-            env.insert("GOOGLE_IMPERSONATE_SERVICE_ACCOUNT".into(), sa_email);
+        if let Some(key_path) = &self.key_file {
+            // Production mode (SA key): authenticate Terraform as the nclav-server SA
+            // and impersonate the enclave SA for scoped permissions.
+            env.insert(
+                "GOOGLE_APPLICATION_CREDENTIALS".into(),
+                key_path.to_string_lossy().into_owned(),
+            );
+            if let Some(identity) = &enclave.identity {
+                let sa_email = format!("{}@{}.iam.gserviceaccount.com", identity, project_id);
+                env.insert("GOOGLE_IMPERSONATE_SERVICE_ACCOUNT".into(), sa_email);
+            }
         }
+        // Local dev (ADC): operator is project owner so Terraform uses ADC directly;
+        // no impersonation needed.
         env.insert("GOOGLE_PROJECT".into(), project_id);
         env
     }
@@ -1380,6 +1635,7 @@ impl Driver for GcpDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use nclav_domain::{CloudTarget, DnsConfig, EnclaveId, NetworkConfig, PartitionId};
     use wiremock::{
         matchers::{method, path},
@@ -2191,6 +2447,122 @@ mod tests {
         );
         assert_eq!(result.handle["provisioning_complete"], true,
             "handle must be stamped on success so future calls can skip re-provisioning");
+    }
+
+    // ── provision_platform ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn provision_platform_creates_project_sa_iam_and_key() {
+        let server = MockServer::start().await;
+
+        // 1. POST /v3/projects (platform project)
+        Mock::given(method("POST"))
+            .and(path("/v3/projects"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "operations/platform-op", "done": false,
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v3/operations/platform-op"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "done": true, "response": { "projectNumber": "999888777" },
+            })))
+            .mount(&server)
+            .await;
+
+        // 2. batchEnable
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/nclav/services:batchEnable"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "operations/enable-op", "done": false,
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/operations/enable-op"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "done": true, "response": {},
+            })))
+            .mount(&server)
+            .await;
+
+        // 3. POST serviceAccounts
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/nclav/serviceAccounts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "email": "nclav-server@nclav.iam.gserviceaccount.com",
+            })))
+            .mount(&server)
+            .await;
+
+        // 4. getIamPolicy on parent (folders/123456)
+        Mock::given(method("POST"))
+            .and(path("/v3/folders/123456:getIamPolicy"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "version": 1, "bindings": [],
+            })))
+            .mount(&server)
+            .await;
+
+        // 4. setIamPolicy on parent
+        let parent_iam_mock = Mock::given(method("POST"))
+            .and(path("/v3/folders/123456:setIamPolicy"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "version": 1, "bindings": [{
+                    "role": "roles/resourcemanager.projectCreator",
+                    "members": ["serviceAccount:nclav-server@nclav.iam.gserviceaccount.com"],
+                }],
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        // 5. getIamPolicy on billing account
+        Mock::given(method("POST"))
+            .and(path("/v1/billingAccounts/AAAAAA-BBBBBB-CCCCCC:getIamPolicy"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "version": 1, "bindings": [],
+            })))
+            .mount(&server)
+            .await;
+
+        // 5. setIamPolicy on billing account
+        let billing_iam_mock = Mock::given(method("POST"))
+            .and(path("/v1/billingAccounts/AAAAAA-BBBBBB-CCCCCC:setIamPolicy"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "version": 1, "bindings": [{
+                    "role": "roles/billing.user",
+                    "members": ["serviceAccount:nclav-server@nclav.iam.gserviceaccount.com"],
+                }],
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        // 6. POST serviceAccounts/{email}/keys
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/nclav/serviceAccounts/nclav-server@nclav.iam.gserviceaccount.com/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                // base64("{"type":"service_account"}") for the test
+                "privateKeyData": base64::engine::general_purpose::STANDARD
+                    .encode(r#"{"type":"service_account"}"#),
+            })))
+            .mount(&server)
+            .await;
+
+        let (sa_email, key_json) = driver(&server)
+            .provision_platform()
+            .await
+            .unwrap();
+
+        drop(parent_iam_mock);
+        drop(billing_iam_mock);
+
+        assert_eq!(sa_email, "nclav-server@nclav.iam.gserviceaccount.com");
+        assert!(key_json.contains("service_account"), "key JSON should be decoded correctly");
     }
 
     #[tokio::test]

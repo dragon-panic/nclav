@@ -131,21 +131,29 @@ subprocess, not as tfvars. This is a deliberate separation:
 - **`auth_env`** → credentials the provider SDK reads automatically from the environment;
   the user's `.tf` files do not reference these at all
 
-The variables are produced by a new `Driver::auth_env(&self, enclave: &Enclave, handle: &Handle)
--> HashMap<String, String>` method. The enclave's `identity` field is the service
-principal/account name scoped to that enclave; `auth_env` constructs the full credential
-reference from it.
+The variables are produced by `Driver::auth_env(&self, enclave: &Enclave, handle: &Handle)
+-> HashMap<String, String>`. The GCP driver has two modes:
 
-**GCP example** — service account impersonation on top of the operator's ADC credentials:
+**Local dev (ADC mode)** — when no SA key file is present (`~/.nclav/gcp-credentials.json`
+does not exist), the operator is project owner and Terraform authenticates directly via ADC.
+No impersonation is needed:
 
 ```
+GOOGLE_PROJECT = myorg-product-a-dev
+```
+
+**Production (SA key mode)** — when `~/.nclav/gcp-credentials.json` was written by
+`provision_platform`, the nclav-server SA key is used and the enclave SA is impersonated
+for scoped permissions:
+
+```
+GOOGLE_APPLICATION_CREDENTIALS    = /home/user/.nclav/gcp-credentials.json
 GOOGLE_IMPERSONATE_SERVICE_ACCOUNT = product-a-dev-sa@myorg-product-a-dev.iam.gserviceaccount.com
 GOOGLE_PROJECT                     = myorg-product-a-dev
 ```
 
 The full SA email is `{enclave.identity}@{project_id}.iam.gserviceaccount.com`, where
-`project_id` comes from the enclave handle written by `provision_enclave`. No key files are
-needed. The operator's existing ADC credentials are used to impersonate the enclave SA.
+`project_id` comes from the enclave handle written by `provision_enclave`.
 
 The user's `google` provider picks this up with no explicit configuration:
 
@@ -155,8 +163,8 @@ terraform {
     google = { source = "hashicorp/google" }
   }
 }
-# No provider block required — nclav sets GOOGLE_PROJECT and
-# GOOGLE_IMPERSONATE_SERVICE_ACCOUNT in the subprocess environment.
+# No provider block required — nclav injects GOOGLE_PROJECT (and in production
+# mode GOOGLE_APPLICATION_CREDENTIALS + GOOGLE_IMPERSONATE_SERVICE_ACCOUNT).
 ```
 
 **LocalDriver** returns an empty map (no auth needed).
@@ -166,12 +174,16 @@ Future cloud drivers (Azure, AWS) implement `auth_env` with their own standard e
 
 ### 2e. Command sequence
 
-`auth_env` variables are merged with `TF_HTTP_PASSWORD` and set on every subprocess.
+`auth_env` variables are merged with `TF_HTTP_PASSWORD` and `TF_INPUT=0` and set on every
+subprocess. `stdin` is set to `/dev/null` so Terraform never blocks waiting for user input.
+A 30-minute hard timeout kills a hung process and returns a clear error.
 
 ```
 # Environment set on all terraform subprocesses:
 #   TF_HTTP_PASSWORD=<nclav_token>
-#   + all entries from Driver::auth_env()  (e.g. GOOGLE_IMPERSONATE_SERVICE_ACCOUNT, GOOGLE_PROJECT)
+#   TF_IN_AUTOMATION=1
+#   TF_INPUT=0
+#   + all entries from Driver::auth_env()  (e.g. GOOGLE_PROJECT)
 
 terraform init \
   -reconfigure \

@@ -302,7 +302,9 @@ impl TerraformBackend {
                 continue;
             }
             let link = workspace.join(&name);
-            let target = entry.path();
+            let target = tokio::fs::canonicalize(entry.path())
+                .await
+                .map_err(|e| DriverError::Internal(format!("canonicalize {:?}: {}", entry.path(), e)))?;
 
             // Remove stale link before re-creating.
             if link.exists() || link.symlink_metadata().is_ok() {
@@ -406,12 +408,14 @@ impl TerraformBackend {
         let mut cmd = Command::new(binary);
         cmd.args(args)
             .current_dir(workspace)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             // State backend auth
             .env("TF_HTTP_PASSWORD", self.auth_token.as_str())
-            // Disable interactive prompts
+            // Disable interactive prompts and colour
             .env("TF_IN_AUTOMATION", "1")
+            .env("TF_INPUT", "0")
             // Cloud-specific auth
             .envs(auth_env);
 
@@ -444,15 +448,36 @@ impl TerraformBackend {
 
         drop(tx); // close our own sender so rx finishes when both tasks finish
 
-        // Collect lines from both streams as they arrive.
-        while let Some(line) = rx.recv().await {
-            debug!(target: "nclav::iac", "{}", line);
-            log.push_str(&line);
-            log.push('\n');
-        }
+        // Collect lines from both streams as they arrive, with a hard timeout.
+        // Terraform should never need more than 30 minutes for init/apply; if it
+        // exceeds that the process is killed and a clear error is returned.
+        const TIMEOUT_SECS: u64 = 1800;
+        let collect = async {
+            while let Some(line) = rx.recv().await {
+                debug!(target: "nclav::iac", "{}", line);
+                log.push_str(&line);
+                log.push('\n');
+            }
+        };
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_secs(TIMEOUT_SECS),
+            collect,
+        )
+        .await
+        .is_err();
 
         stdout_task.await.ok();
         stderr_task.await.ok();
+
+        if timed_out {
+            let _ = child.kill().await;
+            return Err(DriverError::ProvisionFailed(format!(
+                "{} {} timed out after {} minutes",
+                binary,
+                args.first().copied().unwrap_or(""),
+                TIMEOUT_SECS / 60,
+            )));
+        }
 
         let status = child.wait().await
             .map_err(|e| DriverError::Internal(format!("wait {}: {}", binary, e)))?;

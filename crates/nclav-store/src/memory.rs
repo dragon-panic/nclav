@@ -154,7 +154,8 @@ impl StateStore for InMemoryStore {
     async fn unlock_tf_state(&self, key: &str, lock_id: &str) -> Result<(), StoreError> {
         let mut guard = self.inner.write().await;
         if let Some(existing) = guard.tf_locks.get(key) {
-            if existing["ID"].as_str().unwrap_or("") == lock_id {
+            // Empty lock_id = force-unlock (no ID check).
+            if lock_id.is_empty() || existing["ID"].as_str().unwrap_or("") == lock_id {
                 guard.tf_locks.remove(key);
             }
         }

@@ -307,9 +307,11 @@ pub async fn lock_tf_state(
     let key = format!("{}/{}", enc, part);
     match state.store.lock_tf_state(&key, lock_info).await {
         Ok(()) => StatusCode::OK.into_response(),
+        // Terraform's HTTP backend expects the response body to be the existing
+        // lock info JSON directly (not wrapped) — it uses it to show the lock owner.
         Err(StoreError::LockConflict { holder }) => (
             StatusCode::CONFLICT,
-            Json(json!({ "error": "state is locked", "holder": holder })),
+            Json(holder),
         )
             .into_response(),
         Err(e) => ApiError::internal(e.to_string()).into_response(),
@@ -319,14 +321,15 @@ pub async fn lock_tf_state(
 pub async fn unlock_tf_state(
     State(state): State<AppState>,
     Path((enc, part)): Path<(String, String)>,
-    Json(lock_info): Json<Value>,
+    body: axum::body::Bytes,
 ) -> Result<StatusCode, ApiError> {
     let key = format!("{}/{}", enc, part);
-    let lock_id = lock_info
-        .get("ID")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    // Parse the lock ID from the body if present (Terraform's normal unlock path).
+    // An absent or empty body means force-unlock — clear the lock regardless of ID.
+    let lock_id = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("ID").and_then(|v| v.as_str()).map(String::from))
+        .unwrap_or_default();
     state.store.unlock_tf_state(&key, &lock_id).await?;
     Ok(StatusCode::OK)
 }

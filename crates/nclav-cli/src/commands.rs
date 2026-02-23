@@ -98,13 +98,24 @@ pub async fn bootstrap(
                     default_region: gcp_default_region.clone(),
                     project_prefix: gcp_project_prefix.clone(),
                 };
-                println!("Initialising GCP driver (ADC)…");
-                let driver = Arc::new(
+
+                // Use a SA key file if one was written by `provision_platform`
+                // (production/Cloud Run setup), otherwise fall back to ADC.
+                // For local development ADC is sufficient: the operator is project
+                // owner on all enclave projects so Terraform uses ADC directly
+                // without needing impersonation.
+                let creds_path = default_gcp_credentials_path();
+                let driver = if creds_path.exists() {
+                    println!("Using GCP service account credentials from {}", creds_path.display());
+                    GcpDriver::from_key_file(config, creds_path)
+                        .context("Failed to load GCP SA key")?
+                } else {
+                    println!("Initialising GCP driver (ADC)…");
                     GcpDriver::from_adc(config)
                         .await
-                        .context("Failed to initialise GCP driver")?,
-                );
-                registry.register(CloudTarget::Gcp, driver);
+                        .context("Failed to initialise GCP driver")?
+                };
+                registry.register(CloudTarget::Gcp, Arc::new(driver));
             }
             CloudArg::Azure => {
                 anyhow::bail!("Azure driver not yet implemented");
@@ -493,6 +504,12 @@ fn write_token(path: &PathBuf, token: &str) -> Result<()> {
 fn default_token_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".nclav").join("token")
+}
+
+/// Default path for the GCP service account key file written by `provision_platform`.
+fn default_gcp_credentials_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".nclav").join("gcp-credentials.json")
 }
 
 /// Build a reqwest Client with the Authorization header pre-configured.
