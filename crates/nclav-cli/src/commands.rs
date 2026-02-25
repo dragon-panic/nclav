@@ -31,14 +31,31 @@ pub async fn bootstrap(
         anyhow::bail!("bootstrap does not support --remote; run the server locally");
     }
 
-    // Reuse existing token unless rotation is explicitly requested.
-    // This means server restarts don't invalidate client configurations.
-    let token_path = default_token_path();
-    let token = if !rotate_token {
-        if let Ok(existing) = std::fs::read_to_string(&token_path).map(|s| s.trim().to_string()) {
-            if !existing.is_empty() {
-                println!("Reusing existing token from {}", token_path.display());
-                existing
+    // When running in a managed environment (e.g. Cloud Run), the token is
+    // injected via Secret Manager rather than stored in a local file.
+    // NCLAV_TOKEN takes priority over file-based token resolution.
+    let token = if let Ok(env_token) = std::env::var("NCLAV_TOKEN") {
+        if !env_token.is_empty() {
+            println!("Using token from NCLAV_TOKEN environment variable");
+            env_token
+        } else {
+            anyhow::bail!("NCLAV_TOKEN is set but empty");
+        }
+    } else {
+        // Reuse existing token unless rotation is explicitly requested.
+        // This means server restarts don't invalidate client configurations.
+        let token_path = default_token_path();
+        if !rotate_token {
+            if let Ok(existing) = std::fs::read_to_string(&token_path).map(|s| s.trim().to_string()) {
+                if !existing.is_empty() {
+                    println!("Reusing existing token from {}", token_path.display());
+                    existing
+                } else {
+                    let t = generate_token();
+                    write_token(&token_path, &t)?;
+                    println!("Generated new token (written to {})", token_path.display());
+                    t
+                }
             } else {
                 let t = generate_token();
                 write_token(&token_path, &t)?;
@@ -48,15 +65,10 @@ pub async fn bootstrap(
         } else {
             let t = generate_token();
             write_token(&token_path, &t)?;
-            println!("Generated new token (written to {})", token_path.display());
+            println!("Rotated token (written to {})", token_path.display());
+            println!("New token: {}", t);
             t
         }
-    } else {
-        let t = generate_token();
-        write_token(&token_path, &t)?;
-        println!("Rotated token (written to {})", token_path.display());
-        println!("New token: {}", t);
-        t
     };
 
     let store: Arc<dyn StateStore> = if ephemeral {
