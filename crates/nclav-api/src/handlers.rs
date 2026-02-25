@@ -4,7 +4,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use nclav_domain::{EnclaveId, PartitionBackend, PartitionId};
+use nclav_domain::{EnclaveId, PartitionId};
 use nclav_driver::TerraformBackend;
 use nclav_reconciler::{reconcile, ReconcileRequest};
 use nclav_store::StoreError;
@@ -44,6 +44,7 @@ pub async fn post_reconcile(
         dry_run: false,
         api_base: (*state.api_base).clone(),
         auth_token: state.auth_token.clone(),
+        test_mode: false,
     };
     let report = reconcile(req, state.store, state.registry).await?;
     Ok(Json(json!(report)))
@@ -58,6 +59,7 @@ pub async fn post_reconcile_dry_run(
         dry_run: true,
         api_base: (*state.api_base).clone(),
         auth_token: state.auth_token.clone(),
+        test_mode: false,
     };
     let report = reconcile(req, state.store, state.registry).await?;
     Ok(Json(json!(report)))
@@ -108,6 +110,7 @@ pub async fn delete_enclave(
         api_base: (*state.api_base).clone(),
         auth_token: state.auth_token.clone(),
         store: state.store.clone(),
+        test_mode: false,
     };
 
     let mut errors: Vec<String> = Vec::new();
@@ -116,27 +119,22 @@ pub async fn delete_enclave(
         // Teardown IaC partitions first
         let auth_env = driver.auth_env(&existing.desired, enc_handle);
         for (part_id, part_state) in &existing.partitions {
-            match &part_state.desired.backend {
-                PartitionBackend::Terraform(_) | PartitionBackend::OpenTofu(_) => {
-                    if let Err(e) = tf_backend
-                        .teardown(&existing.desired, &part_state.desired, &auth_env, None)
-                        .await
-                    {
-                        warn!(enclave_id = %id, partition_id = %part_id, error = %e, "IaC teardown failed");
-                        errors.push(format!("teardown {}/{}: {}", id, part_id, e));
-                    }
-                    // Clean up partition SA after IaC teardown
-                    if let Some(handle) = &part_state.partition_handle {
-                        if let Err(e) = driver
-                            .teardown_partition(&existing.desired, &part_state.desired, handle)
-                            .await
-                        {
-                            warn!(enclave_id = %id, partition_id = %part_id, error = %e, "partition SA cleanup failed");
-                            errors.push(format!("SA cleanup {}/{}: {}", id, part_id, e));
-                        }
-                    }
+            if let Err(e) = tf_backend
+                .teardown(&existing.desired, &part_state.desired, &auth_env, None)
+                .await
+            {
+                warn!(enclave_id = %id, partition_id = %part_id, error = %e, "IaC teardown failed");
+                errors.push(format!("teardown {}/{}: {}", id, part_id, e));
+            }
+            // Clean up partition SA after IaC teardown
+            if let Some(handle) = &part_state.partition_handle {
+                if let Err(e) = driver
+                    .teardown_partition(&existing.desired, &part_state.desired, handle)
+                    .await
+                {
+                    warn!(enclave_id = %id, partition_id = %part_id, error = %e, "partition SA cleanup failed");
+                    errors.push(format!("SA cleanup {}/{}: {}", id, part_id, e));
                 }
-                PartitionBackend::Managed => {}
             }
         }
 
@@ -187,46 +185,32 @@ pub async fn delete_partition(
 
     let mut errors: Vec<String> = Vec::new();
 
-    match &part_state.desired.backend {
-        PartitionBackend::Terraform(_) | PartitionBackend::OpenTofu(_) => {
-            let tf_backend = TerraformBackend {
-                api_base:   (*state.api_base).clone(),
-                auth_token: state.auth_token.clone(),
-                store:      state.store.clone(),
-            };
-            let auth_env = existing
-                .enclave_handle
-                .as_ref()
-                .map(|h| driver.auth_env(&existing.desired, h))
-                .unwrap_or_default();
-            if let Err(e) = tf_backend
-                .teardown(&existing.desired, &part_state.desired, &auth_env, None)
-                .await
-            {
-                warn!(enclave_id = %enc_id, partition_id = %part_id, error = %e, "IaC partition teardown failed");
-                errors.push(format!("{}", e));
-            }
-            // Clean up partition SA
-            if let Some(handle) = &part_state.partition_handle {
-                if let Err(e) = driver
-                    .teardown_partition(&existing.desired, &part_state.desired, handle)
-                    .await
-                {
-                    warn!(enclave_id = %enc_id, partition_id = %part_id, error = %e, "partition SA cleanup failed");
-                    errors.push(format!("SA cleanup: {}", e));
-                }
-            }
-        }
-        PartitionBackend::Managed => {
-            if let Some(handle) = &part_state.partition_handle {
-                if let Err(e) = driver
-                    .teardown_partition(&existing.desired, &part_state.desired, handle)
-                    .await
-                {
-                    warn!(enclave_id = %enc_id, partition_id = %part_id, error = %e, "partition teardown failed");
-                    errors.push(format!("{}", e));
-                }
-            }
+    let tf_backend = TerraformBackend {
+        api_base:   (*state.api_base).clone(),
+        auth_token: state.auth_token.clone(),
+        store:      state.store.clone(),
+        test_mode:  false,
+    };
+    let auth_env = existing
+        .enclave_handle
+        .as_ref()
+        .map(|h| driver.auth_env(&existing.desired, h))
+        .unwrap_or_default();
+    if let Err(e) = tf_backend
+        .teardown(&existing.desired, &part_state.desired, &auth_env, None)
+        .await
+    {
+        warn!(enclave_id = %enc_id, partition_id = %part_id, error = %e, "IaC partition teardown failed");
+        errors.push(format!("{}", e));
+    }
+    // Clean up partition SA
+    if let Some(handle) = &part_state.partition_handle {
+        if let Err(e) = driver
+            .teardown_partition(&existing.desired, &part_state.desired, handle)
+            .await
+        {
+            warn!(enclave_id = %enc_id, partition_id = %part_id, error = %e, "partition SA cleanup failed");
+            errors.push(format!("SA cleanup: {}", e));
         }
     }
 

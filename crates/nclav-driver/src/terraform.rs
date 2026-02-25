@@ -32,6 +32,9 @@ pub struct TerraformBackend {
     pub auth_token: Arc<String>,
     /// Store for persisting [`IacRun`] log records.
     pub store: Arc<dyn StateStore>,
+    /// When true, skip all subprocess invocations and return stubbed outputs.
+    /// Used in tests to avoid requiring a terraform binary.
+    pub test_mode: bool,
 }
 
 impl TerraformBackend {
@@ -44,6 +47,20 @@ impl TerraformBackend {
         auth_env: &HashMap<String, String>,
         reconcile_run_id: Option<Uuid>,
     ) -> Result<ProvisionResult, DriverError> {
+        if self.test_mode {
+            let outputs: HashMap<String, String> = partition
+                .declared_outputs
+                .iter()
+                .map(|k| (k.clone(), format!("test://{}", k)))
+                .collect();
+            let handle = serde_json::json!({
+                "backend":      "test",
+                "enclave_id":   enclave.id.0,
+                "partition_id": partition.id.0,
+            });
+            return Ok(ProvisionResult { handle, outputs });
+        }
+
         let (binary, tf_config) = extract_tf_config(partition)?;
         let binary = binary.as_str();
         let workspace = self.workspace_dir(&enclave.id.0, &partition.id.0);
@@ -191,6 +208,10 @@ impl TerraformBackend {
         auth_env: &HashMap<String, String>,
         reconcile_run_id: Option<Uuid>,
     ) -> Result<(), DriverError> {
+        if self.test_mode {
+            return Ok(());
+        }
+
         let (binary, _) = extract_tf_config(partition)?;
         let binary = binary.as_str();
         let workspace = self.workspace_dir(&enclave.id.0, &partition.id.0);
@@ -527,9 +548,6 @@ fn extract_tf_config(partition: &Partition) -> Result<(String, nclav_domain::Ter
             let binary = cfg.tool.clone().unwrap_or_else(|| "tofu".into());
             Ok((binary, cfg.clone()))
         }
-        PartitionBackend::Managed => Err(DriverError::Internal(
-            "extract_tf_config called on a Managed partition".into(),
-        )),
     }
 }
 

@@ -46,7 +46,7 @@ pub struct RawPartition {
     pub inputs: HashMap<String, String>,
     #[serde(default)]
     pub declared_outputs: Vec<String>,
-    /// "managed" (default), "terraform", or "opentofu".
+    /// "terraform" (default) or "opentofu".
     #[serde(default)]
     pub backend: String,
     /// Present when `backend` is "terraform" or "opentofu".

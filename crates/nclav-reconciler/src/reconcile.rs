@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
-use nclav_domain::{Enclave, EnclaveId, PartitionBackend};
+use nclav_domain::{Enclave, EnclaveId};
 use nclav_store::{
     AuditEvent, EnclaveState, PartitionState, ProvisioningStatus, StateStore,
     compute_desired_hash,
@@ -24,6 +24,7 @@ pub async fn reconcile(
         api_base: req.api_base.clone(),
         auth_token: req.auth_token.clone(),
         store: store.clone(),
+        test_mode: req.test_mode,
     });
     let mut report = ReconcileReport::new(req.dry_run);
 
@@ -173,38 +174,33 @@ pub async fn reconcile(
                     // Teardown IaC partitions before tearing down the enclave itself
                     let auth_env = driver.auth_env(&existing.desired, handle);
                     for (part_id, part_state) in &existing.partitions {
-                        match &part_state.desired.backend {
-                            PartitionBackend::Terraform(_) | PartitionBackend::OpenTofu(_) => {
-                                if let Err(e) = tf_backend
-                                    .teardown(&existing.desired, &part_state.desired, &auth_env, Some(run_id))
-                                    .await
-                                {
-                                    warn!(
-                                        enclave_id = %id,
-                                        partition_id = %part_id,
-                                        error = %e,
-                                        "IaC partition teardown failed during enclave removal"
-                                    );
-                                    report.errors.push(format!(
-                                        "teardown {}/{}: {}", id, part_id, e
-                                    ));
-                                }
-                                // Clean up the partition SA after terraform destroy
-                                if let Some(handle) = &part_state.partition_handle {
-                                    if let Err(e) = driver
-                                        .teardown_partition(&existing.desired, &part_state.desired, handle)
-                                        .await
-                                    {
-                                        warn!(
-                                            enclave_id = %id,
-                                            partition_id = %part_id,
-                                            error = %e,
-                                            "Partition SA cleanup failed during enclave removal"
-                                        );
-                                    }
-                                }
+                        if let Err(e) = tf_backend
+                            .teardown(&existing.desired, &part_state.desired, &auth_env, Some(run_id))
+                            .await
+                        {
+                            warn!(
+                                enclave_id = %id,
+                                partition_id = %part_id,
+                                error = %e,
+                                "IaC partition teardown failed during enclave removal"
+                            );
+                            report.errors.push(format!(
+                                "teardown {}/{}: {}", id, part_id, e
+                            ));
+                        }
+                        // Clean up the partition SA after terraform destroy
+                        if let Some(handle) = &part_state.partition_handle {
+                            if let Err(e) = driver
+                                .teardown_partition(&existing.desired, &part_state.desired, handle)
+                                .await
+                            {
+                                warn!(
+                                    enclave_id = %id,
+                                    partition_id = %part_id,
+                                    error = %e,
+                                    "Partition SA cleanup failed during enclave removal"
+                                );
                             }
-                            PartitionBackend::Managed => {}
                         }
                     }
 
@@ -312,65 +308,55 @@ pub async fn reconcile(
             enc_state.partitions.insert(part.id.clone(), part_state.clone());
             store.upsert_enclave(&enc_state).await?;
 
-            let provision_result = match &part.backend {
-                PartitionBackend::Managed => {
-                    driver
-                        .provision_partition(enc, part, &resolved_inputs, part_state.partition_handle.as_ref())
-                        .await
-                        .map_err(|e| e.to_string())
-                }
-                PartitionBackend::Terraform(_) | PartitionBackend::OpenTofu(_) => {
-                    // 1. Create partition SA (returns a handle containing "partition_sa").
-                    let sa_result = driver
-                        .provision_partition(enc, part, &resolved_inputs, part_state.partition_handle.as_ref())
-                        .await
-                        .map_err(|e| e.to_string());
+            // 1. Create partition SA (returns a handle containing "partition_sa").
+            let sa_result = driver
+                .provision_partition(enc, part, &resolved_inputs, part_state.partition_handle.as_ref())
+                .await
+                .map_err(|e| e.to_string());
 
-                    match sa_result {
-                        Err(e) => Err(e),
-                        Ok(sa_provision) => {
-                            // Persist the SA handle immediately so partition_sa survives
-                            // the next reconcile even if Terraform subsequently fails.
-                            {
-                                let ps = enc_state.partitions
-                                    .entry(part.id.clone())
-                                    .or_insert_with(|| PartitionState::new(part.clone()));
-                                ps.partition_handle = Some(sa_provision.handle.clone());
-                            }
-                            store.upsert_enclave(&enc_state).await.ok();
+            let provision_result = match sa_result {
+                Err(e) => Err(e),
+                Ok(sa_provision) => {
+                    // Persist the SA handle immediately so partition_sa survives
+                    // the next reconcile even if Terraform subsequently fails.
+                    {
+                        let ps = enc_state.partitions
+                            .entry(part.id.clone())
+                            .or_insert_with(|| PartitionState::new(part.clone()));
+                        ps.partition_handle = Some(sa_provision.handle.clone());
+                    }
+                    store.upsert_enclave(&enc_state).await.ok();
 
-                            // 2. Build auth_env, override GOOGLE_IMPERSONATE_SERVICE_ACCOUNT
-                            //    with the partition SA so Terraform runs under it.
-                            //    Only in SA-key mode (GOOGLE_APPLICATION_CREDENTIALS present);
-                            //    in ADC mode the operator's credentials run Terraform directly.
-                            let mut auth_env = enc_state
-                                .enclave_handle
-                                .as_ref()
-                                .map(|h| driver.auth_env(enc, h))
-                                .unwrap_or_default();
-                            if auth_env.contains_key("GOOGLE_APPLICATION_CREDENTIALS") {
-                                if let Some(sa) = sa_provision.handle["partition_sa"].as_str() {
-                                    auth_env.insert(
-                                        "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT".into(),
-                                        sa.to_string(),
-                                    );
-                                }
-                            }
-
-                            // 3. Run Terraform under the partition SA identity.
-                            tf_backend
-                                .provision(enc, part, &resolved_inputs, &auth_env, Some(run_id))
-                                .await
-                                .map_err(|e| e.to_string())
-                                // Merge the SA handle fields into the Terraform handle for storage.
-                                .map(|mut tf_result| {
-                                    if let Some(sa) = sa_provision.handle["partition_sa"].as_str() {
-                                        tf_result.handle["partition_sa"] = serde_json::json!(sa);
-                                    }
-                                    tf_result
-                                })
+                    // 2. Build auth_env, override GOOGLE_IMPERSONATE_SERVICE_ACCOUNT
+                    //    with the partition SA so Terraform runs under it.
+                    //    Only in SA-key mode (GOOGLE_APPLICATION_CREDENTIALS present);
+                    //    in ADC mode the operator's credentials run Terraform directly.
+                    let mut auth_env = enc_state
+                        .enclave_handle
+                        .as_ref()
+                        .map(|h| driver.auth_env(enc, h))
+                        .unwrap_or_default();
+                    if auth_env.contains_key("GOOGLE_APPLICATION_CREDENTIALS") {
+                        if let Some(sa) = sa_provision.handle["partition_sa"].as_str() {
+                            auth_env.insert(
+                                "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT".into(),
+                                sa.to_string(),
+                            );
                         }
                     }
+
+                    // 3. Run Terraform under the partition SA identity.
+                    tf_backend
+                        .provision(enc, part, &resolved_inputs, &auth_env, Some(run_id))
+                        .await
+                        .map_err(|e| e.to_string())
+                        // Merge the SA handle fields into the Terraform handle for storage.
+                        .map(|mut tf_result| {
+                            if let Some(sa) = sa_provision.handle["partition_sa"].as_str() {
+                                tf_result.handle["partition_sa"] = serde_json::json!(sa);
+                            }
+                            tf_result
+                        })
                 }
             };
 
@@ -641,7 +627,7 @@ mod tests {
 
         let store = Arc::new(InMemoryStore::new());
         let registry = test_registry();
-        let req = ReconcileRequest { enclaves_dir: dir, dry_run: false, ..Default::default() };
+        let req = ReconcileRequest { enclaves_dir: dir, dry_run: false, test_mode: true, ..Default::default() };
 
         let report = reconcile(req, store.clone(), registry).await.unwrap();
         assert!(report.errors.is_empty(), "expected no errors: {:?}", report.errors);
@@ -675,7 +661,7 @@ mod tests {
 
         let store = Arc::new(InMemoryStore::new());
         let registry = test_registry();
-        let req = ReconcileRequest { enclaves_dir: dir.clone(), dry_run: false, ..Default::default() };
+        let req = ReconcileRequest { enclaves_dir: dir.clone(), dry_run: false, test_mode: true, ..Default::default() };
 
         reconcile(req.clone(), store.clone(), registry.clone()).await.unwrap();
         let report2 = reconcile(req, store.clone(), registry).await.unwrap();

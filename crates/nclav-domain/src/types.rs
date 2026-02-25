@@ -174,15 +174,22 @@ impl From<&ProducesType> for ExportType {
 
 /// How a partition's workload is provisioned.
 /// Orthogonal to the enclave's `cloud` field (which controls *where*).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PartitionBackend {
-    /// Default: the cloud driver handles provisioning with its built-in logic.
-    #[default]
-    Managed,
     /// Co-located `.tf` files in the partition directory, run via the `terraform` binary.
     Terraform(TerraformConfig),
     /// Co-located `.tf` files in the partition directory, run via the `tofu` binary.
     OpenTofu(TerraformConfig),
+}
+
+impl Default for PartitionBackend {
+    fn default() -> Self {
+        PartitionBackend::Terraform(TerraformConfig {
+            tool: None,
+            source: None,
+            dir: std::path::PathBuf::new(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nclav_domain::{AuthType, Enclave, Export, ExportType, Import, Partition, PartitionBackend, ProducesType};
+use nclav_domain::{AuthType, Enclave, Export, ExportType, Import, Partition};
+#[cfg(test)]
+use nclav_domain::ProducesType;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
@@ -619,20 +621,6 @@ impl GcpDriver {
 
 }
 
-// ── Label helpers ─────────────────────────────────────────────────────────────
-
-/// Build the standard nclav label set for a managed resource.
-///
-/// GCP label constraints: lowercase letters, numbers, hyphens, underscores; max 63 chars.
-/// Enclave/partition IDs are already safe (they're directory names).
-fn nclav_labels(enclave_id: &str, partition_id: &str) -> serde_json::Value {
-    json!({
-        "nclav-managed":   "true",
-        "nclav-enclave":   enclave_id,
-        "nclav-partition": partition_id,
-    })
-}
-
 // ── Partition SA helpers ──────────────────────────────────────────────────────
 
 /// Derive the GCP service account ID for a partition.
@@ -1066,19 +1054,17 @@ impl Driver for GcpDriver {
         &self,
         enclave: &Enclave,
         partition: &Partition,
-        resolved_inputs: &HashMap<String, String>,
+        _resolved_inputs: &HashMap<String, String>,
         _existing: Option<&Handle>,
     ) -> Result<ProvisionResult, DriverError> {
         let token          = self.bearer().await?;
         let project_id_buf = self.gcp_project_id(enclave.id.as_str());
         let project_id     = project_id_buf.as_str();
-        let region         = self.region(enclave);
         let partition_id   = partition.id.as_str();
 
         // ── Partition SA ──────────────────────────────────────────────────────
         // Create a per-partition service account for least-privilege isolation.
-        // IaC partitions run Terraform under this SA via impersonation;
-        // managed partitions use it as Cloud Run's runtime SA.
+        // Terraform runs under this SA via impersonation.
         let sa_account_id = partition_sa_id(partition_id);
         let partition_sa_email = format!("{}@{}.iam.gserviceaccount.com", sa_account_id, project_id);
         info!(project_id, partition_id, sa_account_id, "Creating partition service account");
@@ -1122,226 +1108,28 @@ impl Driver for GcpDriver {
             warn!(error = %e, "Could not grant tokenCreator to enclave SA on partition SA (non-fatal)");
         }
 
-        // Grant partition SA project-level roles based on partition type
+        // Grant the partition SA project-level editor role so Terraform can provision resources.
         let project_resource = format!(
             "{}/v3/projects/{}",
             self.base.resourcemanager, project_id
         );
         let part_sa_member = format!("serviceAccount:{}", partition_sa_email);
-        let partition_role = match &partition.backend {
-            PartitionBackend::Terraform(_) | PartitionBackend::OpenTofu(_) => Some("roles/editor"),
-            PartitionBackend::Managed => match &partition.produces {
-                Some(ProducesType::Http)  => Some("roles/run.admin"),
-                Some(ProducesType::Queue) => Some("roles/pubsub.admin"),
-                _                         => None,
-            },
-        };
-        if let Some(role) = partition_role {
-            if let Err(e) = self
-                .ensure_iam_role_binding(&token, &project_resource, &part_sa_member, role)
-                .await
-            {
-                warn!(error = %e, role, "Could not grant role to partition SA (non-fatal)");
-            }
+        if let Err(e) = self
+            .ensure_iam_role_binding(&token, &project_resource, &part_sa_member, "roles/editor")
+            .await
+        {
+            warn!(error = %e, "Could not grant editor to partition SA (non-fatal)");
         }
 
-        // For IaC partitions: the SA is all we provision here; Terraform does the rest.
-        if matches!(&partition.backend, PartitionBackend::Terraform(_) | PartitionBackend::OpenTofu(_)) {
-            let handle = json!({
-                "driver":       "gcp",
-                "kind":         "partition",
-                "type":         "iac",
-                "project_id":   project_id,
-                "partition_sa": partition_sa_email,
-            });
-            return Ok(ProvisionResult { handle, outputs: HashMap::new() });
-        }
-
-        match &partition.produces {
-            // ── Cloud Run (http) ─────────────────────────────────────────────
-            Some(ProducesType::Http) => {
-                info!(project_id, partition_id, region, "Provisioning Cloud Run service");
-                let image = resolved_inputs
-                    .get("image")
-                    .cloned()
-                    .unwrap_or_else(|| "gcr.io/cloudrun/hello".into());
-                // Derive SA email using the same identity field as provision_enclave used.
-                let sa_id    = enclave.identity.as_deref().unwrap_or(project_id);
-                let sa_email = format!("{}@{}.iam.gserviceaccount.com", sa_id, project_id);
-                let env: Vec<Value> = resolved_inputs
-                    .iter()
-                    .filter(|(k, _)| *k != "image")
-                    .map(|(k, v)| json!({ "name": k, "value": v }))
-                    .collect();
-
-                // Cloud Run v2: service ID goes as a query param; body `name` must be empty.
-                let labels = nclav_labels(enclave.id.as_str(), partition_id);
-                let url = format!(
-                    "{}/v2/projects/{}/locations/{}/services?serviceId={}",
-                    self.base.run, project_id, region, partition_id
-                );
-                match self
-                    .post_json(
-                        &url,
-                        &token,
-                        &json!({
-                            "labels": labels,
-                            "template": {
-                                "serviceAccount": sa_email,
-                                "containers": [{ "image": image, "env": env }],
-                            },
-                            "ingress": "INGRESS_TRAFFIC_INTERNAL_ONLY",
-                        }),
-                    )
-                    .await
-                {
-                    Ok(op) => {
-                        // Poll the operation if it isn't immediately done
-                        if op.get("done").is_some() && !op["done"].as_bool().unwrap_or(true) {
-                            let op_name = op["name"].as_str().ok_or_else(|| {
-                                DriverError::ProvisionFailed("Cloud Run op: no name".into())
-                            })?;
-                            let op_url = format!("{}/v2/{}", self.base.run, op_name);
-                            self.wait_for_operation(&op_url).await?;
-                        }
-                    }
-                    Err(e) if e.to_string().to_lowercase().contains("already exists") => {
-                        info!(project_id, partition_id, "Cloud Run service already exists; patching labels");
-                        // Idempotent re-run: ensure labels are up to date
-                        let patch_url = format!(
-                            "{}/v2/projects/{}/locations/{}/services/{}",
-                            self.base.run, project_id, region, partition_id
-                        );
-                        let _ = self
-                            .client
-                            .patch(&patch_url)
-                            .bearer_auth(&token)
-                            .query(&[("updateMask", "labels")])
-                            .json(&json!({ "labels": labels }))
-                            .send()
-                            .await; // non-fatal
-                    }
-                    Err(e) => return Err(e),
-                }
-
-                // Fetch the service to read the generated URL
-                let get_url = format!(
-                    "{}/v2/projects/{}/locations/{}/services/{}",
-                    self.base.run, project_id, region, partition_id
-                );
-                let svc: Value = self
-                    .client
-                    .get(&get_url)
-                    .bearer_auth(&token)
-                    .send()
-                    .await
-                    .map_err(|e| DriverError::Internal(e.to_string()))?
-                    .json()
-                    .await
-                    .map_err(|e| DriverError::Internal(e.to_string()))?;
-
-                let service_url = svc["uri"].as_str().unwrap_or("").to_string();
-                let hostname    = service_url.trim_start_matches("https://").to_string();
-
-                let service_name = format!(
-                    "projects/{}/locations/{}/services/{}",
-                    project_id, region, partition_id
-                );
-                let handle = json!({
-                    "driver":        "gcp",
-                    "kind":          "partition",
-                    "type":          "cloud_run",
-                    "project_id":    project_id,
-                    "region":        region,
-                    "service_name":  service_name,
-                    "service_url":   service_url,
-                    "partition_sa":  partition_sa_email,
-                });
-                let mut outputs = HashMap::new();
-                outputs.insert("hostname".into(), hostname);
-                outputs.insert("port".into(), "443".into());
-
-                Ok(ProvisionResult { handle, outputs })
-            }
-
-            // ── TCP passthrough ──────────────────────────────────────────────
-            //
-            // nclav does not provision backing TCP services (databases, etc.).
-            // Provisioning those resources is out of scope — use Terraform or
-            // another IaC tool for that.  nclav's job here is to validate the
-            // wiring and propagate `hostname`/`port` from the partition's inputs
-            // through the graph so importers can consume them.
-            Some(ProducesType::Tcp) => {
-                let hostname = resolved_inputs.get("hostname").cloned().unwrap_or_default();
-                let port     = resolved_inputs.get("port").cloned().unwrap_or_default();
-
-                if hostname.is_empty() {
-                    warn!(project_id, partition_id,
-                        "tcp partition has no 'hostname' input — \
-                         provision the backing service externally and set it in inputs");
-                }
-
-                info!(project_id, partition_id, "TCP partition registered (externally managed)");
-
-                let mut outputs = HashMap::new();
-                if !hostname.is_empty() { outputs.insert("hostname".into(), hostname); }
-                if !port.is_empty()     { outputs.insert("port".into(), port); }
-
-                let handle = json!({
-                    "driver":       "gcp",
-                    "kind":         "partition",
-                    "type":         "tcp_passthrough",
-                    "project_id":   project_id,
-                    "partition_sa": partition_sa_email,
-                    "outputs":      outputs,
-                });
-
-                Ok(ProvisionResult { handle, outputs })
-            }
-
-            // ── Pub/Sub topic (queue) ────────────────────────────────────────
-            Some(ProducesType::Queue) => {
-                info!(project_id, partition_id, "Provisioning Pub/Sub topic");
-                let url = format!(
-                    "{}/v1/projects/{}/topics/{}",
-                    self.base.pubsub, project_id, partition_id
-                );
-                let resp = self
-                    .client
-                    .put(&url)
-                    .bearer_auth(&token)
-                    .json(&json!({ "labels": nclav_labels(enclave.id.as_str(), partition_id) }))
-                    .send()
-                    .await
-                    .map_err(|e| DriverError::ProvisionFailed(e.to_string()))?;
-
-                let status = resp.status();
-                if !status.is_success() && status.as_u16() != 409 {
-                    // 409 ALREADY_EXISTS is idempotent success
-                    let body: Value = resp.json().await.unwrap_or_default();
-                    return Err(DriverError::ProvisionFailed(Self::extract_gcp_error(&body)));
-                }
-
-                let queue_url = format!("projects/{}/topics/{}", project_id, partition_id);
-                let handle = json!({
-                    "driver":       "gcp",
-                    "kind":         "partition",
-                    "type":         "pubsub_topic",
-                    "project_id":   project_id,
-                    "topic_name":   queue_url,
-                    "partition_sa": partition_sa_email,
-                });
-                let mut outputs = HashMap::new();
-                outputs.insert("queue_url".into(), queue_url);
-
-                Ok(ProvisionResult { handle, outputs })
-            }
-
-            None => Err(DriverError::ProvisionFailed(format!(
-                "partition '{}' has no produces type; GCP driver requires one",
-                partition.id
-            ))),
-        }
+        // SA creation is all we provision here; Terraform does the rest.
+        let handle = json!({
+            "driver":       "gcp",
+            "kind":         "partition",
+            "type":         "iac",
+            "project_id":   project_id,
+            "partition_sa": partition_sa_email,
+        });
+        Ok(ProvisionResult { handle, outputs: HashMap::new() })
     }
 
     // ── teardown_partition ────────────────────────────────────────────────────
@@ -1356,42 +1144,6 @@ impl Driver for GcpDriver {
         let project_id_buf = self.gcp_project_id(enclave.id.as_str());
         let project_id     = project_id_buf.as_str();
         let partition_id   = partition.id.as_str();
-        let region         = self.region(enclave);
-
-        // Delete the cloud resource (best effort for tcp_passthrough/iac which have none)
-        let resource_url = match handle["type"].as_str().unwrap_or("") {
-            "cloud_run"    => Some(format!(
-                "{}/v2/projects/{}/locations/{}/services/{}",
-                self.base.run, project_id, region, partition_id
-            )),
-            "pubsub_topic" => Some(format!(
-                "{}/v1/projects/{}/topics/{}",
-                self.base.pubsub, project_id, partition_id
-            )),
-            // tcp_passthrough and iac: no managed cloud resource to delete here.
-            "tcp_passthrough" | "iac" => None,
-            other => {
-                warn!(kind = other, "teardown_partition: unknown partition type, skipping resource delete");
-                None
-            }
-        };
-
-        if let Some(url) = resource_url {
-            let resp = self
-                .client
-                .delete(&url)
-                .bearer_auth(&token)
-                .send()
-                .await
-                .map_err(|e| DriverError::TeardownFailed(e.to_string()))?;
-
-            let status = resp.status();
-            if !status.is_success() && status.as_u16() != 404 {
-                let body: Value = resp.json().await.unwrap_or_default();
-                return Err(DriverError::TeardownFailed(Self::extract_gcp_error(&body)));
-            }
-        }
-
         // Delete the partition SA (best effort; 404 = already gone = success)
         if let Some(sa_email) = handle["partition_sa"].as_str() {
             info!(project_id, partition_id, sa_email, "Deleting partition service account");
@@ -1853,110 +1605,19 @@ impl Driver for GcpDriver {
 
     async fn observe_partition(
         &self,
-        enclave: &Enclave,
-        partition: &Partition,
+        _enclave: &Enclave,
+        _partition: &Partition,
         handle: &Handle,
     ) -> Result<ObservedState, DriverError> {
-        let token        = self.bearer().await?;
-        let project_id   = handle["project_id"].as_str().unwrap_or(enclave.id.as_str());
-        let region       = self.region(enclave);
-        let partition_id = partition.id.as_str();
-
         match handle["type"].as_str().unwrap_or("") {
-            // ── Cloud Run ────────────────────────────────────────────────────
-            "cloud_run" => {
-                let url = format!(
-                    "{}/v2/projects/{}/locations/{}/services/{}",
-                    self.base.run, project_id, region, partition_id
-                );
-                let resp = self
-                    .client
-                    .get(&url)
-                    .bearer_auth(&token)
-                    .send()
-                    .await
-                    .map_err(|e| DriverError::Internal(e.to_string()))?;
-
-                if resp.status().as_u16() == 404 {
-                    return Ok(ObservedState {
-                        exists: false, healthy: false,
-                        outputs: HashMap::new(), raw: json!({}),
-                    });
-                }
-
-                let svc: Value = resp
-                    .json()
-                    .await
-                    .map_err(|e| DriverError::Internal(e.to_string()))?;
-
-                // "Ready" condition: True → healthy, False → unhealthy, Unknown → in-progress
-                let ready_status = svc["conditions"]
-                    .as_array()
-                    .and_then(|arr| arr.iter().find(|c| c["type"] == "Ready"))
-                    .and_then(|c| c["status"].as_str());
-                let healthy = ready_status == Some("True");
-
-                let service_url = svc["uri"].as_str().unwrap_or("").to_string();
-                let hostname    = service_url.trim_start_matches("https://").to_string();
-                let mut outputs = HashMap::new();
-                if !hostname.is_empty() {
-                    outputs.insert("hostname".into(), hostname);
-                    outputs.insert("port".into(), "443".into());
-                }
-
-                Ok(ObservedState { exists: true, healthy, outputs, raw: svc })
-            }
-
-            // ── TCP passthrough ──────────────────────────────────────────────
-            // Externally managed — always reports healthy; outputs come from
-            // the stored handle (set at provision time from the partition inputs).
-            "tcp_passthrough" => {
-                let mut outputs = HashMap::new();
-                if let Some(obj) = handle["outputs"].as_object() {
-                    for (k, v) in obj {
-                        if let Some(s) = v.as_str() {
-                            outputs.insert(k.clone(), s.to_string());
-                        }
-                    }
-                }
-                let healthy = !outputs.is_empty();
-                Ok(ObservedState { exists: true, healthy, outputs, raw: json!({}) })
-            }
-
-            // ── Pub/Sub topic ────────────────────────────────────────────────
-            "pubsub_topic" => {
-                let fallback = format!("projects/{}/topics/{}", project_id, partition_id);
-                let topic    = handle["topic_name"].as_str().unwrap_or(&fallback);
-                let url      = format!("{}/v1/{}", self.base.pubsub, topic);
-                let resp = self
-                    .client
-                    .get(&url)
-                    .bearer_auth(&token)
-                    .send()
-                    .await
-                    .map_err(|e| DriverError::Internal(e.to_string()))?;
-
-                if resp.status().as_u16() == 404 {
-                    return Ok(ObservedState {
-                        exists: false, healthy: false,
-                        outputs: HashMap::new(), raw: json!({}),
-                    });
-                }
-
-                let topic_resp: Value = resp
-                    .json()
-                    .await
-                    .map_err(|e| DriverError::Internal(e.to_string()))?;
-
-                let queue_url = topic_resp["name"]
-                    .as_str()
-                    .unwrap_or(topic)
-                    .to_string();
-                let mut outputs = HashMap::new();
-                outputs.insert("queue_url".into(), queue_url);
-
-                Ok(ObservedState { exists: true, healthy: true, outputs, raw: topic_resp })
-            }
+            // IaC partition: the SA exists; Terraform manages everything else.
+            // Terraform state is the source of truth for health.
+            "iac" => Ok(ObservedState {
+                exists: true,
+                healthy: true,
+                outputs: HashMap::new(),
+                raw: json!({}),
+            }),
 
             other => {
                 warn!(kind = other, "observe_partition: unknown partition type");
@@ -2243,32 +1904,6 @@ mod tests {
         }
     }
 
-    fn tcp_partition() -> Partition {
-        Partition {
-            id:               PartitionId::new("db"),
-            name:             "DB".into(),
-            produces:         Some(ProducesType::Tcp),
-            imports:          vec![],
-            exports:          vec![],
-            inputs:           HashMap::new(),
-            declared_outputs: vec!["hostname".into(), "port".into()],
-            backend:          Default::default(),
-        }
-    }
-
-    fn queue_partition() -> Partition {
-        Partition {
-            id:               PartitionId::new("queue"),
-            name:             "Queue".into(),
-            produces:         Some(ProducesType::Queue),
-            imports:          vec![],
-            exports:          vec![],
-            inputs:           HashMap::new(),
-            declared_outputs: vec!["queue_url".into()],
-            backend:          Default::default(),
-        }
-    }
-
     // ── GCP error parsing (pure, no mocking) ──────────────────────────────────
 
     #[test]
@@ -2465,371 +2100,80 @@ mod tests {
         assert!(!obs.healthy);
     }
 
-    // ── observe_partition: Cloud Run ──────────────────────────────────────────
+    // ── observe_partition: IaC ───────────────────────────────────────────────
 
     #[tokio::test]
-    async fn observe_partition_cloud_run_ready() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v2/projects/test-proj/locations/us-central1/services/api"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "uri":        "https://api-abc123-uc.a.run.app",
-                "conditions": [{ "type": "Ready", "status": "True" }],
-            })))
-            .mount(&server)
-            .await;
-
-        let obs = driver(&server)
-            .observe_partition(
-                &dummy_enclave(),
-                &http_partition(),
-                &json!({ "type": "cloud_run", "project_id": "test-proj" }),
-            )
-            .await
-            .unwrap();
-
-        assert!(obs.exists);
-        assert!(obs.healthy);
-        assert_eq!(obs.outputs["hostname"], "api-abc123-uc.a.run.app");
-        assert_eq!(obs.outputs["port"], "443");
-    }
-
-    #[tokio::test]
-    async fn observe_partition_cloud_run_condition_false_is_unhealthy() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v2/projects/test-proj/locations/us-central1/services/api"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "uri":        "https://api-abc123-uc.a.run.app",
-                "conditions": [{ "type": "Ready", "status": "False", "message": "OOM" }],
-            })))
-            .mount(&server)
-            .await;
-
-        let obs = driver(&server)
-            .observe_partition(
-                &dummy_enclave(),
-                &http_partition(),
-                &json!({ "type": "cloud_run", "project_id": "test-proj" }),
-            )
-            .await
-            .unwrap();
-
-        assert!(obs.exists);
-        assert!(!obs.healthy);
-    }
-
-    #[tokio::test]
-    async fn observe_partition_cloud_run_not_found() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v2/projects/test-proj/locations/us-central1/services/api"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-
-        let obs = driver(&server)
-            .observe_partition(
-                &dummy_enclave(),
-                &http_partition(),
-                &json!({ "type": "cloud_run", "project_id": "test-proj" }),
-            )
-            .await
-            .unwrap();
-
-        assert!(!obs.exists);
-    }
-
-    // ── observe_partition: TCP passthrough ───────────────────────────────────
-
-    #[tokio::test]
-    async fn observe_partition_tcp_passthrough_with_outputs_is_healthy() {
+    async fn observe_partition_iac_is_healthy() {
         let obs = driver(&MockServer::start().await)
             .observe_partition(
                 &dummy_enclave(),
-                &tcp_partition(),
-                &json!({
-                    "type":       "tcp_passthrough",
-                    "project_id": "test-proj",
-                    "outputs":    { "hostname": "10.0.0.5", "port": "5432" },
-                }),
+                &http_partition(),
+                &json!({ "type": "iac", "project_id": "test-proj" }),
             )
             .await
             .unwrap();
 
         assert!(obs.exists);
         assert!(obs.healthy);
-        assert_eq!(obs.outputs["hostname"], "10.0.0.5");
-        assert_eq!(obs.outputs["port"], "5432");
+        assert!(obs.outputs.is_empty());
     }
 
-    #[tokio::test]
-    async fn observe_partition_tcp_passthrough_no_outputs_is_unhealthy() {
-        let obs = driver(&MockServer::start().await)
-            .observe_partition(
-                &dummy_enclave(),
-                &tcp_partition(),
-                &json!({ "type": "tcp_passthrough", "project_id": "test-proj", "outputs": {} }),
-            )
-            .await
-            .unwrap();
-
-        assert!(obs.exists);
-        assert!(!obs.healthy, "no outputs → not healthy");
-    }
-
-    // ── observe_partition: Pub/Sub ────────────────────────────────────────────
+    // ── provision_partition: SA creation ─────────────────────────────────────
 
     #[tokio::test]
-    async fn observe_partition_pubsub_exists() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/projects/test-proj/topics/queue"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "projects/test-proj/topics/queue",
-            })))
-            .mount(&server)
-            .await;
-
-        let obs = driver(&server)
-            .observe_partition(
-                &dummy_enclave(),
-                &queue_partition(),
-                &json!({
-                    "type":       "pubsub_topic",
-                    "project_id": "test-proj",
-                    "topic_name": "projects/test-proj/topics/queue",
-                }),
-            )
-            .await
-            .unwrap();
-
-        assert!(obs.exists);
-        assert!(obs.healthy);
-        assert_eq!(obs.outputs["queue_url"], "projects/test-proj/topics/queue");
-    }
-
-    #[tokio::test]
-    async fn observe_partition_pubsub_not_found() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/projects/test-proj/topics/queue"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-
-        let obs = driver(&server)
-            .observe_partition(
-                &dummy_enclave(),
-                &queue_partition(),
-                &json!({
-                    "type":       "pubsub_topic",
-                    "project_id": "test-proj",
-                    "topic_name": "projects/test-proj/topics/queue",
-                }),
-            )
-            .await
-            .unwrap();
-
-        assert!(!obs.exists);
-    }
-
-    // ── provision_partition: Pub/Sub topic ────────────────────────────────────
-
-    #[tokio::test]
-    async fn provision_partition_queue_creates_topic() {
-        let server = MockServer::start().await;
-        mount_sa_creation_mock(&server, "queue").await;
-        Mock::given(method("PUT"))
-            .and(path("/v1/projects/test-proj/topics/queue"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "projects/test-proj/topics/queue",
-            })))
-            .mount(&server)
-            .await;
-
-        let result = driver(&server)
-            .provision_partition(&dummy_enclave(), &queue_partition(), &HashMap::new(), None)
-            .await
-            .unwrap();
-
-        assert_eq!(result.handle["type"], "pubsub_topic");
-        assert_eq!(result.outputs["queue_url"], "projects/test-proj/topics/queue");
-    }
-
-    #[tokio::test]
-    async fn provision_partition_queue_409_is_idempotent_success() {
-        let server = MockServer::start().await;
-        mount_sa_creation_mock(&server, "queue").await;
-        Mock::given(method("PUT"))
-            .and(path("/v1/projects/test-proj/topics/queue"))
-            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
-                "error": { "code": 409, "status": "ALREADY_EXISTS", "message": "Already exists" },
-            })))
-            .mount(&server)
-            .await;
-
-        let result = driver(&server)
-            .provision_partition(&dummy_enclave(), &queue_partition(), &HashMap::new(), None)
-            .await
-            .unwrap();
-
-        // 409 is treated as success; the known queue_url is still returned.
-        assert_eq!(result.outputs["queue_url"], "projects/test-proj/topics/queue");
-    }
-
-    // ── provision_partition: Cloud Run ────────────────────────────────────────
-
-    #[tokio::test]
-    async fn provision_partition_http_returns_hostname_and_port() {
+    async fn provision_partition_creates_sa_and_returns_iac_handle() {
         let server = MockServer::start().await;
         mount_sa_creation_mock(&server, "api").await;
-
-        // POST /services → operation already done
-        Mock::given(method("POST"))
-            .and(path("/v2/projects/test-proj/locations/us-central1/services"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "operations/cloud-run-create",
-                "done": true,
-                "response": {},
-            })))
-            .mount(&server)
-            .await;
-
-        // GET service (for URL)
-        Mock::given(method("GET"))
-            .and(path("/v2/projects/test-proj/locations/us-central1/services/api"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "uri":        "https://api-hash-uc.a.run.app",
-                "conditions": [{ "type": "Ready", "status": "True" }],
-            })))
-            .mount(&server)
-            .await;
 
         let result = driver(&server)
             .provision_partition(&dummy_enclave(), &http_partition(), &HashMap::new(), None)
             .await
             .unwrap();
 
-        assert_eq!(result.handle["type"], "cloud_run");
-        assert_eq!(result.outputs["hostname"], "api-hash-uc.a.run.app");
-        assert_eq!(result.outputs["port"], "443");
-    }
-
-    #[tokio::test]
-    async fn provision_partition_http_already_exists_is_idempotent() {
-        let server = MockServer::start().await;
-        mount_sa_creation_mock(&server, "api").await;
-
-        // POST → ALREADY_EXISTS (service was created in a previous run)
-        Mock::given(method("POST"))
-            .and(path("/v2/projects/test-proj/locations/us-central1/services"))
-            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
-                "error": {
-                    "code":    409,
-                    "status":  "ALREADY_EXISTS",
-                    "message": "Resource 'api' already exists.",
-                },
-            })))
-            .mount(&server)
-            .await;
-
-        // GET service (fetched to retrieve the URL after ALREADY_EXISTS)
-        Mock::given(method("GET"))
-            .and(path("/v2/projects/test-proj/locations/us-central1/services/api"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "uri":        "https://api-hash-uc.a.run.app",
-                "conditions": [{ "type": "Ready", "status": "True" }],
-            })))
-            .mount(&server)
-            .await;
-
-        let result = driver(&server)
-            .provision_partition(&dummy_enclave(), &http_partition(), &HashMap::new(), None)
-            .await
-            .unwrap();
-
-        assert_eq!(result.handle["type"], "cloud_run");
-        assert_eq!(result.outputs["hostname"], "api-hash-uc.a.run.app");
-        assert_eq!(result.outputs["port"], "443");
-    }
-
-    #[tokio::test]
-    async fn provision_partition_http_polls_operation_when_not_done() {
-        let server = MockServer::start().await;
-        mount_sa_creation_mock(&server, "api").await;
-
-        // POST → in-progress operation
-        Mock::given(method("POST"))
-            .and(path("/v2/projects/test-proj/locations/us-central1/services"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "operations/create-op",
-                "done": false,
-            })))
-            .mount(&server)
-            .await;
-
-        // Operation poll → done
-        Mock::given(method("GET"))
-            .and(path("/v2/operations/create-op"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name":     "operations/create-op",
-                "done":     true,
-                "response": {},
-            })))
-            .mount(&server)
-            .await;
-
-        // GET service
-        Mock::given(method("GET"))
-            .and(path("/v2/projects/test-proj/locations/us-central1/services/api"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "uri":        "https://api-hash-uc.a.run.app",
-                "conditions": [{ "type": "Ready", "status": "True" }],
-            })))
-            .mount(&server)
-            .await;
-
-        let result = driver(&server)
-            .provision_partition(&dummy_enclave(), &http_partition(), &HashMap::new(), None)
-            .await
-            .unwrap();
-
-        assert_eq!(result.outputs["hostname"], "api-hash-uc.a.run.app");
-    }
-
-    // ── provision_partition: TCP passthrough ─────────────────────────────────
-
-    #[tokio::test]
-    async fn provision_partition_tcp_passthrough_propagates_inputs() {
-        let server = MockServer::start().await;
-        mount_sa_creation_mock(&server, "db").await;
-        let mut inputs = HashMap::new();
-        inputs.insert("hostname".into(), "10.0.1.10".into());
-        inputs.insert("port".into(), "5432".into());
-
-        let result = driver(&server)
-            .provision_partition(&dummy_enclave(), &tcp_partition(), &inputs, None)
-            .await
-            .unwrap();
-
-        assert_eq!(result.handle["type"], "tcp_passthrough");
-        assert_eq!(result.outputs["hostname"], "10.0.1.10");
-        assert_eq!(result.outputs["port"], "5432");
-    }
-
-    #[tokio::test]
-    async fn provision_partition_tcp_passthrough_no_inputs_returns_empty_outputs() {
-        let server = MockServer::start().await;
-        mount_sa_creation_mock(&server, "db").await;
-
-        let result = driver(&server)
-            .provision_partition(&dummy_enclave(), &tcp_partition(), &HashMap::new(), None)
-            .await
-            .unwrap();
-
-        assert_eq!(result.handle["type"], "tcp_passthrough");
+        assert_eq!(result.handle["type"], "iac");
+        assert!(result.handle["partition_sa"].as_str().is_some());
         assert!(result.outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn teardown_partition_deletes_sa() {
+        let server = MockServer::start().await;
+        let sa_email = "partition-api@test-proj.iam.gserviceaccount.com";
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v1/projects/test-proj/serviceAccounts/{}", sa_email)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        driver(&server)
+            .teardown_partition(
+                &dummy_enclave(),
+                &http_partition(),
+                &json!({ "type": "iac", "project_id": "test-proj", "partition_sa": sa_email }),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn teardown_partition_404_is_success() {
+        let server = MockServer::start().await;
+        let sa_email = "partition-api@test-proj.iam.gserviceaccount.com";
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v1/projects/test-proj/serviceAccounts/{}", sa_email)))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        // 404 = already gone = success
+        driver(&server)
+            .teardown_partition(
+                &dummy_enclave(),
+                &http_partition(),
+                &json!({ "type": "iac", "project_id": "test-proj", "partition_sa": sa_email }),
+            )
+            .await
+            .unwrap();
     }
 
     // ── provision_import: queue subscription ──────────────────────────────────

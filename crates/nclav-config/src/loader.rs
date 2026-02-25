@@ -186,8 +186,7 @@ fn convert_partition(raw: RawPartition, path: &Path) -> Result<Partition, Config
     let dir = path.parent().unwrap_or(path).to_path_buf();
 
     let backend = match raw.backend.as_str() {
-        "" | "managed" => PartitionBackend::Managed,
-        "terraform" => PartitionBackend::Terraform(TerraformConfig {
+        "" | "terraform" => PartitionBackend::Terraform(TerraformConfig {
             tool: raw.terraform.as_ref().and_then(|t| t.tool.clone()),
             source: raw.terraform.as_ref().and_then(|t| t.source.clone()),
             dir,
@@ -197,10 +196,16 @@ fn convert_partition(raw: RawPartition, path: &Path) -> Result<Partition, Config
             source: raw.terraform.as_ref().and_then(|t| t.source.clone()),
             dir,
         }),
+        "managed" => {
+            return Err(ConfigError::Conversion {
+                path: path.display().to_string(),
+                message: "backend 'managed' is no longer supported; use 'terraform' or 'opentofu' with a main.tf in the partition directory".to_string(),
+            });
+        }
         other => {
             return Err(ConfigError::Conversion {
                 path: path.display().to_string(),
-                message: format!("unknown backend '{}'; expected managed, terraform, or opentofu", other),
+                message: format!("unknown backend '{}'; expected terraform or opentofu", other),
             });
         }
     };

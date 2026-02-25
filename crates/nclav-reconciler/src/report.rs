@@ -16,6 +16,10 @@ pub struct ReconcileRequest {
     /// Not serialized — callers must supply it directly.
     #[serde(skip, default)]
     pub auth_token: Arc<String>,
+    /// When true, the TerraformBackend skips subprocess invocations and returns stubbed outputs.
+    /// Use in tests to avoid requiring a terraform binary.
+    #[serde(default)]
+    pub test_mode: bool,
 }
 
 fn default_api_base() -> String {
@@ -29,6 +33,7 @@ impl Default for ReconcileRequest {
             dry_run: false,
             api_base: default_api_base(),
             auth_token: Arc::new(String::new()),
+            test_mode: false,
         }
     }
 }
