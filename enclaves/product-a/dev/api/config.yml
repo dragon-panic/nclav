@@ -1,11 +1,14 @@
 id: api
 name: API Service
 produces: http
+backend: terraform
 imports:
   - from: product-a-dev
     export_name: db-tcp
     alias: database
 inputs:
+  project_id: "{{ nclav_project_id }}"
+  region: "{{ nclav_region }}"
   db_host: "{{ database.hostname }}"
   db_port: "{{ database.port }}"
 declared_outputs:
