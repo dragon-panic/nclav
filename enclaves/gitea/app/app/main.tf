@@ -125,14 +125,6 @@ resource "google_cloud_run_v2_service" "gitea" {
   }
 }
 
-# Allow unauthenticated invocations — nclav's token auth layer (from the
-# app-http export) handles access control at the application boundary.
-resource "google_cloud_run_v2_service_iam_member" "public" {
-  location = google_cloud_run_v2_service.gitea.location
-  name     = google_cloud_run_v2_service.gitea.name
-  role     = "roles/run.invoker"
-  member   = "allUsers"
-}
 
 # ── Outputs (must match declared_outputs in config.yml) ───────────────────────
 

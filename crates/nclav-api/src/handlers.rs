@@ -125,6 +125,16 @@ pub async fn delete_enclave(
                         warn!(enclave_id = %id, partition_id = %part_id, error = %e, "IaC teardown failed");
                         errors.push(format!("teardown {}/{}: {}", id, part_id, e));
                     }
+                    // Clean up partition SA after IaC teardown
+                    if let Some(handle) = &part_state.partition_handle {
+                        if let Err(e) = driver
+                            .teardown_partition(&existing.desired, &part_state.desired, handle)
+                            .await
+                        {
+                            warn!(enclave_id = %id, partition_id = %part_id, error = %e, "partition SA cleanup failed");
+                            errors.push(format!("SA cleanup {}/{}: {}", id, part_id, e));
+                        }
+                    }
                 }
                 PartitionBackend::Managed => {}
             }
@@ -196,6 +206,16 @@ pub async fn delete_partition(
                 warn!(enclave_id = %enc_id, partition_id = %part_id, error = %e, "IaC partition teardown failed");
                 errors.push(format!("{}", e));
             }
+            // Clean up partition SA
+            if let Some(handle) = &part_state.partition_handle {
+                if let Err(e) = driver
+                    .teardown_partition(&existing.desired, &part_state.desired, handle)
+                    .await
+                {
+                    warn!(enclave_id = %enc_id, partition_id = %part_id, error = %e, "partition SA cleanup failed");
+                    errors.push(format!("SA cleanup: {}", e));
+                }
+            }
         }
         PartitionBackend::Managed => {
             if let Some(handle) = &part_state.partition_handle {
@@ -214,9 +234,20 @@ pub async fn delete_partition(
     // can fix things manually and re-apply.
     state.store.delete_partition(&eid, &pid).await?;
 
+    // Post-destroy CAI check: list any resources still labeled to this partition.
+    let remaining_resources: Vec<String> = if let Some(enc_handle) = &existing.enclave_handle {
+        driver
+            .list_partition_resources(&existing.desired, enc_handle, &part_state.desired)
+            .await
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
     Ok(Json(json!({
-        "destroyed": format!("{}/{}", enc_id, part_id),
-        "errors":    errors,
+        "destroyed":           format!("{}/{}", enc_id, part_id),
+        "errors":              errors,
+        "remaining_resources": remaining_resources,
     })))
 }
 
@@ -498,4 +529,40 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiErr
         "default_cloud": default_cloud,
         "active_drivers": active_drivers,
     })))
+}
+
+// ── Orphans ────────────────────────────────────────────────────────────────────
+
+pub async fn list_orphans(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let enclaves = state.store.list_enclaves().await?;
+    let mut all_orphans: Vec<Value> = Vec::new();
+
+    for enc_state in &enclaves {
+        let Some(enc_handle) = &enc_state.enclave_handle else { continue };
+        let cloud = enc_state.resolved_cloud.clone()
+            .unwrap_or_else(|| state.registry.default_cloud.clone());
+        let Ok(driver) = state.registry.for_cloud(cloud) else { continue };
+
+        let known: Vec<&str> = enc_state.partitions.keys()
+            .map(|id| id.as_str())
+            .collect();
+
+        if let Ok(orphans) = driver
+            .list_orphaned_resources(&enc_state.desired, enc_handle, &known)
+            .await
+        {
+            for o in orphans {
+                all_orphans.push(json!({
+                    "enclave":         enc_state.desired.id.as_str(),
+                    "nclav_partition": o.nclav_partition,
+                    "resource_type":   o.resource_type,
+                    "resource_name":   o.resource_name,
+                }));
+            }
+        }
+    }
+
+    Ok(Json(json!({ "orphans": all_orphans })))
 }

@@ -32,6 +32,8 @@ An enclave is the outer isolation boundary. It bounds:
 
 A partition is a contained unit of infrastructure within an enclave — a set of resources roped off with a declared interface. Partitions have typed outputs and declare what they produce. App developers own the Terraform inside a partition; nclav owns the boundary around it.
 
+Each partition is provisioned under a dedicated service account scoped to that partition alone, enabling least-privilege isolation and a clear IAM audit trail for every cloud resource.
+
 **Enclaves contain partitions. Partitions produce typed outputs. Exports expose those outputs. Imports consume them.**
 
 ---

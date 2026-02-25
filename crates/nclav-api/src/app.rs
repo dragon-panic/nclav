@@ -56,6 +56,8 @@ pub fn build_app(
         .route("/events", get(handlers::list_events))
         // Status
         .route("/status", get(handlers::status))
+        // Orphan detection
+        .route("/orphans", get(handlers::list_orphans))
         // Auth middleware applies to all routes above
         .route_layer(middleware::from_fn_with_state(state.clone(), require_bearer_token))
         .layer(TraceLayer::new_for_http())

@@ -166,13 +166,36 @@ Three forms are supported:
 | `{{ nclav_project_id }}` | Cloud project ID (GCP: enclave's GCP project; local: `""`) |
 | `{{ nclav_region }}` | Cloud region (GCP: configured region; local: `""`) |
 
-Only the keys that appear in `inputs:` are written to the workspace — nothing is
-injected automatically. If your `.tf` files don't declare a variable, don't put it in
-`inputs:`.
+nclav always injects `nclav_enclave` and `nclav_partition` into
+`nclav_context.auto.tfvars` as a preamble, regardless of what is listed in `inputs:`.
+You do not need to add them to `inputs:`. After the preamble, the keys listed in
+`inputs:` are written with their resolved values. If your `.tf` files don't declare a
+variable, don't put it in `inputs:`.
 
 For module-sourced partitions, resolved `inputs:` values become module arguments in the
 generated `nclav_module.tf` instead of `auto.tfvars` entries. The template resolution
 step is identical.
+
+### Recommended labeling pattern
+
+Apply the always-injected variables as resource labels in your Terraform code. This
+convention enables `nclav orphans` to find your resources after a failed teardown:
+
+```hcl
+variable "nclav_enclave"   { default = "" }
+variable "nclav_partition" { default = "" }
+
+locals {
+  nclav_labels = {
+    "nclav-enclave"   = var.nclav_enclave
+    "nclav-partition" = var.nclav_partition
+    "nclav-managed"   = "true"
+  }
+}
+# Apply local.nclav_labels to every resource you create.
+```
+
+Managed partitions (Cloud Run, Pub/Sub) are labeled automatically by the driver.
 
 ---
 
@@ -256,9 +279,14 @@ GOOGLE_PROJECT = myorg-product-a-dev
 
 ```
 GOOGLE_APPLICATION_CREDENTIALS    = ~/.nclav/gcp-credentials.json
-GOOGLE_IMPERSONATE_SERVICE_ACCOUNT = product-a-dev-sa@myorg-product-a-dev.iam.gserviceaccount.com
+GOOGLE_IMPERSONATE_SERVICE_ACCOUNT = partition-db@myorg-product-a-dev.iam.gserviceaccount.com
 GOOGLE_PROJECT                     = myorg-product-a-dev
 ```
+
+nclav creates one service account per partition (`partition-{id}@{project}.iam.gserviceaccount.com`)
+for least-privilege isolation. The Terraform subprocess impersonates that partition-scoped SA,
+not the enclave-level SA, so each IaC run has a clear IAM audit trail and the minimum
+permissions needed for that partition alone.
 
 Your `google` provider block therefore needs no `credentials` or `project` attributes:
 
@@ -344,6 +372,30 @@ capture and `IacRun` recording applies.
 
 The workspace directory is left in place after teardown so the run log remains
 inspectable. It is reused if the enclave is re-provisioned.
+
+After `terraform destroy` completes, the API response includes a `remaining_resources`
+field listing any GCP resources still labeled to that partition. An empty array means
+clean teardown; a non-empty array indicates resources that were not destroyed (e.g. due
+to a partial failure) and should be investigated.
+
+---
+
+## Orphan detection
+
+When `nclav destroy … --partition` completes, the API response includes a
+`remaining_resources` field: an array of GCP resource names still labeled
+`nclav-partition={id}`. An empty array means clean teardown.
+
+To scan across all partitions at any time:
+
+```bash
+nclav orphans                          # all enclaves
+nclav orphans --enclave product-a-dev  # one enclave
+```
+
+For this to work, your Terraform code must apply `local.nclav_labels` to every
+resource it creates (see "Recommended labeling pattern" above). Managed partitions
+(Cloud Run, Pub/Sub) are labeled automatically by the driver.
 
 ---
 

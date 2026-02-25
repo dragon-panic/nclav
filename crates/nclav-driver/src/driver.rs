@@ -6,6 +6,20 @@ use nclav_domain::{Enclave, Export, Import, Partition};
 use crate::error::DriverError;
 use crate::Handle;
 
+/// A GCP resource still labeled to a partition that no longer exists (or is unknown)
+/// in nclav's state. Returned by `list_orphaned_resources`.
+#[derive(Debug, Clone)]
+pub struct OrphanedResource {
+    /// GCP full resource name (e.g. `//run.googleapis.com/projects/p/locations/us-central1/services/svc`).
+    pub resource_name:   String,
+    /// GCP asset type (e.g. `run.googleapis.com/Service`).
+    pub resource_type:   String,
+    /// Value of the `nclav-partition` label on this resource.
+    pub nclav_partition: String,
+    /// Value of the `nclav-enclave` label on this resource.
+    pub nclav_enclave:   String,
+}
+
 /// Result of a successful provision call.
 #[derive(Debug, Clone)]
 pub struct ProvisionResult {
@@ -111,4 +125,33 @@ pub trait Driver: Send + Sync + 'static {
     ///
     /// Example (GCP): `GOOGLE_IMPERSONATE_SERVICE_ACCOUNT`, `GOOGLE_PROJECT`.
     fn auth_env(&self, enclave: &Enclave, handle: &Handle) -> HashMap<String, String>;
+
+    // ── Orphan detection ──────────────────────────────────────────────────────
+
+    /// List all GCP resources currently labeled to a specific partition.
+    /// Returns full resource names. An empty list confirms clean teardown.
+    ///
+    /// Default implementation returns an empty list (no-op for local driver).
+    async fn list_partition_resources(
+        &self,
+        _enclave: &Enclave,
+        _enc_handle: &Handle,
+        _partition: &Partition,
+    ) -> Result<Vec<String>, DriverError> {
+        Ok(vec![])
+    }
+
+    /// List all GCP resources labeled `nclav-managed=true` whose `nclav-partition`
+    /// label does not appear in `known_partition_ids`. These are orphans left by a
+    /// failed or partial teardown.
+    ///
+    /// Default implementation returns an empty list (no-op for local driver).
+    async fn list_orphaned_resources(
+        &self,
+        _enclave: &Enclave,
+        _enc_handle: &Handle,
+        _known_partition_ids: &[&str],
+    ) -> Result<Vec<OrphanedResource>, DriverError> {
+        Ok(vec![])
+    }
 }

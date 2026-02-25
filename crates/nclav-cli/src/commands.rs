@@ -527,6 +527,61 @@ pub async fn iac_logs(
     Ok(())
 }
 
+// ── Orphans ───────────────────────────────────────────────────────────────────
+
+pub async fn orphans(
+    filter_enclave: Option<String>,
+    remote: Option<String>,
+    token: Option<String>,
+) -> Result<()> {
+    let token = resolve_token(token)?;
+    let url   = server_url(remote);
+    let body: serde_json::Value = authed_client(&token)
+        .get(format!("{}/orphans", url.trim_end_matches('/')))
+        .send()
+        .await
+        .with_context(|| format!("Failed to reach server at {url}"))?
+        .json()
+        .await
+        .context("Failed to parse orphans response")?;
+
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let orphans = body["orphans"].as_array().unwrap_or(&empty);
+
+    // Apply optional enclave filter
+    let filtered: Vec<&serde_json::Value> = orphans
+        .iter()
+        .filter(|o| {
+            filter_enclave
+                .as_deref()
+                .map_or(true, |f| o["enclave"].as_str() == Some(f))
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        println!("No orphaned resources found.");
+        return Ok(());
+    }
+
+    // Print as an ASCII table
+    println!(
+        "{:<22} {:<16} {:<28} {}",
+        "ENCLAVE", "PARTITION", "RESOURCE TYPE", "RESOURCE NAME"
+    );
+    println!("{}", "─".repeat(100));
+
+    for o in &filtered {
+        let enclave   = o["enclave"].as_str().unwrap_or("-");
+        let partition = o["nclav_partition"].as_str().unwrap_or("-");
+        let rtype     = o["resource_type"].as_str().unwrap_or("-");
+        let rname     = o["resource_name"].as_str().unwrap_or("-");
+        println!("{:<22} {:<16} {:<28} {}", enclave, partition, rtype, rname);
+    }
+
+    // Exit 1 so CI pipelines can detect orphans
+    anyhow::bail!("{} orphaned resource(s) found", filtered.len());
+}
+
 // ── Token helpers ─────────────────────────────────────────────────────────────
 
 /// Generate a cryptographically random token as a 64-character hex string.

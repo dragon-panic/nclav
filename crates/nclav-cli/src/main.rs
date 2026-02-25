@@ -56,6 +56,9 @@ async fn main() -> Result<()> {
         Command::Graph { output, enclave } => {
             commands::graph(output, enclave, cli.remote, cli.token).await
         }
+        Command::Orphans { enclave } => {
+            commands::orphans(enclave, cli.remote, cli.token).await
+        }
         Command::Destroy { enclave_ids, all, partition, yes } => {
             commands::destroy(enclave_ids, all, partition, yes, cli.remote, cli.token).await
         }

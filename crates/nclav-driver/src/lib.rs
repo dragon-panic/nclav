@@ -5,7 +5,7 @@ pub mod local;
 pub mod registry;
 pub mod terraform;
 
-pub use driver::{Driver, ObservedState, ProvisionResult};
+pub use driver::{Driver, ObservedState, OrphanedResource, ProvisionResult};
 pub use error::DriverError;
 pub use gcp::{GcpDriver, GcpDriverConfig};
 pub use local::LocalDriver;

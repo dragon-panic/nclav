@@ -116,6 +116,17 @@ pub enum Command {
         command: IacCommand,
     },
 
+    /// Scan GCP enclave projects for resources belonging to destroyed or unknown partitions.
+    ///
+    /// Queries Cloud Asset Inventory for resources labeled `nclav-managed=true` whose
+    /// `nclav-partition` label does not match any active partition in nclav state.
+    /// Exits 0 if no orphans found; exits 1 if any are reported (CI-friendly).
+    Orphans {
+        /// Filter to a specific enclave.
+        #[arg(long)]
+        enclave: Option<String>,
+    },
+
     /// Destroy one or more enclaves, tearing down all their infrastructure.
     ///
     /// Runs terraform destroy for IaC partitions, then tears down the enclave

@@ -12,6 +12,7 @@ the exact API calls the driver makes at each method, and defines what the opaque
 |---|---|---|
 | `Enclave` | **Project** | Billing, IAM, API enablement, and network are all project-scoped |
 | `Enclave.identity` | **Service Account** | One SA per enclave; name taken from `identity` field |
+| `Partition` (identity) | **Service Account** | One SA per partition: `partition-{id}@{project}.iam.gserviceaccount.com` |
 | `Enclave.network` | **VPC network + subnets** | Custom-mode VPC; one subnet per entry in `subnets` list |
 | `Enclave.dns.zone` | **Cloud DNS managed zone** | Private zone, visible only within the VPC |
 | `Partition` (http) | **Cloud Run service** | Serverless; region from enclave |
@@ -236,6 +237,9 @@ POST https://run.googleapis.com/v2/projects/<project-id>/locations/<region>/serv
 
 > **Note:** The Cloud Run v2 API requires the service ID to be passed as a `?serviceId=` query parameter. The `name` field must be **absent** (or empty) in the request body — the API returns an error if it is set on create. The full resource name is derived locally after creation as `projects/<p>/locations/<r>/services/<partition-id>`.
 
+The GCP driver automatically applies `nclav-managed=true`, `nclav-enclave={enclave-id}`,
+and `nclav-partition={partition-id}` labels to the Cloud Run service.
+
 **Outputs:**
 ```
 hostname  →  <service-hash>-<project-hash>.<region>.run.app
@@ -290,6 +294,9 @@ port      →  inputs["port"]       (empty string if not set)
 PUT https://pubsub.googleapis.com/v1/projects/<project-id>/topics/<partition-id>
 {}
 ```
+
+The GCP driver automatically applies `nclav-managed=true`, `nclav-enclave={enclave-id}`,
+and `nclav-partition={partition-id}` labels to the Pub/Sub topic.
 
 **Outputs:**
 ```

@@ -162,9 +162,20 @@ nclav destroy product-a-dev product-b-staging
 
 # Nuclear option — destroy everything the server knows about
 nclav destroy --all
+
+# Destroy a single partition (runs terraform destroy, clears state)
+nclav destroy product-a-dev --partition db
 ```
 
 This is the imperative escape hatch. The declarative equivalent is to remove the enclave from your YAML and run `nclav apply`. Either approach follows the same teardown path; `destroy` is more convenient when testing or resetting an environment.
+
+### `nclav orphans [--enclave <id>]`
+
+Scan GCP enclave projects for resources labeled `nclav-managed=true` whose
+`nclav-partition` label does not match any active partition in nclav state.
+Useful after a failed destroy to surface what was left behind.
+
+Exit 0 if no orphans found; exit 1 if any are reported (CI-friendly).
 
 ### `nclav iac runs <enclave-id> <partition-id>`
 
@@ -202,6 +213,7 @@ Start the server with `nclav bootstrap`, then use the token from `~/.nclav/token
 | `GET` | `/graph` | System-wide dependency graph |
 | `GET` | `/events` | Audit log (`?enclave_id=&limit=`) |
 | `GET` | `/status` | Summary: enclave count, default cloud, active drivers |
+| `DELETE` | `/enclaves/{id}/partitions/{part}` | Destroy a single partition and its infrastructure |
 | `GET` | `/enclaves/{id}/partitions/{part}/iac/runs` | List IaC runs for a partition |
 | `GET` | `/enclaves/{id}/partitions/{part}/iac/runs/latest` | Most recent IaC run |
 | `GET` | `/enclaves/{id}/partitions/{part}/iac/runs/{run-id}` | Specific IaC run |
@@ -336,7 +348,7 @@ When nclav reconciles this partition it:
 1. Creates a workspace at `~/.nclav/workspaces/{enclave_id}/{partition_id}/`
 2. Symlinks all `.tf` files from the partition directory into the workspace
 3. Writes `nclav_backend.tf` (configures the Terraform HTTP state backend — no separate backend setup required)
-4. Writes `nclav_context.auto.tfvars` with only the keys declared in `inputs:`, after resolving all template tokens
+4. Writes `nclav_context.auto.tfvars` with a preamble containing `nclav_enclave` and `nclav_partition` (always injected), followed by the keys declared in `inputs:` after resolving all template tokens
 5. Runs `terraform init` then `terraform apply -auto-approve`
 6. Reads the declared outputs and stores them for downstream partitions to consume
 7. Records the full combined log as an `IacRun` record (viewable with `nclav iac logs`)
