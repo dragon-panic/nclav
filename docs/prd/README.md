@@ -175,6 +175,8 @@ The reconciler validates that `produces` matches the export `type` that targets 
 | `tcp` | `host`, `port` |
 | `queue` | `connection_string`, `topic_name` |
 
+See [PARTITIONS.md](PARTITIONS.md) for the full partition authoring reference — Terraform/OpenTofu backends, input templating, declared outputs, IaC run logs, and labeling conventions.
+
 ---
 
 ## Driver Architecture
@@ -243,6 +245,8 @@ It runs the full reconcile loop — YAML parsing, graph validation, import/expor
 - Output contract (partition outputs satisfy `produces` requirements)
 
 If the YAML requires changes to run locally vs on Azure, the abstraction has leaked. Local driver parity is a hard requirement.
+
+See [GCP.md](GCP.md) for the GCP driver reference — provisioning model, PSC wiring, IAM, Cloud Run, Cloud SQL, and all design decisions specific to the GCP target.
 
 ---
 
@@ -530,7 +534,12 @@ nclav bootstrap              # One-time platform setup
 nclav apply ./enclaves       # Reconcile against actual state
 nclav diff ./enclaves        # Show what apply would change
 nclav status                 # Enclave health and drift summary
-nclav graph ./enclaves       # Render full import/export graph
+nclav graph                  # Render full import/export graph
+nclav destroy <id>           # Tear down an enclave and all its infrastructure
+nclav destroy <id> --partition <part>  # Tear down a single partition
+nclav iac runs <enc> <part>  # List IaC run history for a partition
+nclav iac logs <enc> <part>  # Print logs from the latest (or a specific) IaC run
+nclav orphans                # Scan for GCP resources from destroyed partitions
 ```
 
 ---
