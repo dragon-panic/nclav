@@ -7,7 +7,7 @@ Cloud infrastructure orchestration via a YAML-driven reconcile loop. nclav manag
 | Term | Meaning |
 |---|---|
 | **Enclave** | An isolated boundary (VPC, subscription, cost center). Owns its partitions and declares what it exports to other enclaves. |
-| **Partition** | A deployable unit inside an enclave (a service, a database, a queue). Can be managed by nclav directly or backed by Terraform/OpenTofu. |
+| **Partition** | A deployable unit inside an enclave (a service, a database, a queue). Backed by Terraform or OpenTofu; nclav creates the partition service account and runs the IaC tool. |
 | **Export** | A named endpoint an enclave makes available to others, with type (`http`, `tcp`, `queue`) and access control (`to:`). |
 | **Import** | A reference to another enclave's export, given a local alias used for template substitution. |
 | **Reconcile** | The loop that diffs desired state (YAML) against actual state (store), then provisions/tears down in dependency order. |
@@ -104,13 +104,7 @@ gcloud auth application-default login \
   --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/cloud-billing
 ```
 
-**Partition type mapping (GCP managed driver):**
-
-| Partition `produces` | GCP resource |
-|---|---|
-| `http` | Cloud Run service |
-| `tcp` | Externally managed — reads `hostname`/`port` from partition `inputs:` |
-| `queue` | Pub/Sub topic + subscription |
+GCP partitions are provisioned via Terraform. nclav creates a per-partition service account (`partition-{id}@{project}.iam.gserviceaccount.com`) with `roles/editor`, then runs Terraform under that identity.
 
 See [GCP.md](docs/prd/GCP.md) for full GCP driver and bootstrap reference.
 
@@ -249,7 +243,8 @@ enclaves/
   product-a/dev/
     config.yml          ← enclave declaration
     api/
-      config.yml        ← partition declaration (managed driver)
+      config.yml        ← partition declaration (terraform backend)
+      main.tf           ← your terraform code
     db/
       config.yml        ← partition declaration (terraform backend)
       main.tf           ← your terraform code
@@ -291,41 +286,9 @@ imports: []
 | tcp | yes | — | — | yes | yes |
 | queue | yes | yes | — | — | yes |
 
-### Partition `config.yml` — managed backend
+### Partition `config.yml`
 
-```yaml
-id: api
-name: API Service
-produces: http        # http | tcp | queue (optional)
-
-# Intra- or cross-enclave imports
-imports:
-  - from: product-a-dev       # enclave id
-    export_name: db-tcp
-    alias: database           # local name for template substitution
-
-# Template-resolved inputs passed to the driver at provision time
-inputs:
-  db_host: "{{ database.hostname }}"
-  db_port: "{{ database.port }}"
-
-# Keys the driver will populate in resolved_outputs
-declared_outputs:
-  - hostname
-  - port
-```
-
-`declared_outputs` must cover the keys required by `produces`:
-
-| produces | required outputs |
-|---|---|
-| `http` | `hostname`, `port` |
-| `tcp` | `hostname`, `port` |
-| `queue` | `queue_url` |
-
-### Partition `config.yml` — IaC backend (Terraform / OpenTofu)
-
-Set `backend: terraform` (or `opentofu`) to hand provisioning off to an IaC tool. Place `.tf` files alongside `config.yml` in the partition directory, and declare the variables you need via `inputs:`:
+Every partition is backed by Terraform or OpenTofu. Place `.tf` files alongside `config.yml` in the partition directory and declare the variables you need via `inputs:`:
 
 ```yaml
 id: db
@@ -433,7 +396,6 @@ RUST_LOG=nclav::iac=debug cargo run -p nclav-cli -- apply ./enclaves
 - **Azure driver** — the `Driver` trait is defined; the Azure implementation is deferred
 - **AWS driver**
 - **Postgres store** — `StateStore` is designed for it; feature-flag planned
-- **GCP platform bootstrap** — deploying the nclav API itself to Cloud Run + Cloud SQL (currently `--cloud gcp` runs the API server locally with the GCP driver for enclave provisioning)
 - **IaC drift detection** — `terraform plan` on a schedule to detect out-of-band changes
 - **Live log streaming** — IaC run logs are currently stored as a single blob after completion; streaming via SSE is future work
 - **Web UI**

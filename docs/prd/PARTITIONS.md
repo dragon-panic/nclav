@@ -10,34 +10,17 @@ is provisioned*. These two concerns are independent — any backend can produce 
 
 | `backend` | Who provisions | Files in partition directory |
 |---|---|---|
-| `managed` (default) | Cloud driver built-in logic (Cloud Run, Pub/Sub, …) | None |
-| `terraform` | `terraform` binary | `.tf` files you write |
+| `terraform` (default) | `terraform` binary | `.tf` files you write |
 | `opentofu` | `tofu` binary | `.tf` files you write |
 | `terraform` + `source:` | `terraform` binary, module fetched from URL | None — nclav generates everything |
 | `opentofu` + `source:` | `tofu` binary, module fetched from URL | None — nclav generates everything |
 
 ---
 
-## Managed partitions
-
-The default. The cloud driver provisions the workload using its own built-in logic
-(e.g. Cloud Run for `http`, Pub/Sub for `queue`). No extra files are needed.
-
-```yaml
-id: api
-name: API Service
-produces: http
-declared_outputs:
-  - hostname
-  - port
-```
-
----
-
 ## IaC-backed partitions
 
-Set `backend: terraform` or `backend: opentofu` to hand provisioning off to Terraform
-or OpenTofu. nclav manages the workspace, state backend, credentials, and run logs —
+Every partition is backed by Terraform or OpenTofu. nclav creates a per-partition
+service account, then manages the workspace, state backend, credentials, and run logs —
 you only write the infrastructure code.
 
 ### Writing your own `.tf` files
@@ -394,8 +377,7 @@ nclav orphans --enclave product-a-dev  # one enclave
 ```
 
 For this to work, your Terraform code must apply `local.nclav_labels` to every
-resource it creates (see "Recommended labeling pattern" above). Managed partitions
-(Cloud Run, Pub/Sub) are labeled automatically by the driver.
+resource it creates (see "Recommended labeling pattern" above).
 
 ---
 

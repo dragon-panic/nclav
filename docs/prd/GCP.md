@@ -15,9 +15,7 @@ the exact API calls the driver makes at each method, and defines what the opaque
 | `Partition` (identity) | **Service Account** | One SA per partition: `partition-{id}@{project}.iam.gserviceaccount.com` |
 | `Enclave.network` | **VPC network + subnets** | Custom-mode VPC; one subnet per entry in `subnets` list |
 | `Enclave.dns.zone` | **Cloud DNS managed zone** | Private zone, visible only within the VPC |
-| `Partition` (http) | **Cloud Run service** | Serverless; region from enclave |
-| `Partition` (tcp) | **externally managed** | nclav validates wiring; hostname/port read from partition `inputs:` |
-| `Partition` (queue) | **Pub/Sub topic** | One topic per partition; subscriptions created at import time |
+| `Partition` (workload) | **Terraform-managed** | nclav creates the partition SA; Terraform provisions the workload |
 | `Export` (http) | **Cloud Run IAM binding** + URL | IAM: `roles/run.invoker` on the service |
 | `Export` (tcp) | **Private Service Connect** endpoint | Exposes a service across project boundaries without VPC peering |
 | `Export` (queue) | **Pub/Sub topic** + IAM binding | `roles/pubsub.publisher` granted to importer SA |
@@ -217,104 +215,34 @@ GCP soft-deletes projects; they enter a 30-day pending-deletion period. Poll
 
 ### `provision_partition`
 
-Behavior depends on `partition.produces`:
-
-#### `produces: http` → Cloud Run service
+Creates a per-partition service account for least-privilege isolation. Terraform
+runs under this SA via impersonation (`GOOGLE_IMPERSONATE_SERVICE_ACCOUNT`).
 
 ```
-POST https://run.googleapis.com/v2/projects/<project-id>/locations/<region>/services?serviceId=<partition-id>
+POST https://iam.googleapis.com/v1/projects/<project-id>/serviceAccounts
 {
-  "template": {
-    "serviceAccount": "<enclave-sa-email>",
-    "containers": [{
-      "image": "<resolved_inputs["image"] or placeholder>",
-      "env": [ { "name": "K", "value": "V" } ... ]   // from resolved_inputs
-    }]
-  },
-  "ingress": "INGRESS_TRAFFIC_INTERNAL_ONLY"           // tightened at export time
+  "accountId": "partition-<partition-id>",
+  "serviceAccount": { "displayName": "nclav <enclave-id>/<partition-id>" }
 }
 ```
 
-> **Note:** The Cloud Run v2 API requires the service ID to be passed as a `?serviceId=` query parameter. The `name` field must be **absent** (or empty) in the request body — the API returns an error if it is set on create. The full resource name is derived locally after creation as `projects/<p>/locations/<r>/services/<partition-id>`.
+Two IAM bindings are then applied:
 
-The GCP driver automatically applies `nclav-managed=true`, `nclav-enclave={enclave-id}`,
-and `nclav-partition={partition-id}` labels to the Cloud Run service.
-
-**Outputs:**
-```
-hostname  →  <service-hash>-<project-hash>.<region>.run.app
-port      →  443
-```
-
-#### `produces: tcp` → externally managed (passthrough)
-
-nclav does not provision TCP backing services (databases, caches, etc.). The choice
-of database engine, instance tier, HA topology, and backup policy is an
-application-level concern outside nclav's scope.
-
-For a `tcp` partition, nclav:
-1. Validates all consumers can reach this partition (access-control graph check)
-2. Reads `hostname` and `port` from the partition's `inputs:` block at provision time
-3. Stores those values in the handle so subsequent `observe_partition` calls work without a live cloud call
-
-**Partition `config.yml` example:**
-```yaml
-id: db
-name: Database
-produces: tcp
-inputs:
-  hostname: "10.10.5.3"
-  port: "5432"
-declared_outputs:
-  - hostname
-  - port
-```
-
-**Outputs:**
-```
-hostname  →  inputs["hostname"]   (empty string if not set — warning logged)
-port      →  inputs["port"]       (empty string if not set)
-```
+1. Enclave SA → `roles/iam.serviceAccountTokenCreator` on the partition SA (allows Terraform impersonation)
+2. Partition SA → `roles/editor` on the enclave project (allows Terraform to provision resources)
 
 **Handle shape:**
 ```json
 {
   "driver": "gcp",
   "kind": "partition",
-  "type": "tcp_passthrough",
+  "type": "iac",
   "project_id": "acme-product-a-dev",
-  "hostname": "10.10.5.3",
-  "port": "5432"
+  "partition_sa": "partition-api@acme-product-a-dev.iam.gserviceaccount.com"
 }
 ```
 
-#### `produces: queue` → Pub/Sub topic
-
-```
-PUT https://pubsub.googleapis.com/v1/projects/<project-id>/topics/<partition-id>
-{}
-```
-
-The GCP driver automatically applies `nclav-managed=true`, `nclav-enclave={enclave-id}`,
-and `nclav-partition={partition-id}` labels to the Pub/Sub topic.
-
-**Outputs:**
-```
-queue_url  →  projects/<project-id>/topics/<partition-id>
-```
-
-**Handle shape (Cloud Run example):**
-```json
-{
-  "driver": "gcp",
-  "kind": "partition",
-  "type": "cloud_run",
-  "project_id": "acme-product-a-dev",
-  "region": "us-central1",
-  "service_name": "projects/acme-product-a-dev/locations/us-central1/services/api",
-  "service_url": "https://api-abc123-uc.a.run.app"
-}
-```
+**Outputs:** empty (Terraform provides the outputs after `terraform apply`).
 
 ---
 
@@ -620,60 +548,14 @@ or the service account is missing — the enclave is partially provisioned.
 
 ### `observe_partition`
 
-#### Cloud Run (http)
+IaC partitions report `exists: true, healthy: true` as long as their handle
+type is `"iac"`. Terraform state is the source of truth for the workload's
+actual health; nclav does not inspect the Terraform-managed resources directly.
 
-```
-GET https://run.googleapis.com/v2/projects/<p>/locations/<r>/services/<partition-id>
-```
-
-Map the `conditions` array:
-
-| Condition | `status` | Meaning |
+| Handle type | `exists` | `healthy` |
 |---|---|---|
-| `type: Ready`, `status: True` | `Active` | Service is live and handling traffic |
-| `type: Ready`, `status: False` | `Degraded` | Service exists but is not ready |
-| `type: Ready`, `status: Unknown` | `Provisioning` | Deployment still rolling out |
-| HTTP 404 | report `exists: false` | — |
-
-Populate `ObservedState.outputs` from the live service:
-
-```
-hostname  →  response.uri  (strip "https://")
-port      →  443
-```
-
-#### TCP passthrough
-
-TCP partitions are externally managed; no cloud API is called. `observe_partition`
-reads hostname and port from the stored handle:
-
-```
-hostname  →  handle["hostname"]
-port      →  handle["port"]
-```
-
-| Condition | `ProvisioningStatus` |
-|---|---|
-| handle present, hostname non-empty | `Active` |
-| handle present, hostname empty | `Degraded` |
-| no handle | `exists: false` |
-
-#### Pub/Sub topic (queue)
-
-```
-GET https://pubsub.googleapis.com/v1/projects/<p>/topics/<partition-id>
-```
-
-Pub/Sub topics have no health state beyond existence:
-
-| Response | `ProvisioningStatus` |
-|---|---|
-| HTTP 200 | `Active` |
-| HTTP 404 | `exists: false` |
-
-```
-queue_url  →  response.name   ("projects/<p>/topics/<partition-id>")
-```
+| `iac` | `true` | `true` |
+| unknown | `false` | `false` (warning logged) |
 
 ---
 
@@ -690,15 +572,8 @@ driver reports via `ObservedState`.
 | Project | `lifecycleState: DELETE_REQUESTED` | `Deleting` |
 | Project | VPC or SA missing | `Degraded` |
 | Project | HTTP 404 | (caller treats as `Deleted`) |
-| Cloud Run | `conditions[Ready].status: True` | `Active` |
-| Cloud Run | `conditions[Ready].status: False` | `Degraded` |
-| Cloud Run | `conditions[Ready].status: Unknown` | `Provisioning` |
-| Cloud Run | HTTP 404 | (caller treats as `Deleted`) |
-| TCP passthrough | handle present, hostname non-empty | `Active` |
-| TCP passthrough | handle present, hostname empty | `Degraded` |
-| TCP passthrough | no handle | (caller treats as `Deleted`) |
-| Pub/Sub topic | HTTP 200 | `Active` |
-| Pub/Sub topic | HTTP 404 | (caller treats as `Deleted`) |
+| IaC partition | handle type `iac` | `Active` |
+| IaC partition | unknown handle type | (caller treats as `Deleted`) |
 
 The reconciler — not the driver — writes to `ResourceMeta.status`. The driver
 returns `ObservedState`; the reconciler decides the transition.
