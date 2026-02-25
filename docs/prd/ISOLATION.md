@@ -201,7 +201,7 @@ Is every service in the catalog?
 
 ## Related Documents
 
-- [PRD.md](PRD.md) — Core concepts, imports/exports, enclave and partition primitives
+- [README.md](README.md) — Core concepts, imports/exports, enclave and partition primitives
 - [PARTITIONS.md](PARTITIONS.md) — Partition backends, Terraform/OpenTofu, inputs/outputs, labeling
 - [GCP.md](GCP.md) — GCP driver reference, PSC wiring, Cloud Run, Cloud SQL, IAM
 - [BOOTSTRAP.md](BOOTSTRAP.md) — Platform setup, authentication, bootstrap options

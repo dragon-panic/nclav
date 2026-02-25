@@ -54,7 +54,7 @@ nclav [--remote <url>] [--token <token>] <command>
 
 Bootstrap provisions the nclav **platform** — the API server and its state store. It is a one-time, idempotent operation. After bootstrap completes, the API runs continuously and all other CLI commands talk to it via HTTP.
 
-The platform location (set by `--cloud`) and each enclave's target cloud (`cloud:` in YAML) are **independent**. An API running locally can provision enclaves into GCP. See [BOOTSTRAP.md](BOOTSTRAP.md) for full design rationale.
+The platform location (set by `--cloud`) and each enclave's target cloud (`cloud:` in YAML) are **independent**. An API running locally can provision enclaves into GCP. See [BOOTSTRAP.md](docs/prd/BOOTSTRAP.md) for full design rationale.
 
 #### Local bootstrap
 
@@ -112,7 +112,7 @@ gcloud auth application-default login \
 | `tcp` | Externally managed — reads `hostname`/`port` from partition `inputs:` |
 | `queue` | Pub/Sub topic + subscription |
 
-See [GCP.md](GCP.md) for full GCP driver and bootstrap reference.
+See [GCP.md](docs/prd/GCP.md) for full GCP driver and bootstrap reference.
 
 ### `nclav diff <enclaves-dir>`
 
