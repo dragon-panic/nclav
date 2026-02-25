@@ -142,6 +142,84 @@ pub async fn delete_enclave(
     Ok(Json(json!({ "destroyed": id, "errors": errors })))
 }
 
+// ── delete_partition ──────────────────────────────────────────────────────────
+
+pub async fn delete_partition(
+    State(state): State<AppState>,
+    Path((enc_id, part_id)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let eid = EnclaveId::new(&enc_id);
+    let pid = PartitionId::new(&part_id);
+
+    let existing = state
+        .store
+        .get_enclave(&eid)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("enclave '{}' not found", enc_id)))?;
+
+    let part_state = existing
+        .partitions
+        .get(&pid)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found(
+            format!("partition '{}' not found in enclave '{}'", part_id, enc_id)
+        ))?;
+
+    let cloud = existing
+        .resolved_cloud
+        .clone()
+        .unwrap_or_else(|| state.registry.default_cloud.clone());
+
+    let driver = state
+        .registry
+        .for_cloud(cloud)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let mut errors: Vec<String> = Vec::new();
+
+    match &part_state.desired.backend {
+        PartitionBackend::Terraform(_) | PartitionBackend::OpenTofu(_) => {
+            let tf_backend = TerraformBackend {
+                api_base:   (*state.api_base).clone(),
+                auth_token: state.auth_token.clone(),
+                store:      state.store.clone(),
+            };
+            let auth_env = existing
+                .enclave_handle
+                .as_ref()
+                .map(|h| driver.auth_env(&existing.desired, h))
+                .unwrap_or_default();
+            if let Err(e) = tf_backend
+                .teardown(&existing.desired, &part_state.desired, &auth_env, None)
+                .await
+            {
+                warn!(enclave_id = %enc_id, partition_id = %part_id, error = %e, "IaC partition teardown failed");
+                errors.push(format!("{}", e));
+            }
+        }
+        PartitionBackend::Managed => {
+            if let Some(handle) = &part_state.partition_handle {
+                if let Err(e) = driver
+                    .teardown_partition(&existing.desired, &part_state.desired, handle)
+                    .await
+                {
+                    warn!(enclave_id = %enc_id, partition_id = %part_id, error = %e, "partition teardown failed");
+                    errors.push(format!("{}", e));
+                }
+            }
+        }
+    }
+
+    // Remove partition from store regardless of teardown errors so the operator
+    // can fix things manually and re-apply.
+    state.store.delete_partition(&eid, &pid).await?;
+
+    Ok(Json(json!({
+        "destroyed": format!("{}/{}", enc_id, part_id),
+        "errors":    errors,
+    })))
+}
+
 pub async fn get_enclave_graph(
     State(state): State<AppState>,
     Path(id): Path<String>,

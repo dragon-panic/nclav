@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::middleware;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use nclav_driver::DriverRegistry;
 use nclav_store::StateStore;
@@ -33,6 +33,8 @@ pub fn build_app(
             get(handlers::get_enclave).delete(handlers::delete_enclave),
         )
         .route("/enclaves/:id/graph", get(handlers::get_enclave_graph))
+        // Partition destroy
+        .route("/enclaves/:id/partitions/:part", delete(handlers::delete_partition))
         // IaC run logs
         .route("/enclaves/:id/partitions/:part/iac/runs", get(handlers::list_iac_runs))
         .route("/enclaves/:id/partitions/:part/iac/runs/latest", get(handlers::get_latest_iac_run))

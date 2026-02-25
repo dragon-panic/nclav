@@ -1,0 +1,18 @@
+id: gitea-db
+name: Gitea Database
+cloud: gcp
+region: us-central1
+network:
+  vpc_cidr: "10.1.0.0/16"
+  subnets:
+    - "10.1.1.0/24"
+dns:
+  zone: gitea-db.local
+exports:
+  - name: postgres-tcp
+    target_partition: postgres
+    type: tcp
+    to:
+      enclave: gitea-app
+    auth: none
+imports: []

@@ -1,3 +1,4 @@
+use std::io::{self, BufRead, Write as IoWrite};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -251,18 +252,78 @@ pub async fn graph(
 
 // ── Destroy ───────────────────────────────────────────────────────────────────
 
+/// Prompt the user to type `expected` to confirm a destructive action.
+/// Returns Ok if confirmed, Err if they typed something else or hit EOF.
+fn confirm_destructive(label: &str, expected: &str) -> Result<()> {
+    print!("  Type '{}' to confirm: ", expected);
+    io::stdout().flush().context("flush stdout")?;
+    let line = io::stdin()
+        .lock()
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no input"))??;
+    if line.trim() != expected {
+        anyhow::bail!("aborted: {} not destroyed", label);
+    }
+    Ok(())
+}
+
 pub async fn destroy(
     enclave_ids: Vec<String>,
     all: bool,
+    partition: Option<String>,
+    yes: bool,
     remote: Option<String>,
     token: Option<String>,
 ) -> Result<()> {
-    let token = resolve_token(token)?;
-    let url = server_url(remote);
+    let token  = resolve_token(token)?;
+    let url    = server_url(remote);
     let client = authed_client(&token);
-    let base = url.trim_end_matches('/');
+    let base   = url.trim_end_matches('/');
 
-    // Resolve the list of IDs to destroy
+    // ── Partition destroy ─────────────────────────────────────────────────────
+    if let Some(ref part_id) = partition {
+        if enclave_ids.len() != 1 {
+            anyhow::bail!("--partition requires exactly one enclave ID");
+        }
+        let enc_id = &enclave_ids[0];
+
+        if !yes {
+            println!("This will destroy partition '{}/{}' and remove it from the server state.", enc_id, part_id);
+            println!("A subsequent 'apply' will re-provision it from scratch.");
+            confirm_destructive(&format!("{}/{}", enc_id, part_id), part_id)?;
+        }
+
+        print!("Destroying {}/{}… ", enc_id, part_id);
+        let resp = client
+            .delete(format!("{}/enclaves/{}/partitions/{}", base, enc_id, part_id))
+            .send()
+            .await
+            .with_context(|| format!("Failed to reach server at {url}"))?;
+
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+
+        if status.is_success() {
+            let errors = body["errors"].as_array().cloned().unwrap_or_default();
+            if errors.is_empty() {
+                println!("done.");
+            } else {
+                println!("done (with errors):");
+                for e in &errors {
+                    println!("  ! {}", e.as_str().unwrap_or(&e.to_string()));
+                }
+                anyhow::bail!("partition destroy completed with errors");
+            }
+        } else {
+            let msg = body["error"].as_str().unwrap_or("unknown error");
+            println!("failed: {} — {}", status, msg);
+            anyhow::bail!("partition destroy failed");
+        }
+        return Ok(());
+    }
+
+    // ── Enclave destroy ───────────────────────────────────────────────────────
     let ids: Vec<String> = if all {
         let states: Vec<serde_json::Value> = client
             .get(format!("{}/enclaves", base))
@@ -275,7 +336,12 @@ pub async fn destroy(
 
         let ids: Vec<String> = states
             .iter()
-            .filter_map(|s| s.get("desired").and_then(|d| d.get("id")).and_then(|v| v.as_str()).map(String::from))
+            .filter_map(|s| {
+                s.get("desired")
+                    .and_then(|d| d.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
             .collect();
 
         if ids.is_empty() {
@@ -289,6 +355,15 @@ pub async fn destroy(
 
     let mut any_error = false;
     for id in &ids {
+        if !yes && !all {
+            println!("This will destroy enclave '{}' and delete its GCP project (30-day hold).", id);
+            if let Err(e) = confirm_destructive(id, id) {
+                println!("{}", e);
+                any_error = true;
+                continue;
+            }
+        }
+
         print!("Destroying {}… ", id);
         let resp = client
             .delete(format!("{}/enclaves/{}", base, id))

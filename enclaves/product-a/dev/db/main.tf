@@ -1,5 +1,8 @@
 # Cloud SQL (PostgreSQL 15) for the product-a-dev db partition.
 #
+# PSC-enabled — no VPC peering / service networking required.
+# Cross-enclave connectivity uses the native PSC service attachment.
+#
 # Variables are supplied by nclav via nclav_context.auto.tfvars.
 # Declare only the ones you use; see inputs: in config.yml.
 
@@ -20,33 +23,7 @@ provider "google" {
   region  = var.region
 }
 
-# ── VPC ───────────────────────────────────────────────────────────────────────
-
-# Reference the VPC that the nclav GCP driver created for this enclave.
-data "google_compute_network" "nclav" {
-  name    = "nclav-vpc"
-  project = var.project_id
-}
-
-# ── Private services access ───────────────────────────────────────────────────
-# Cloud SQL uses a VPC peering connection into Google's managed network.
-# servicenetworking.googleapis.com is already enabled by the nclav GCP driver.
-
-resource "google_compute_global_address" "sql_private_range" {
-  name          = "cloudsql-private-range"
-  purpose       = "VPC_PEERING"
-  address_type  = "INTERNAL"
-  prefix_length = 20
-  network       = data.google_compute_network.nclav.id
-}
-
-resource "google_service_networking_connection" "private_vpc" {
-  network                 = data.google_compute_network.nclav.id
-  service                 = "servicenetworking.googleapis.com"
-  reserved_peering_ranges = [google_compute_global_address.sql_private_range.name]
-}
-
-# ── Cloud SQL instance ────────────────────────────────────────────────────────
+# ── Cloud SQL instance (Enterprise, PSC enabled) ──────────────────────────────
 
 resource "google_sql_database_instance" "db" {
   name             = "db"
@@ -54,12 +31,14 @@ resource "google_sql_database_instance" "db" {
   region           = var.region
 
   settings {
-    tier              = "db-f1-micro"
+    tier              = "db-custom-2-7680"
     availability_type = "ZONAL"
 
     ip_configuration {
-      ipv4_enabled    = false
-      private_network = data.google_compute_network.nclav.id
+      ipv4_enabled = false
+      psc_config {
+        psc_enabled = true
+      }
     }
 
     backup_configuration {
@@ -68,7 +47,6 @@ resource "google_sql_database_instance" "db" {
   }
 
   deletion_protection = false
-  depends_on          = [google_service_networking_connection.private_vpc]
 }
 
 resource "google_sql_database" "app" {
@@ -86,4 +64,9 @@ output "hostname" {
 output "port" {
   description = "PostgreSQL port."
   value       = "5432"
+}
+
+output "psc_service_attachment" {
+  description = "PSC service attachment URI for cross-enclave connectivity."
+  value       = google_sql_database_instance.db.psc_service_attachment_link
 }

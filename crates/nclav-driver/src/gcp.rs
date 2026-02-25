@@ -1279,15 +1279,32 @@ impl Driver for GcpDriver {
             }
 
             ExportType::Tcp => {
-                // PSC attachment is complex; record the region/project for import wiring.
+                // Catalog data services (Cloud SQL, AlloyDB, Memorystore, etc.) expose a native
+                // PSC service attachment URI. Read it from the partition's declared outputs.
+                //
+                // VM Fleet L4 exports (MIG + ILB + PSC) are a separate builder — not implemented
+                // here. Services without a native PSC attachment should be wrapped behind an HTTP
+                // export or require hub-spoke topology.
+                let service_attachment = partition_outputs
+                    .get("psc_service_attachment")
+                    .cloned()
+                    .ok_or_else(|| DriverError::ProvisionFailed(format!(
+                        "tcp export '{}': partition must declare 'psc_service_attachment' in its \
+                         outputs. Catalog services (Cloud SQL, AlloyDB, Memorystore) support this \
+                         natively — enable PSC on the service in Terraform and output \
+                         'psc_service_attachment_link'.",
+                        export.name
+                    )))?;
+
                 let handle = json!({
-                    "driver":      "gcp",
-                    "kind":        "export",
-                    "type":        "tcp",
-                    "project_id":  project_id,
-                    "export_name": export.name,
-                    "region":      region,
-                    "outputs":     partition_outputs,
+                    "driver":             "gcp",
+                    "kind":               "export",
+                    "type":               "tcp",
+                    "project_id":         project_id,
+                    "export_name":        export.name,
+                    "region":             region,
+                    "service_attachment": service_attachment,
+                    "outputs":            partition_outputs,
                 });
                 Ok(ProvisionResult { handle, outputs: partition_outputs.clone() })
             }
@@ -1346,7 +1363,166 @@ impl Driver for GcpDriver {
             }
 
             "tcp" => {
-                // Propagate connection details (PSC wiring would go here).
+                let region = self.region(importer);
+
+                let service_attachment = export_handle["service_attachment"].as_str()
+                    .ok_or_else(|| DriverError::ProvisionFailed(
+                        "tcp import: export handle missing 'service_attachment'".into()
+                    ))?;
+
+                if importer.network.is_none() {
+                    return Err(DriverError::ProvisionFailed(format!(
+                        "cross-enclave tcp import '{}': importer enclave must have \
+                         network: configured",
+                        import.alias
+                    )));
+                }
+                let dns_zone = importer.dns.as_ref()
+                    .and_then(|d| d.zone.as_ref())
+                    .ok_or_else(|| DriverError::ProvisionFailed(format!(
+                        "cross-enclave tcp import '{}': importer enclave must have \
+                         dns.zone: configured",
+                        import.alias
+                    )))?;
+
+                let ep_ip_name = format!("nclav-ep-ip-{}", import.alias);
+                let ep_name    = format!("nclav-ep-{}", import.alias);
+                let dns_name   = format!("{}.{}", import.alias, dns_zone);
+
+                // Step 1 — Reserve internal IP in the importer's subnet
+                info!(importer_project, ep_ip_name, "Reserving internal IP for PSC endpoint");
+                let addr_url = format!(
+                    "{}/compute/v1/projects/{}/regions/{}/addresses",
+                    self.base.compute, importer_project, region
+                );
+                let addr_op = match self.post_json(
+                    &addr_url,
+                    &token,
+                    &json!({
+                        "name":        ep_ip_name,
+                        "addressType": "INTERNAL",
+                        "subnetwork":  format!(
+                            "projects/{}/regions/{}/subnetworks/subnet-0",
+                            importer_project, region
+                        ),
+                        "purpose":     "GCE_ENDPOINT",
+                    }),
+                ).await {
+                    Ok(op) => Some(op),
+                    Err(e) if e.to_string().to_lowercase().contains("already exists") => {
+                        info!(importer_project, ep_ip_name, "PSC endpoint IP already exists");
+                        None
+                    }
+                    Err(e) => return Err(e),
+                };
+                if let Some(op) = addr_op {
+                    if let Some(op_name) = op["name"].as_str() {
+                        let op_url = format!(
+                            "{}/compute/v1/projects/{}/regions/{}/operations/{}",
+                            self.base.compute, importer_project, region, op_name
+                        );
+                        self.wait_for_operation(&op_url).await?;
+                    }
+                }
+
+                // GET the reserved address to read the actual IP
+                let get_addr_url = format!(
+                    "{}/compute/v1/projects/{}/regions/{}/addresses/{}",
+                    self.base.compute, importer_project, region, ep_ip_name
+                );
+                let addr_resp: Value = self.client
+                    .get(&get_addr_url)
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .map_err(|e| DriverError::ProvisionFailed(
+                        format!("GET {get_addr_url}: {e}")
+                    ))?
+                    .json()
+                    .await
+                    .map_err(|e| DriverError::Internal(
+                        format!("GET {get_addr_url} decode: {e}")
+                    ))?;
+                let endpoint_ip = addr_resp["address"].as_str()
+                    .ok_or_else(|| DriverError::ProvisionFailed(
+                        "PSC endpoint address GET returned no 'address' field".into()
+                    ))?
+                    .to_string();
+
+                // Step 2 — Create PSC forwarding rule (endpoint) pointing at the
+                //           service attachment in the exporter's project
+                info!(
+                    importer_project, ep_name, service_attachment,
+                    "Creating PSC forwarding rule"
+                );
+                let fr_url = format!(
+                    "{}/compute/v1/projects/{}/regions/{}/forwardingRules",
+                    self.base.compute, importer_project, region
+                );
+                let fr_op = match self.post_json(
+                    &fr_url,
+                    &token,
+                    &json!({
+                        "name":                ep_name,
+                        "loadBalancingScheme": "",
+                        "target":              service_attachment,
+                        "network":             format!(
+                            "projects/{}/global/networks/nclav-vpc",
+                            importer_project
+                        ),
+                        "subnetwork":          format!(
+                            "projects/{}/regions/{}/subnetworks/subnet-0",
+                            importer_project, region
+                        ),
+                        "IPAddress":           endpoint_ip,
+                    }),
+                ).await {
+                    Ok(op) => Some(op),
+                    Err(e) if e.to_string().to_lowercase().contains("already exists") => {
+                        info!(importer_project, ep_name, "PSC forwarding rule already exists");
+                        None
+                    }
+                    Err(e) => return Err(e),
+                };
+                if let Some(op) = fr_op {
+                    if let Some(op_name) = op["name"].as_str() {
+                        let op_url = format!(
+                            "{}/compute/v1/projects/{}/regions/{}/operations/{}",
+                            self.base.compute, importer_project, region, op_name
+                        );
+                        self.wait_for_operation(&op_url).await?;
+                    }
+                }
+
+                // Step 3 — Create DNS A record in the importer's private zone
+                info!(
+                    importer_project, dns_name, endpoint_ip,
+                    "Creating DNS A record for PSC endpoint"
+                );
+                let dns_change_url = format!(
+                    "{}/dns/v1/projects/{}/managedZones/nclav-zone/changes",
+                    self.base.dns, importer_project
+                );
+                match self.post_json(
+                    &dns_change_url,
+                    &token,
+                    &json!({
+                        "additions": [{
+                            "name":    format!("{}.", dns_name),
+                            "type":    "A",
+                            "ttl":     300,
+                            "rrdatas": [endpoint_ip],
+                        }],
+                    }),
+                ).await {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().to_lowercase().contains("already exists") => {
+                        info!(importer_project, dns_name, "DNS A record already exists");
+                    }
+                    Err(e) => return Err(e),
+                }
+
+                // Build outputs: pass through all export outputs, override hostname with DNS name
                 if let Some(obj) = export_handle["outputs"].as_object() {
                     for (k, v) in obj {
                         if let Some(s) = v.as_str() {
@@ -1354,6 +1530,7 @@ impl Driver for GcpDriver {
                         }
                     }
                 }
+                outputs.insert("hostname".into(), dns_name.clone());
 
                 let handle = json!({
                     "driver":           "gcp",
@@ -1361,6 +1538,10 @@ impl Driver for GcpDriver {
                     "type":             "tcp",
                     "importer_project": importer_project,
                     "alias":            import.alias,
+                    "endpoint_ip_name": ep_ip_name,
+                    "endpoint_name":    ep_name,
+                    "endpoint_ip":      endpoint_ip,
+                    "dns_name":         dns_name,
                     "outputs":          outputs,
                 });
                 Ok(ProvisionResult { handle, outputs })
@@ -1636,7 +1817,7 @@ impl Driver for GcpDriver {
 mod tests {
     use super::*;
     use base64::Engine as _;
-    use nclav_domain::{CloudTarget, DnsConfig, EnclaveId, NetworkConfig, PartitionId};
+    use nclav_domain::{CloudTarget, DnsConfig, EnclaveId, ExportTarget, NetworkConfig, PartitionId};
     use wiremock::{
         matchers::{method, path},
         Mock, MockServer, ResponseTemplate,
@@ -2876,5 +3057,294 @@ mod tests {
 
         // Should return the same handle without creating anything new
         assert_eq!(result.handle["project_id"], "test-proj");
+    }
+
+    // ── provision_export: TCP PSC ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn provision_export_tcp_reads_psc_attachment_from_partition_outputs() {
+        // No GCP API calls — the PSC attachment URI comes from partition outputs.
+        let d = driver(&MockServer::start().await);
+        let enc = dummy_enclave();
+        let export = Export {
+            name:             "postgres-tcp".into(),
+            target_partition: PartitionId::new("postgres"),
+            export_type:      ExportType::Tcp,
+            to:               ExportTarget::AnyEnclave,
+            auth:             AuthType::None,
+            hostname:         None,
+            port:             None,
+        };
+        let mut partition_outputs = HashMap::new();
+        partition_outputs.insert("hostname".into(), "10.1.0.5".into());
+        partition_outputs.insert("port".into(), "5432".into());
+        partition_outputs.insert(
+            "psc_service_attachment".into(),
+            "projects/acme-gitea-db/regions/us-central1/serviceAttachments/gitea-psc".into(),
+        );
+
+        let result = d.provision_export(&enc, &export, &partition_outputs, None).await.unwrap();
+
+        assert_eq!(
+            result.handle["service_attachment"],
+            "projects/acme-gitea-db/regions/us-central1/serviceAttachments/gitea-psc",
+        );
+        assert_eq!(result.handle["type"], "tcp");
+        assert_eq!(result.outputs["hostname"], "10.1.0.5");
+        assert_eq!(result.outputs["port"], "5432");
+        assert_eq!(
+            result.outputs["psc_service_attachment"],
+            "projects/acme-gitea-db/regions/us-central1/serviceAttachments/gitea-psc",
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_export_tcp_without_psc_attachment_returns_error() {
+        let d = driver(&MockServer::start().await);
+        let enc = dummy_enclave();
+        let export = Export {
+            name:             "postgres-tcp".into(),
+            target_partition: PartitionId::new("postgres"),
+            export_type:      ExportType::Tcp,
+            to:               ExportTarget::AnyEnclave,
+            auth:             AuthType::None,
+            hostname:         None,
+            port:             None,
+        };
+        let mut partition_outputs = HashMap::new();
+        partition_outputs.insert("hostname".into(), "10.1.0.5".into());
+        partition_outputs.insert("port".into(), "5432".into());
+
+        let err = d.provision_export(&enc, &export, &partition_outputs, None).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("psc_service_attachment"),
+            "expected psc_service_attachment mention, got: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("catalog"),
+            "expected catalog guidance, got: {msg}"
+        );
+    }
+
+    // ── provision_import: TCP PSC ─────────────────────────────────────────────
+
+    fn tcp_import_enclave() -> Enclave {
+        Enclave {
+            id:         EnclaveId::new("importer-proj"),
+            name:       "Importer".into(),
+            cloud:      Some(CloudTarget::Gcp),
+            region:     "us-central1".into(),
+            identity:   None,
+            network:    Some(NetworkConfig { vpc_cidr: None, subnets: vec!["10.2.0.0/20".into()] }),
+            dns:        Some(DnsConfig { zone: Some("gitea-app.local".into()) }),
+            imports:    vec![],
+            exports:    vec![],
+            partitions: vec![],
+        }
+    }
+
+    fn tcp_export_handle() -> Value {
+        json!({
+            "driver":             "gcp",
+            "kind":               "export",
+            "type":               "tcp",
+            "service_attachment": "projects/acme-gitea-db/regions/us-central1/serviceAttachments/gitea-psc",
+            "outputs": {
+                "hostname":    "10.1.0.5",
+                "port":        "5432",
+                "db_name":     "gitea",
+                "db_user":     "gitea",
+                "db_password": "supersecret",
+            },
+        })
+    }
+
+    fn tcp_import() -> Import {
+        Import {
+            from:        EnclaveId::new("exporter-proj"),
+            export_name: "postgres-tcp".into(),
+            alias:       "database".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn provision_import_tcp_creates_endpoint_and_dns() {
+        let server = MockServer::start().await;
+
+        // Step 1a: POST addresses → operation
+        Mock::given(method("POST"))
+            .and(path("/compute/v1/projects/importer-proj/regions/us-central1/addresses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name":   "addr-op",
+                "status": "RUNNING",
+            })))
+            .mount(&server)
+            .await;
+
+        // Step 1b: poll address operation
+        Mock::given(method("GET"))
+            .and(path("/compute/v1/projects/importer-proj/regions/us-central1/operations/addr-op"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "DONE",
+            })))
+            .mount(&server)
+            .await;
+
+        // Step 1c: GET address to read the assigned IP
+        Mock::given(method("GET"))
+            .and(path("/compute/v1/projects/importer-proj/regions/us-central1/addresses/nclav-ep-ip-database"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name":    "nclav-ep-ip-database",
+                "address": "10.2.5.10",
+                "status":  "RESERVED",
+            })))
+            .mount(&server)
+            .await;
+
+        // Step 2a: POST forwardingRules → operation
+        Mock::given(method("POST"))
+            .and(path("/compute/v1/projects/importer-proj/regions/us-central1/forwardingRules"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name":   "fr-op",
+                "status": "RUNNING",
+            })))
+            .mount(&server)
+            .await;
+
+        // Step 2b: poll forwarding rule operation
+        Mock::given(method("GET"))
+            .and(path("/compute/v1/projects/importer-proj/regions/us-central1/operations/fr-op"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "DONE",
+            })))
+            .mount(&server)
+            .await;
+
+        // Step 3: POST DNS change
+        Mock::given(method("POST"))
+            .and(path("/dns/v1/projects/importer-proj/managedZones/nclav-zone/changes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "done",
+            })))
+            .mount(&server)
+            .await;
+
+        let d      = GcpDriver::with_static_token(test_config(), "fake", test_base(&server.uri()));
+        let result = d
+            .provision_import(&tcp_import_enclave(), &tcp_import(), &tcp_export_handle(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.outputs["hostname"], "database.gitea-app.local");
+        assert_eq!(result.outputs["port"],     "5432");
+        assert_eq!(result.outputs["db_name"],  "gitea");
+        assert_eq!(result.handle["endpoint_ip"],  "10.2.5.10");
+        assert_eq!(result.handle["dns_name"],     "database.gitea-app.local");
+        assert_eq!(result.handle["type"],         "tcp");
+    }
+
+    #[tokio::test]
+    async fn provision_import_tcp_idempotent() {
+        let server = MockServer::start().await;
+
+        // Address POST → ALREADY_EXISTS
+        Mock::given(method("POST"))
+            .and(path("/compute/v1/projects/importer-proj/regions/us-central1/addresses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": {
+                    "code":    409,
+                    "status":  "ALREADY_EXISTS",
+                    "message": "The resource 'nclav-ep-ip-database' already exists.",
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        // GET existing address
+        Mock::given(method("GET"))
+            .and(path("/compute/v1/projects/importer-proj/regions/us-central1/addresses/nclav-ep-ip-database"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name":    "nclav-ep-ip-database",
+                "address": "10.2.5.10",
+                "status":  "RESERVED",
+            })))
+            .mount(&server)
+            .await;
+
+        // Forwarding rule POST → ALREADY_EXISTS
+        Mock::given(method("POST"))
+            .and(path("/compute/v1/projects/importer-proj/regions/us-central1/forwardingRules"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": {
+                    "code":    409,
+                    "status":  "ALREADY_EXISTS",
+                    "message": "The resource 'nclav-ep-database' already exists.",
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        // DNS change → ALREADY_EXISTS
+        Mock::given(method("POST"))
+            .and(path("/dns/v1/projects/importer-proj/managedZones/nclav-zone/changes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": {
+                    "code":    409,
+                    "status":  "ALREADY_EXISTS",
+                    "message": "The resource already exists.",
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        let d      = GcpDriver::with_static_token(test_config(), "fake", test_base(&server.uri()));
+        let result = d
+            .provision_import(&tcp_import_enclave(), &tcp_import(), &tcp_export_handle(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.outputs["hostname"],    "database.gitea-app.local");
+        assert_eq!(result.handle["endpoint_ip"],  "10.2.5.10");
+    }
+
+    #[tokio::test]
+    async fn provision_import_tcp_fails_without_dns_zone() {
+        let importer = Enclave {
+            dns: None,
+            ..tcp_import_enclave()
+        };
+        let export_handle = json!({
+            "type":               "tcp",
+            "service_attachment": "projects/foo/regions/us-central1/serviceAttachments/bar",
+            "outputs":            {},
+        });
+
+        let d   = driver(&MockServer::start().await);
+        let err = d.provision_import(&importer, &tcp_import(), &export_handle, None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("dns.zone"), "expected dns.zone mention, got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn provision_import_tcp_fails_without_network() {
+        let importer = Enclave {
+            network: None,
+            ..tcp_import_enclave()
+        };
+        let export_handle = json!({
+            "type":               "tcp",
+            "service_attachment": "projects/foo/regions/us-central1/serviceAttachments/bar",
+            "outputs":            {},
+        });
+
+        let d   = driver(&MockServer::start().await);
+        let err = d.provision_import(&importer, &tcp_import(), &export_handle, None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("network"), "expected network mention, got: {msg}");
     }
 }

@@ -1,0 +1,22 @@
+id: app
+name: Gitea App
+produces: http
+backend: terraform
+
+imports:
+  - from: gitea-db
+    export_name: postgres-tcp
+    alias: database
+
+inputs:
+  project_id: "{{ nclav_project_id }}"
+  region: "{{ nclav_region }}"
+  db_host: "{{ database.hostname }}"
+  db_port: "{{ database.port }}"
+  db_name: "{{ database.db_name }}"
+  db_user: "{{ database.db_user }}"
+  db_password: "{{ database.db_password }}"
+
+declared_outputs:
+  - hostname
+  - port

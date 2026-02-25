@@ -1,5 +1,5 @@
-id: db
-name: Database
+id: postgres
+name: PostgreSQL
 produces: tcp
 backend: terraform
 
@@ -10,4 +10,7 @@ inputs:
 declared_outputs:
   - hostname
   - port
+  - db_name
+  - db_user
+  - db_password
   - psc_service_attachment

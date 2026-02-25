@@ -1,0 +1,17 @@
+id: gitea-app
+name: Gitea
+cloud: gcp
+region: us-central1
+network:
+  vpc_cidr: "10.2.0.0/16"
+  subnets:
+    - "10.2.1.0/24"
+dns:
+  zone: gitea-app.local
+exports:
+  - name: app-http
+    target_partition: app
+    type: http
+    to: any_enclave
+    auth: token
+imports: []

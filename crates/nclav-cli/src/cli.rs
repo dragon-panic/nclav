@@ -121,14 +121,27 @@ pub enum Command {
     /// Runs terraform destroy for IaC partitions, then tears down the enclave
     /// itself. State is removed from the server. Use --all to nuke everything
     /// (handy for resetting a test environment).
+    ///
+    /// Use --partition to destroy a single partition within an enclave instead
+    /// of the whole enclave (e.g. to clean up and recreate a bad Cloud SQL
+    /// instance without deleting the GCP project).
     Destroy {
         /// Enclave IDs to destroy. Required unless --all is given.
         #[arg(required_unless_present = "all")]
         enclave_ids: Vec<String>,
 
-        /// Destroy every enclave known to the server.
+        /// Destroy every enclave known to the server. Skips confirmation prompts.
         #[arg(long)]
         all: bool,
+
+        /// Destroy a single partition within the enclave rather than the whole
+        /// enclave. Requires exactly one enclave ID. Cannot be combined with --all.
+        #[arg(long, conflicts_with = "all")]
+        partition: Option<String>,
+
+        /// Skip the confirmation prompt. Useful for automation and scripts.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
