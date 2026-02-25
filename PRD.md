@@ -138,6 +138,16 @@ imports:
 
 ---
 
+## Topology
+
+nclav defaults to an **isolated topology**: each enclave has a private network with no routes to other enclaves. Cross-enclave communication happens only through explicit, auditable bridges using cloud-native private connectivity mechanisms (GCP Private Service Connect; Azure Private Link and AWS PrivateLink when those drivers land).
+
+This model holds for workloads built on catalog services — managed databases, serverless containers, managed queues, object storage. For workloads that require wire protocols with embedded addressing (Kafka, Cassandra) or high-density N×M cross-enclave routing, a **hub-spoke topology** (shared routing plane with firewall enforcement) is planned as a future nclav mode.
+
+See [ISOLATION.md](ISOLATION.md) for the full service catalog, the topology decision guide, and the isolated vs. hub-spoke tradeoff analysis.
+
+---
+
 ## Partition Interface
 
 A partition declares what it produces, and outputs that other partitions or the enclave boundary can reference.
