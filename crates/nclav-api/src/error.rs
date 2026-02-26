@@ -28,6 +28,9 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if self.status.is_server_error() {
+            tracing::error!(status = %self.status, message = %self.message, "request handler error");
+        }
         let body = Json(json!({ "error": self.message }));
         (self.status, body).into_response()
     }

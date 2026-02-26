@@ -11,9 +11,9 @@ use uuid::Uuid;
 use crate::cli::{CloudArg, GraphOutput};
 use crate::output;
 
-// ── Bootstrap ─────────────────────────────────────────────────────────────────
+// ── Serve ─────────────────────────────────────────────────────────────────────
 
-pub async fn bootstrap(
+pub async fn serve(
     cloud: CloudArg,
     enable_cloud: Vec<CloudArg>,
     remote: Option<String>,
@@ -28,7 +28,7 @@ pub async fn bootstrap(
     bind: String,
 ) -> Result<()> {
     if remote.is_some() {
-        anyhow::bail!("bootstrap does not support --remote; run the server locally");
+        anyhow::bail!("serve does not support --remote; run the server locally");
     }
 
     // When running in a managed environment (e.g. Cloud Run), the token is
@@ -191,13 +191,16 @@ pub async fn diff(
 pub async fn status(remote: Option<String>, token: Option<String>) -> Result<()> {
     let token = resolve_token(token)?;
     let url = server_url(remote);
-    let body: serde_json::Value = authed_client(&token)
-        .get(format!("{}/status", url.trim_end_matches('/')))
-        .send()
-        .await
-        .with_context(|| format!("Failed to reach server at {url}"))?
-        .json()
-        .await?;
+    let body: serde_json::Value = expect_success(
+        authed_client(&token)
+            .get(format!("{}/status", url.trim_end_matches('/')))
+            .send()
+            .await
+            .with_context(|| format!("Failed to reach server at {url}"))?,
+    )
+    .await?
+    .json()
+    .await?;
 
     if let Some(count) = body.get("enclave_count").and_then(|v| v.as_u64()) {
         println!("Enclaves: {}", count);
@@ -233,24 +236,30 @@ pub async fn graph(
             } else {
                 format!("{}/graph", url.trim_end_matches('/'))
             };
-            let body: serde_json::Value = client
-                .get(&path)
-                .send()
-                .await
-                .with_context(|| format!("Failed to reach server at {url}"))?
-                .json()
-                .await?;
+            let body: serde_json::Value = expect_success(
+                client
+                    .get(&path)
+                    .send()
+                    .await
+                    .with_context(|| format!("Failed to reach server at {url}"))?,
+            )
+            .await?
+            .json()
+            .await?;
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
         GraphOutput::Text | GraphOutput::Dot => {
-            let states: Vec<EnclaveState> = client
-                .get(format!("{}/enclaves", url.trim_end_matches('/')))
-                .send()
-                .await
-                .with_context(|| format!("Failed to reach server at {url}"))?
-                .json()
-                .await
-                .context("Failed to deserialize enclave states")?;
+            let states: Vec<EnclaveState> = expect_success(
+                client
+                    .get(format!("{}/enclaves", url.trim_end_matches('/')))
+                    .send()
+                    .await
+                    .with_context(|| format!("Failed to reach server at {url}"))?,
+            )
+            .await?
+            .json()
+            .await
+            .context("Failed to deserialize enclave states")?;
             match output_format {
                 GraphOutput::Text => print!("{}", output::render_graph_text_live(&states, filter)),
                 GraphOutput::Dot => println!("{}", output::render_dot_live(&states, filter)),
@@ -337,14 +346,17 @@ pub async fn destroy(
 
     // ── Enclave destroy ───────────────────────────────────────────────────────
     let ids: Vec<String> = if all {
-        let states: Vec<serde_json::Value> = client
-            .get(format!("{}/enclaves", base))
-            .send()
-            .await
-            .with_context(|| format!("Failed to reach server at {url}"))?
-            .json()
-            .await
-            .context("Failed to parse enclave list")?;
+        let states: Vec<serde_json::Value> = expect_success(
+            client
+                .get(format!("{}/enclaves", base))
+                .send()
+                .await
+                .with_context(|| format!("Failed to reach server at {url}"))?,
+        )
+        .await?
+        .json()
+        .await
+        .context("Failed to parse enclave list")?;
 
         let ids: Vec<String> = states
             .iter()
@@ -426,14 +438,17 @@ pub async fn iac_runs(
         enclave_id,
         partition_id,
     );
-    let runs: serde_json::Value = authed_client(&token)
-        .get(&endpoint)
-        .send()
-        .await
-        .with_context(|| format!("Failed to reach server at {url}"))?
-        .json()
-        .await
-        .context("Failed to parse IaC runs response")?;
+    let runs: serde_json::Value = expect_success(
+        authed_client(&token)
+            .get(&endpoint)
+            .send()
+            .await
+            .with_context(|| format!("Failed to reach server at {url}"))?,
+    )
+    .await?
+    .json()
+    .await
+    .context("Failed to parse IaC runs response")?;
 
     let runs = runs.as_array().cloned().unwrap_or_default();
     if runs.is_empty() {
@@ -548,14 +563,17 @@ pub async fn orphans(
 ) -> Result<()> {
     let token = resolve_token(token)?;
     let url   = server_url(remote);
-    let body: serde_json::Value = authed_client(&token)
-        .get(format!("{}/orphans", url.trim_end_matches('/')))
-        .send()
-        .await
-        .with_context(|| format!("Failed to reach server at {url}"))?
-        .json()
-        .await
-        .context("Failed to parse orphans response")?;
+    let body: serde_json::Value = expect_success(
+        authed_client(&token)
+            .get(format!("{}/orphans", url.trim_end_matches('/')))
+            .send()
+            .await
+            .with_context(|| format!("Failed to reach server at {url}"))?,
+    )
+    .await?
+    .json()
+    .await
+    .context("Failed to parse orphans response")?;
 
     let empty: Vec<serde_json::Value> = Vec::new();
     let orphans = body["orphans"].as_array().unwrap_or(&empty);
@@ -616,7 +634,7 @@ fn resolve_token(explicit: Option<String>) -> Result<String> {
         .with_context(|| {
             format!(
                 "No token provided and could not read token file at {}. \
-                 Use --token, NCLAV_TOKEN, or run `nclav bootstrap` first.",
+                 Use --token, NCLAV_TOKEN, or run `nclav serve` first.",
                 path.display()
             )
         })
@@ -669,6 +687,22 @@ fn authed_client(token: &str) -> reqwest::Client {
         .expect("failed to build HTTP client")
 }
 
+/// Check that a response has a success status code, returning a clear error
+/// if not. Reads the body to extract the server's `"error"` message when present.
+async fn expect_success(resp: reqwest::Response) -> Result<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    // Try to extract a human-readable error from the JSON body.
+    let body = resp.text().await.unwrap_or_default();
+    let msg = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["error"].as_str().map(String::from))
+        .unwrap_or(body);
+    anyhow::bail!("server returned {status}: {msg}");
+}
+
 // ── Other helpers ─────────────────────────────────────────────────────────────
 
 fn server_url(remote: Option<String>) -> String {
@@ -699,14 +733,17 @@ async fn api_reconcile(
         "enclaves_dir": enclaves_dir.display().to_string(),
     });
 
-    let report: serde_json::Value = authed_client(token)
-        .post(&endpoint)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("Failed to reach server at {url}"))?
-        .json()
-        .await?;
+    let report: serde_json::Value = expect_success(
+        authed_client(token)
+            .post(&endpoint)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("Failed to reach server at {url}"))?,
+    )
+    .await?
+    .json()
+    .await?;
 
     if let Some(changes) = report.get("changes").and_then(|c| c.as_array()) {
         for c in changes {

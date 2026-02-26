@@ -174,7 +174,8 @@ impl From<&ProducesType> for ExportType {
 
 /// How a partition's workload is provisioned.
 /// Orthogonal to the enclave's `cloud` field (which controls *where*).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "PascalCase")]
 pub enum PartitionBackend {
     /// Co-located `.tf` files in the partition directory, run via the `terraform` binary.
     Terraform(TerraformConfig),
@@ -189,6 +190,39 @@ impl Default for PartitionBackend {
             source: None,
             dir: std::path::PathBuf::new(),
         })
+    }
+}
+
+// Custom Deserialize that accepts the old `"Managed"` unit-variant string
+// (stored before Managed was removed) and silently promotes it to
+// `Terraform` with default config, so existing state.redb files remain
+// readable across that migration.
+impl<'de> Deserialize<'de> for PartitionBackend {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let v = serde_json::Value::deserialize(d)?;
+        match &v {
+            // Old unit-variant stored as the bare string "Managed".
+            serde_json::Value::String(s) if s == "Managed" => {
+                Ok(PartitionBackend::Terraform(TerraformConfig {
+                    tool: None,
+                    source: None,
+                    dir: std::path::PathBuf::new(),
+                }))
+            }
+            // Current externally-tagged format: {"Terraform": {...}} or {"OpenTofu": {...}}
+            _ => {
+                #[derive(Deserialize)]
+                enum Inner {
+                    Terraform(TerraformConfig),
+                    OpenTofu(TerraformConfig),
+                }
+                match serde_json::from_value::<Inner>(v).map_err(D::Error::custom)? {
+                    Inner::Terraform(c) => Ok(PartitionBackend::Terraform(c)),
+                    Inner::OpenTofu(c) => Ok(PartitionBackend::OpenTofu(c)),
+                }
+            }
+        }
     }
 }
 
@@ -242,7 +276,7 @@ pub struct Partition {
     pub inputs: HashMap<String, String>,
     /// Output keys this partition declares it will produce.
     pub declared_outputs: Vec<String>,
-    /// How this partition's workload is provisioned. Defaults to `Managed`.
+    /// How this partition's workload is provisioned. Defaults to `Terraform`.
     #[serde(default)]
     pub backend: PartitionBackend,
 }
@@ -273,4 +307,29 @@ pub struct Enclave {
     /// Exports this enclave exposes to others.
     pub exports: Vec<Export>,
     pub partitions: Vec<Partition>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partition_backend_deserializes_legacy_managed() {
+        // Old state.redb stored Managed as the bare string "Managed".
+        // It should silently promote to Terraform with default config.
+        let b: PartitionBackend = serde_json::from_str("\"Managed\"").unwrap();
+        assert!(matches!(b, PartitionBackend::Terraform(_)));
+    }
+
+    #[test]
+    fn partition_backend_round_trips_terraform() {
+        let orig = PartitionBackend::Terraform(TerraformConfig {
+            tool: Some("tofu".into()),
+            source: None,
+            dir: std::path::PathBuf::from("/tmp"),
+        });
+        let json = serde_json::to_string(&orig).unwrap();
+        let back: PartitionBackend = serde_json::from_str(&json).unwrap();
+        assert_eq!(orig, back);
+    }
 }
