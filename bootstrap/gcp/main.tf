@@ -146,7 +146,7 @@ resource "google_cloud_run_v2_service" "nclav" {
 
       args = concat(
         [
-          "bootstrap",
+          "serve",
           "--bind", "0.0.0.0",
           "--cloud", "gcp",
           "--store-path", "/mnt/state/state.redb",

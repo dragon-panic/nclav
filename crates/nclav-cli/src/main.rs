@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Bootstrap {
+        Command::Serve {
             cloud,
             enable_cloud,
             ephemeral,
@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
             port,
             bind,
         } => {
-            commands::bootstrap(
+            commands::serve(
                 cloud,
                 enable_cloud,
                 cli.remote,

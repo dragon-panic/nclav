@@ -434,7 +434,7 @@ impl GcpDriver {
 
     /// Provision the nclav server platform in GCP.
     ///
-    /// Called once during `nclav bootstrap --cloud gcp` before the server starts.
+    /// Called once before the server starts (e.g. from `bootstrap/gcp/` Terraform or manually).
     /// Creates a platform project (`{prefix}-nclav`), a `nclav-server` service
     /// account with the IAM roles needed to manage enclave projects, and a SA key.
     ///

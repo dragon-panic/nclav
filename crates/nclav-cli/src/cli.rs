@@ -9,7 +9,7 @@ use std::path::PathBuf;
 )]
 pub struct Cli {
     /// nclav server URL (default: http://localhost:8080).
-    /// All non-bootstrap commands talk to this server. Env: NCLAV_URL
+    /// All non-serve commands talk to this server. Env: NCLAV_URL
     #[arg(long, env = "NCLAV_URL", global = true)]
     pub remote: Option<String>,
 
@@ -23,8 +23,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Initialize and start the nclav server.
-    Bootstrap {
+    /// Start the nclav API server.
+    Serve {
         /// Default cloud for enclaves that omit `cloud:` in their YAML.
         /// The driver for this cloud is automatically registered.
         #[arg(long, default_value = "local")]

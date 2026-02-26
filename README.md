@@ -30,7 +30,7 @@ cargo build --workspace
 
 # Start the HTTP API server — binds 127.0.0.1:8080, persists state to ~/.nclav/state.redb
 # Prints a bearer token and writes it to ~/.nclav/token on first run
-cargo run -p nclav-cli -- bootstrap --cloud local
+cargo run -p nclav-cli -- serve --cloud local
 
 # In another terminal — see what would change (token read automatically from ~/.nclav/token)
 cargo run -p nclav-cli -- diff ./enclaves
@@ -50,37 +50,28 @@ nclav [--remote <url>] [--token <token>] <command>
 
 `bootstrap` starts the API server. All other commands send HTTP requests to it — defaulting to `http://localhost:8080`. Pass `--remote <url>` (or set `NCLAV_URL`) to target a remote server. The token is read from `~/.nclav/token` automatically; override with `--token` or `NCLAV_TOKEN`.
 
-### `nclav bootstrap`
+### `nclav serve`
 
-Bootstrap provisions the nclav **platform** — the API server and its state store. It is a one-time, idempotent operation. After bootstrap completes, the API runs continuously and all other CLI commands talk to it via HTTP.
-
-The platform location (set by `--cloud`) and each enclave's target cloud (`cloud:` in YAML) are **independent**. An API running locally can provision enclaves into GCP. See [BOOTSTRAP.md](docs/prd/BOOTSTRAP.md) for full design rationale.
-
-#### Local bootstrap
+Start the nclav API server. All other commands send HTTP requests to it.
 
 ```bash
-# Ephemeral — in-memory state, lost on restart (CI / quick tests)
-nclav bootstrap --cloud local --ephemeral
+# Persistent state (default) — redb at ~/.nclav/state.redb
+nclav serve --cloud local
 
-# Persistent — redb at ~/.nclav/state.redb (default; single-operator dev)
-nclav bootstrap --cloud local
+# Ephemeral — in-memory, lost on restart (CI / quick tests)
+nclav serve --cloud local --ephemeral
 
-# Local default + GCP also registered for mixed enclave environments
-nclav bootstrap --cloud local \
-  --enable-cloud gcp \
-  --gcp-parent folders/123 \
-  --gcp-billing-account billingAccounts/XXX-YYYY-ZZZZ
+# GCP as default cloud for enclaves
+nclav serve --cloud gcp \
+  --gcp-parent folders/123456789 \
+  --gcp-billing-account billingAccounts/XXXX-YYYY-ZZZZ
 ```
 
 Every driver must be explicitly requested — `--cloud` registers the default driver, `--enable-cloud` adds more. Binds `http://127.0.0.1:8080` by default; use `--bind 0.0.0.0` / `NCLAV_BIND` to expose on all interfaces, `--port` / `NCLAV_PORT` to change the port.
 
 On first run a 64-character bearer token is generated and written to `~/.nclav/token` (mode 0600). Subsequent restarts reuse the same token — clients stay connected. Pass `--rotate-token` to force a new token (invalidates existing clients).
 
-#### GCP bootstrap
-
-Initialises the GCP driver (via Application Default Credentials) and starts the API server locally with GCP as the default cloud. Enclave provisioning targets real GCP projects; the API process itself still runs on your machine.
-
-**Flags / env vars:**
+**GCP flags / env vars:**
 
 | Flag | Env var | Required | Description |
 |---|---|:---:|---|
@@ -89,14 +80,6 @@ Initialises the GCP driver (via Application Default Credentials) and starts the 
 | `--gcp-project-prefix` | `NCLAV_GCP_PROJECT_PREFIX` | no | Prefix for GCP project IDs: `acme` → `acme-product-a-dev` |
 | `--gcp-default-region` | `NCLAV_GCP_DEFAULT_REGION` | no | Default region for enclave projects (default: `us-central1`) |
 
-```bash
-export NCLAV_GCP_PARENT="folders/123456789"
-export NCLAV_GCP_BILLING_ACCOUNT="billingAccounts/ABCD-1234-EFGH-5678"
-export NCLAV_GCP_PROJECT_PREFIX="acme"
-
-nclav bootstrap --cloud gcp
-```
-
 GCP credentials must include the `cloud-billing` scope:
 
 ```bash
@@ -104,9 +87,9 @@ gcloud auth application-default login \
   --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/cloud-billing
 ```
 
-GCP partitions are provisioned via Terraform. nclav creates a per-partition service account (`partition-{id}@{project}.iam.gserviceaccount.com`) with `roles/editor`, then runs Terraform under that identity.
-
-See [GCP.md](docs/prd/GCP.md) for full GCP driver and bootstrap reference.
+**Hosted deployment:** To run nclav on Cloud Run instead of a local process, use
+the `bootstrap/gcp/` Terraform module. See [BOOTSTRAP.md](docs/prd/BOOTSTRAP.md)
+and [bootstrap/gcp/README.md](bootstrap/gcp/README.md).
 
 ### `nclav diff <enclaves-dir>`
 
@@ -192,7 +175,7 @@ nclav iac logs product-a-dev db 3f6d9e1a-c4b2-4d91-a8f0-123456789abc
 
 ## HTTP API
 
-Start the server with `nclav bootstrap`, then use the token from `~/.nclav/token`. All endpoints require `Authorization: Bearer <token>`.
+Start the server with `nclav serve`, then use the token from `~/.nclav/token`. All endpoints require `Authorization: Bearer <token>`.
 
 | Method | Path | Description |
 |---|---|---|

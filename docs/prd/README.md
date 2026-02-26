@@ -516,21 +516,22 @@ Bootstrap provisions the nclav **platform** — the API server and its state
 store — so the system runs persistently without a local process. It is a
 one-time, idempotent operation distinct from enclave provisioning.
 
-The platform location (`bootstrap --cloud`) and each enclave's target cloud
-(`cloud:` in YAML) are independent. An API running on GCP can provision
-enclaves into GCP, local, or Azure simultaneously. Enclaves omitting `cloud:`
-inherit the API's configured default.
+The platform location and each enclave's target cloud (`cloud:` in YAML) are
+independent. An API running on GCP can provision enclaves into GCP, local, or
+Azure simultaneously. Enclaves omitting `cloud:` inherit the API's configured
+default.
 
-See [BOOTSTRAP.md](BOOTSTRAP.md) for full design rationale, local/GCP
-bootstrap specs, per-enclave cloud targeting, the DriverRegistry and SecretStore
-architecture, and all design decisions.
+Local dev: `nclav serve --cloud local` starts the API as a local process.
+Hosted: the `bootstrap/gcp/` Terraform module deploys nclav to Cloud Run.
+
+See [BOOTSTRAP.md](BOOTSTRAP.md) for the full bootstrap reference.
 
 ---
 
 ## CLI
 
 ```bash
-nclav bootstrap              # One-time platform setup
+nclav serve                  # Start the API server (local dev)
 nclav apply ./enclaves       # Reconcile against actual state
 nclav diff ./enclaves        # Show what apply would change
 nclav status                 # Enclave health and drift summary

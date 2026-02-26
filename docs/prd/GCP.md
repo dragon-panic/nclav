@@ -648,7 +648,7 @@ gcloud auth application-default login \
 ## `provision_platform` — SA key provisioning
 
 `GcpDriver::provision_platform()` bootstraps a dedicated `nclav-server` service account for
-production use. It is **not called automatically** by `nclav bootstrap`; call it once when an
+production use. It is **not called automatically** by `nclav serve`; call it once when an
 operator with Org/Folder Admin rights sets up a new environment:
 
 **What it does:**
@@ -660,80 +660,30 @@ operator with Org/Folder Admin rights sets up a new environment:
 6. Creates and returns a SA key (base64-decoded JSON)
 
 The caller writes the key JSON to `~/.nclav/gcp-credentials.json` (mode 0600). On the next
-`nclav bootstrap --cloud gcp` the key file is detected and the driver switches to SA key mode.
+`nclav serve --cloud gcp` the key file is detected and the driver switches to SA key mode.
 
 ---
 
-## GCP bootstrap (platform provisioning)
+## GCP platform bootstrap (`bootstrap/gcp/`)
 
-`nclav bootstrap --cloud gcp` provisions a dedicated **platform GCP project**
-that hosts the nclav API and its state store. This is separate from the enclave
-projects the driver creates during `nclav apply`.
+The `bootstrap/gcp/` Terraform module deploys the nclav API server to Cloud Run
+as a persistent, hosted platform. This is a one-time operator step separate from
+the enclave provisioning that nclav performs afterwards.
 
 ### What the platform project contains
 
 | Resource | Name | Purpose |
 |---|---|---|
-| GCP Project | `{prefix}-nclav` | Billing and IAM boundary for the platform |
-| Cloud Run service | `nclav-api` | The nclav HTTP API |
-| Cloud SQL Postgres | `nclav-state` | Persistent state store (enclave handles, outputs, audit log) |
-| Service Account | `nclav-runner@{platform-project}.iam.gserviceaccount.com` | Identity the API uses to provision enclave projects |
-| Secret Manager secret | `nclav-api-token` | Bearer token read by Cloud Run at startup; never in env vars |
+| Service Account | `nclav-server@{project}.iam.gserviceaccount.com` | Identity for the Cloud Run service |
+| GCS Bucket | `{project}-nclav-state` | Persistent storage for the redb state file (GCS volume mount) |
+| Secret Manager secret | `nclav-api-token` | Bearer token for CLI authentication |
+| Cloud Run service | `nclav-api` | The nclav API server (runs `nclav serve --bind 0.0.0.0 --cloud gcp …`) |
 
-The platform project is created using the same `--gcp-parent` and
-`--gcp-billing-account` as enclave projects. Override the parent with
-`--gcp-platform-parent` if you need the platform in a separate folder.
+See [bootstrap/gcp/README.md](../../bootstrap/gcp/README.md) for the full
+operator walkthrough. See [BOOTSTRAP.md](BOOTSTRAP.md) for the conceptual
+overview of platform bootstrap vs. enclave provisioning.
 
-### Platform project naming
-
-| Config | Platform project ID |
-|---|---|
-| `--gcp-project-prefix acme` | `acme-nclav` |
-| `--gcp-platform-project my-nclav` | `my-nclav` (explicit override) |
-| No prefix | `nclav` (globally unique; only safe in a dedicated org) |
-
-Enclave projects are named `{prefix}-{enclave-id}` (e.g. `acme-product-a-dev`).
-Platform and enclave projects follow the same naming convention but the
-platform always has the suffix `-nclav`.
-
-### Platform bootstrap sequence
-
-1. **Create platform project** under `--gcp-parent`
-2. **Link billing account**
-3. **Enable APIs**: `run.googleapis.com`, `sqladmin.googleapis.com`, `iam.googleapis.com`,
-   `cloudresourcemanager.googleapis.com`, `secretmanager.googleapis.com`
-4. **Create platform service account** `nclav-runner` with required IAM roles (see below)
-5. **Generate API token** (or reuse from `--rotate-token` flag)
-6. **Write token to Secret Manager**
-   ```
-   POST https://secretmanager.googleapis.com/v1/projects/{platform-project}/secrets
-   { "replication": { "automatic": {} } }
-   ```
-   then add the first version:
-   ```
-   POST .../secrets/nclav-api-token:addVersion
-   { "payload": { "data": "<base64(token)>" } }
-   ```
-   then grant `nclav-runner` accessor on that secret:
-   ```
-   POST .../secrets/nclav-api-token:setIamPolicy
-   { "policy": { "bindings": [{
-     "role": "roles/secretmanager.secretAccessor",
-     "members": ["serviceAccount:nclav-runner@{platform-project}.iam.gserviceaccount.com"]
-   }]}}
-   ```
-7. **Provision Cloud SQL Postgres** `nclav-state` (private IP, same VPC as the platform project)
-8. **Deploy Cloud Run service** `nclav-api` using the `nclav-runner` SA, injecting the Cloud SQL
-   connection string. The binary reads the token from Secret Manager at startup — the token is
-   **not** passed as an environment variable.
-9. **Print API endpoint** — operator sets `NCLAV_URL` to this value; prints token for
-   `~/.nclav/token` so CLI commands work immediately
-
-Bootstrap is idempotent: each step checks for the resource before creating it. For the
-token specifically: if `nclav-api-token` already exists in Secret Manager and `--rotate-token`
-was not passed, the existing value is preserved.
-
-### Required IAM roles for `nclav-runner` SA
+### Required IAM roles for `nclav-server` SA
 
 These must be granted at the **organization or folder level** (the `--gcp-parent`
 folder) so the API can create and manage enclave projects beneath it:
@@ -748,20 +698,20 @@ folder) so the API can create and manage enclave projects beneath it:
 | `roles/pubsub.admin` | Create Pub/Sub topics in enclave projects |
 | `roles/dns.admin` | Create Cloud DNS zones in enclave projects |
 
-The bootstrap operator (who runs `nclav bootstrap`) needs these same roles
-locally to set up the platform. After bootstrap, the `nclav-runner` SA handles
-all subsequent GCP calls.
+The bootstrap operator (who runs `terraform apply` in `bootstrap/gcp/`) needs
+the same roles locally (via ADC) to provision the platform. After the Cloud Run
+service is deployed, the `nclav-server` SA handles all subsequent GCP calls.
 
 ### Authentication during bootstrap vs. runtime
 
 | Phase | Who authenticates | How |
 |---|---|---|
-| `nclav bootstrap --cloud gcp` | Operator (local) | ADC: `gcloud auth application-default login` or SA key |
-| `nclav apply` / `nclav diff` (post-bootstrap) | `nclav-runner` SA | Cloud Run workload identity / attached SA |
+| `terraform apply` in `bootstrap/gcp/` | Operator (local) | ADC: `gcloud auth application-default login` |
+| `nclav apply` / `nclav diff` (post-bootstrap) | `nclav-server` SA | Cloud Run attached service account |
 
-Bootstrap is always a **local CLI operation** — it never runs on Cloud Run.
-After the Cloud Run service is deployed, the API's SA takes over and the
-operator's credentials are no longer needed for routine use.
+The Terraform bootstrap always runs locally. After the Cloud Run service is
+deployed, the API's SA takes over and the operator's credentials are no longer
+needed for routine use.
 
 ### Cloud SQL details
 
