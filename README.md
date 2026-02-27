@@ -45,16 +45,17 @@ cargo run -p nclav-cli -- graph --output text
 ## Hosted deployment (GCP)
 
 For a persistent, cloud-hosted nclav API run the Terraform bootstrap in
-`bootstrap/gcp/`. This provisions a Cloud Run service backed by a GCS volume
-for state — no local process required after setup.
+`bootstrap/gcp/`. This provisions a Cloud Run service backed by Cloud SQL — no
+local process required after setup.
 
 **What it creates:**
 
 | Resource | Name | Purpose |
 |---|---|---|
 | Service Account | `nclav-server@{project}.iam.gserviceaccount.com` | Identity for the Cloud Run service |
-| GCS Bucket | `{project}-nclav-state` | Persistent storage for the redb state file (GCS volume mount) |
+| Cloud SQL (Postgres 16) | `nclav-state` | Persistent state store |
 | Secret Manager secret | `nclav-api-token` | Bearer token for CLI authentication |
+| Secret Manager secret | `nclav-db-url` | Postgres connection URL for the Cloud Run service |
 | Cloud Run service | `nclav-api` | The nclav API server |
 
 ### Prerequisites
@@ -62,32 +63,38 @@ for state — no local process required after setup.
 - A GCP project for the nclav platform (not an enclave project — a dedicated ops project)
 - A GCP folder or organization under which enclave projects will be created
 - A billing account for enclave projects
-- Docker and `make` installed locally
 - Terraform or OpenTofu installed locally
 - ADC with billing scope:
   ```bash
   gcloud auth application-default login \
     --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/cloud-billing
   ```
+- A container image for the nclav server — either use a pre-built image or build your own (see below)
 
-### Step 1 — Build and push the container image
+### Step 1 — Get a container image
+
+**Option A — Use a pre-built image (recommended for most users)**
+
+Set `nclav_image` in your `terraform.tfvars` to a published image URI and skip ahead to Step 2. No Docker or GitHub account required.
+
+**Option B — Build and publish your own image**
+
+This is only needed if you want to run a custom or private build. It requires Docker, `make`, and a GitHub account.
 
 ```bash
-# Authenticate to GHCR (needs a PAT with write:packages scope)
+# Create a GitHub PAT: Settings → Developer Settings → Personal access tokens
+# → Tokens (classic) → write:packages scope. Your GITHUB_ORG is your GitHub
+# username or org slug (the part after github.com/).
 export GITHUB_ORG=your-github-org-or-username
 export GITHUB_TOKEN=ghp_...
 make login-ghcr
 
 # Build for linux/amd64 (Cloud Run target) and push
 make push TAG=latest
+# Image is published to ghcr.io/$GITHUB_ORG/nclav:latest
 ```
 
-The image is published to `ghcr.io/$GITHUB_ORG/nclav:latest`. It bundles the
-`nclav` binary, Terraform, and OpenTofu. To override IaC tool versions:
-
-```bash
-make push TERRAFORM_VERSION=1.10.0 TOFU_VERSION=1.9.0
-```
+To override bundled IaC tool versions: `make push TERRAFORM_VERSION=1.10.0 TOFU_VERSION=1.9.0`
 
 ### Step 2 — Deploy with Terraform
 

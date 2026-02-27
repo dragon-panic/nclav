@@ -1,5 +1,5 @@
 # ── Stage 1: Build nclav ─────────────────────────────────────────────────────
-FROM rust:1.80-bookworm AS builder
+FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release --locked -p nclav-cli

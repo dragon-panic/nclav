@@ -11,6 +11,10 @@ members = [
 ]
 resolver = "2"
 
+[profile.release]
+strip = true   # strip debug symbols — cuts binary size ~60-70%
+opt-level = 3  # default, explicit for clarity
+
 [workspace.dependencies]
 tokio          = { version = "1", features = ["full"] }
 serde          = { version = "1", features = ["derive"] }
