@@ -48,8 +48,8 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Apply { enclaves_dir } => {
-            commands::apply(enclaves_dir, cli.remote, cli.token).await
+        Command::Apply { enclaves_dir, resources_only } => {
+            commands::apply(enclaves_dir, resources_only, cli.remote, cli.token).await
         }
         Command::Diff { enclaves_dir } => {
             commands::diff(enclaves_dir, cli.remote, cli.token).await
@@ -61,8 +61,8 @@ async fn main() -> Result<()> {
         Command::Orphans { enclave } => {
             commands::orphans(enclave, cli.remote, cli.token).await
         }
-        Command::Destroy { enclave_ids, all, partition, yes } => {
-            commands::destroy(enclave_ids, all, partition, yes, cli.remote, cli.token).await
+        Command::Destroy { enclave_ids, all, partition, yes, resources_only } => {
+            commands::destroy(enclave_ids, all, partition, yes, resources_only, cli.remote, cli.token).await
         }
         Command::Iac { command } => match command {
             IacCommand::Runs { enclave_id, partition_id } => {

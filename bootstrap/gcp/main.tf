@@ -92,9 +92,10 @@ resource "google_sql_database_instance" "nclav" {
     }
 
     ip_configuration {
-      ipv4_enabled = false
-      # Cloud Run connects via Cloud SQL Auth Proxy (Unix socket) —
-      # no public IP or VPC peering required.
+      # Cloud SQL Auth Proxy requires the instance to have a reachable IP.
+      # Public IP is fine — the proxy authenticates via IAM and encrypts
+      # the tunnel; postgres is never directly accessible from the internet.
+      ipv4_enabled = true
     }
 
     deletion_protection_enabled = false

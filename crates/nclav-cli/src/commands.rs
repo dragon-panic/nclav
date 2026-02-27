@@ -176,11 +176,12 @@ fn cloud_arg_to_target(arg: &CloudArg) -> CloudTarget {
 
 pub async fn apply(
     enclaves_dir: PathBuf,
+    resources_only: bool,
     remote: Option<String>,
     token: Option<String>,
 ) -> Result<()> {
     let token = resolve_token(token)?;
-    api_reconcile(&server_url(remote), &enclaves_dir, false, &token).await
+    api_reconcile(&server_url(remote), &enclaves_dir, false, resources_only, &token).await
 }
 
 // ── Diff ──────────────────────────────────────────────────────────────────────
@@ -191,7 +192,7 @@ pub async fn diff(
     token: Option<String>,
 ) -> Result<()> {
     let token = resolve_token(token)?;
-    api_reconcile(&server_url(remote), &enclaves_dir, true, &token).await
+    api_reconcile(&server_url(remote), &enclaves_dir, true, false, &token).await
 }
 
 // ── Status ────────────────────────────────────────────────────────────────────
@@ -302,6 +303,7 @@ pub async fn destroy(
     all: bool,
     partition: Option<String>,
     yes: bool,
+    resources_only: bool,
     remote: Option<String>,
     token: Option<String>,
 ) -> Result<()> {
@@ -388,7 +390,11 @@ pub async fn destroy(
     let mut any_error = false;
     for id in &ids {
         if !yes && !all {
-            println!("This will destroy enclave '{}' and delete its GCP project (30-day hold).", id);
+            if resources_only {
+                println!("This will destroy resources inside enclave '{}' but keep its cloud project.", id);
+            } else {
+                println!("This will destroy enclave '{}' and delete its cloud project (30-day hold for GCP).", id);
+            }
             if let Err(e) = confirm_destructive(id, id) {
                 println!("{}", e);
                 any_error = true;
@@ -397,8 +403,12 @@ pub async fn destroy(
         }
 
         print!("Destroying {}… ", id);
+        let mut url_with_query = format!("{}/enclaves/{}", base, id);
+        if resources_only {
+            url_with_query.push_str("?resources_only=true");
+        }
         let resp = client
-            .delete(format!("{}/enclaves/{}", base, id))
+            .delete(&url_with_query)
             .send()
             .await
             .with_context(|| format!("Failed to reach server at {url}"))?;
@@ -729,6 +739,7 @@ async fn api_reconcile(
     url: &str,
     enclaves_dir: &PathBuf,
     dry_run: bool,
+    resources_only: bool,
     token: &str,
 ) -> Result<()> {
     let endpoint = if dry_run {
@@ -739,6 +750,7 @@ async fn api_reconcile(
 
     let body = serde_json::json!({
         "enclaves_dir": enclaves_dir.display().to_string(),
+        "resources_only": resources_only,
     });
 
     let report: serde_json::Value = expect_success(

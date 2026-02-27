@@ -96,6 +96,11 @@ pub enum Command {
     Apply {
         /// Path to the enclaves directory.
         enclaves_dir: PathBuf,
+
+        /// Tear down resources inside cloud projects but do not delete the projects
+        /// themselves. Useful for stopping costs without losing project config.
+        #[arg(long)]
+        resources_only: bool,
     },
 
     /// Show what would change without applying.
@@ -161,6 +166,11 @@ pub enum Command {
         /// Skip the confirmation prompt. Useful for automation and scripts.
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// Tear down resources inside cloud projects but do not delete the projects
+        /// themselves. Useful for stopping costs without losing project config.
+        #[arg(long)]
+        resources_only: bool,
     },
 }
 

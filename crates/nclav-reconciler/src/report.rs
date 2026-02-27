@@ -20,6 +20,12 @@ pub struct ReconcileRequest {
     /// Use in tests to avoid requiring a terraform binary.
     #[serde(default)]
     pub test_mode: bool,
+    /// When true, skip deleting the cloud provider project during enclave teardown.
+    /// IaC resources and partition SAs are still destroyed; only the project deletion
+    /// step is skipped. Useful when you want to stop paying for running resources
+    /// but keep the GCP project (and its config, quotas, etc.) intact.
+    #[serde(default)]
+    pub resources_only: bool,
 }
 
 fn default_api_base() -> String {
@@ -34,6 +40,7 @@ impl Default for ReconcileRequest {
             api_base: default_api_base(),
             auth_token: Arc::new(String::new()),
             test_mode: false,
+            resources_only: false,
         }
     }
 }

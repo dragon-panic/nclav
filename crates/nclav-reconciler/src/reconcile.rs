@@ -204,7 +204,11 @@ pub async fn reconcile(
                         }
                     }
 
-                    driver.teardown_enclave(&existing.desired, handle).await?;
+                    if req.resources_only {
+                        info!(enclave_id = %id, "resources_only: skipping project deletion");
+                    } else {
+                        driver.teardown_enclave(&existing.desired, handle).await?;
+                    }
                 }
             }
             store.delete_enclave(id).await?;

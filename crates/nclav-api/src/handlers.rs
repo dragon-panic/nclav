@@ -33,6 +33,8 @@ pub async fn ready(State(state): State<AppState>) -> Result<StatusCode, ApiError
 #[derive(Debug, Deserialize)]
 pub struct ReconcileBody {
     pub enclaves_dir: String,
+    #[serde(default)]
+    pub resources_only: bool,
 }
 
 pub async fn post_reconcile(
@@ -45,6 +47,7 @@ pub async fn post_reconcile(
         api_base: (*state.api_base).clone(),
         auth_token: state.auth_token.clone(),
         test_mode: false,
+        resources_only: body.resources_only,
     };
     let report = reconcile(req, state.store, state.registry).await?;
     Ok(Json(json!(report)))
@@ -60,6 +63,7 @@ pub async fn post_reconcile_dry_run(
         api_base: (*state.api_base).clone(),
         auth_token: state.auth_token.clone(),
         test_mode: false,
+        resources_only: body.resources_only,
     };
     let report = reconcile(req, state.store, state.registry).await?;
     Ok(Json(json!(report)))
@@ -85,9 +89,16 @@ pub async fn get_enclave(
     Ok(Json(json!(enclave)))
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct DeleteEnclaveQuery {
+    #[serde(default)]
+    pub resources_only: bool,
+}
+
 pub async fn delete_enclave(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<DeleteEnclaveQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let eid = EnclaveId::new(&id);
     let existing = state
@@ -138,8 +149,10 @@ pub async fn delete_enclave(
             }
         }
 
-        // Teardown the enclave itself
-        if let Err(e) = driver.teardown_enclave(&existing.desired, enc_handle).await {
+        // Teardown the enclave itself (skip project deletion if resources_only)
+        if query.resources_only {
+            warn!(enclave_id = %id, "resources_only: skipping project deletion");
+        } else if let Err(e) = driver.teardown_enclave(&existing.desired, enc_handle).await {
             warn!(enclave_id = %id, error = %e, "enclave teardown failed");
             errors.push(format!("enclave teardown {}: {}", id, e));
         }

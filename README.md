@@ -60,9 +60,14 @@ local process required after setup.
 
 ### Prerequisites
 
-- A GCP project for the nclav platform (not an enclave project — a dedicated ops project)
 - A GCP folder or organization under which enclave projects will be created
 - A billing account for enclave projects
+- A GCP project for the nclav platform (not an enclave project — a dedicated ops project).
+  Create one if you don't have it yet:
+  ```bash
+  gcloud projects create myorg-nclav --organization=ORGANIZATION_ID
+  gcloud billing projects link myorg-nclav --billing-account=XXXXXX-YYYYYY-ZZZZZZ
+  ```
 - Terraform or OpenTofu installed locally
 - ADC with billing scope:
   ```bash
