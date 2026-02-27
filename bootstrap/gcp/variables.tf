@@ -29,3 +29,9 @@ variable "gcp_project_prefix" {
   type        = string
   default     = ""
 }
+
+variable "cloud_sql_tier" {
+  description = "Cloud SQL machine tier for the nclav state database."
+  type        = string
+  default     = "db-f1-micro"
+}

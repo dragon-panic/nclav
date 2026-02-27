@@ -18,6 +18,11 @@ output "service_account" {
   value       = google_service_account.nclav.email
 }
 
+output "db_instance" {
+  description = "Cloud SQL instance connection name (project:region:instance)."
+  value       = google_sql_database_instance.nclav.connection_name
+}
+
 output "iam_setup_commands" {
   description = "Send these gcloud commands to your GCP folder/org admin. They grant nclav-server the roles it needs to create and manage enclave projects. Run once after terraform apply."
   value       = <<-EOT

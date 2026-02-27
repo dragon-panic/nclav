@@ -5,9 +5,9 @@
 #
 # What it creates:
 #   - Service account: nclav-server@ (used by the Cloud Run service)
-#   - GCS bucket: {project_id}-nclav-state (GCS volume mount for redb state)
-#   - Secret Manager secret: nclav-api-token (random 32-byte hex bearer token)
-#   - Cloud Run service: nclav-api (gen2, GCS volume at /mnt/state/)
+#   - Cloud SQL (Postgres 16): nclav state store (no GCS mmap issues)
+#   - Secret Manager: nclav-api-token, nclav-db-url
+#   - Cloud Run service: nclav-api (gen2, connects to Cloud SQL via socket)
 #
 # Prerequisites: see README.md.
 
@@ -35,9 +35,10 @@ resource "google_project_service" "apis" {
   for_each = toset([
     "run.googleapis.com",
     "secretmanager.googleapis.com",
-    "storage.googleapis.com",
     "iam.googleapis.com",
     "cloudresourcemanager.googleapis.com",
+    "sqladmin.googleapis.com",
+    "servicenetworking.googleapis.com",
   ])
   service            = each.key
   disable_on_destroy = false
@@ -51,39 +52,67 @@ resource "google_service_account" "nclav" {
   depends_on   = [google_project_service.apis]
 }
 
-# nclav needs project-level permissions to create enclave projects,
-# manage IAM, enable APIs, and access Cloud Asset Inventory.
+# Editor on the platform project (Secret Manager, Cloud SQL, etc.)
 resource "google_project_iam_member" "nclav_editor" {
   project = var.project_id
   role    = "roles/editor"
   member  = "serviceAccount:${google_service_account.nclav.email}"
 }
 
+# Cloud SQL client — allows the Cloud Run service to connect via socket
+resource "google_project_iam_member" "nclav_cloudsql_client" {
+  project = var.project_id
+  role    = "roles/cloudsql.client"
+  member  = "serviceAccount:${google_service_account.nclav.email}"
+}
 
 # roles/resourcemanager.projectCreator and roles/billing.user must be granted
 # at the folder/org and billing-account level respectively — not the platform
 # project.  Run `terraform output iam_setup_commands` after apply and send the
 # printed gcloud commands to your GCP admin.
 
-# ── GCS bucket for redb state ─────────────────────────────────────────────────
+# ── Cloud SQL (Postgres 16) ───────────────────────────────────────────────────
 
-resource "google_storage_bucket" "state" {
-  name                        = "${var.project_id}-nclav-state"
-  location                    = var.region
-  uniform_bucket_level_access = true
-  force_destroy               = false
-
-  versioning {
-    enabled = true
-  }
-
-  depends_on = [google_project_service.apis]
+resource "random_password" "db_password" {
+  length  = 32
+  special = false
 }
 
-resource "google_storage_bucket_iam_member" "nclav_state_rw" {
-  bucket = google_storage_bucket.state.name
-  role   = "roles/storage.objectAdmin"
-  member = "serviceAccount:${google_service_account.nclav.email}"
+resource "google_sql_database_instance" "nclav" {
+  name             = "nclav-state"
+  database_version = "POSTGRES_16"
+  region           = var.region
+
+  settings {
+    tier              = var.cloud_sql_tier
+    availability_type = "ZONAL"
+
+    backup_configuration {
+      enabled = true
+    }
+
+    ip_configuration {
+      ipv4_enabled = false
+      # Cloud Run connects via Cloud SQL Auth Proxy (Unix socket) —
+      # no public IP or VPC peering required.
+    }
+
+    deletion_protection_enabled = false
+  }
+
+  deletion_protection = false
+  depends_on          = [google_project_service.apis]
+}
+
+resource "google_sql_database" "nclav" {
+  name     = "nclav"
+  instance = google_sql_database_instance.nclav.name
+}
+
+resource "google_sql_user" "nclav" {
+  name     = "nclav"
+  instance = google_sql_database_instance.nclav.name
+  password = random_password.db_password.result
 }
 
 # ── API token (Secret Manager) ────────────────────────────────────────────────
@@ -113,9 +142,10 @@ resource "google_secret_manager_secret_iam_member" "nclav_token_access" {
   member    = "serviceAccount:${google_service_account.nclav.email}"
 }
 
-# ── Cloud Run service ─────────────────────────────────────────────────────────
+# ── Database URL secret ───────────────────────────────────────────────────────
 
 locals {
+  db_url          = "postgres://nclav:${random_password.db_password.result}@/nclav?host=/cloudsql/${google_sql_database_instance.nclav.connection_name}"
   gcp_prefix_flag = var.gcp_project_prefix != "" ? ["--gcp-project-prefix", var.gcp_project_prefix] : []
 
   # Detect whether gcp_parent is a folder or an organization so we can emit
@@ -124,6 +154,29 @@ locals {
   _gcloud_parent_bind = local._parent_is_folder ? "gcloud resource-manager folders add-iam-policy-binding ${trimprefix(var.gcp_parent, "folders/")}" : "gcloud organizations add-iam-policy-binding ${trimprefix(var.gcp_parent, "organizations/")}"
 }
 
+resource "google_secret_manager_secret" "db_url" {
+  secret_id = "nclav-db-url"
+
+  replication {
+    auto {}
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "db_url" {
+  secret      = google_secret_manager_secret.db_url.id
+  secret_data = local.db_url
+}
+
+resource "google_secret_manager_secret_iam_member" "nclav_db_url_access" {
+  secret_id = google_secret_manager_secret.db_url.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.nclav.email}"
+}
+
+# ── Cloud Run service ─────────────────────────────────────────────────────────
+
 resource "google_cloud_run_v2_service" "nclav" {
   name     = "nclav-api"
   location = var.region
@@ -131,12 +184,11 @@ resource "google_cloud_run_v2_service" "nclav" {
   template {
     service_account = google_service_account.nclav.email
 
-    # Mount the GCS bucket at /mnt/state/ for the redb state file.
+    # Mount the Cloud SQL socket so nclav can connect via Unix socket.
     volumes {
-      name = "state"
-      gcs {
-        bucket    = google_storage_bucket.state.name
-        read_only = false
+      name = "cloudsql"
+      cloud_sql_instance {
+        instances = [google_sql_database_instance.nclav.connection_name]
       }
     }
 
@@ -148,7 +200,6 @@ resource "google_cloud_run_v2_service" "nclav" {
           "serve",
           "--bind", "0.0.0.0",
           "--cloud", "gcp",
-          "--store-path", "/mnt/state/state.redb",
           "--gcp-parent", var.gcp_parent,
           "--gcp-billing-account", var.billing_account,
         ],
@@ -165,9 +216,19 @@ resource "google_cloud_run_v2_service" "nclav" {
         }
       }
 
+      env {
+        name = "NCLAV_POSTGRES_URL"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.db_url.secret_id
+            version = "latest"
+          }
+        }
+      }
+
       volume_mounts {
-        name       = "state"
-        mount_path = "/mnt/state"
+        name       = "cloudsql"
+        mount_path = "/cloudsql"
       }
 
       ports {
@@ -191,8 +252,11 @@ resource "google_cloud_run_v2_service" "nclav" {
 
   depends_on = [
     google_project_service.apis,
-    google_storage_bucket_iam_member.nclav_state_rw,
+    google_sql_database_instance.nclav,
+    google_sql_database.nclav,
+    google_sql_user.nclav,
     google_secret_manager_secret_iam_member.nclav_token_access,
+    google_secret_manager_secret_iam_member.nclav_db_url_access,
   ]
 }
 

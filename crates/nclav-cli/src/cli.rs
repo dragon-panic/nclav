@@ -48,9 +48,17 @@ pub enum Command {
         rotate_token: bool,
 
         /// Path to the redb state file. Defaults to ~/.nclav/state.redb.
-        /// Ignored when --ephemeral is set. Env: NCLAV_STORE_PATH
+        /// Ignored when --ephemeral or --postgres-url is set. Env: NCLAV_STORE_PATH
         #[arg(long, env = "NCLAV_STORE_PATH")]
         store_path: Option<String>,
+
+        /// PostgreSQL connection URL for persistent state.
+        /// When set, takes precedence over --store-path and --ephemeral.
+        /// Example: postgres://user:pass@localhost:5432/nclav
+        /// Cloud SQL socket: postgres://user:pass@/db?host=/cloudsql/proj:region:inst
+        /// Env: NCLAV_POSTGRES_URL
+        #[arg(long, env = "NCLAV_POSTGRES_URL")]
+        postgres_url: Option<String>,
 
         /// GCP parent resource ("folders/123" or "organizations/456").
         /// Required when gcp is the default (--cloud gcp) or an additional

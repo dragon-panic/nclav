@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use nclav_domain::CloudTarget;
 use nclav_driver::{DriverRegistry, GcpDriver, GcpDriverConfig, LocalDriver};
-use nclav_store::{EnclaveState, InMemoryStore, RedbStore, StateStore};
+use nclav_store::{EnclaveState, InMemoryStore, PostgresStore, RedbStore, StateStore};
 use uuid::Uuid;
 
 use crate::cli::{CloudArg, GraphOutput};
@@ -20,6 +20,7 @@ pub async fn serve(
     ephemeral: bool,
     rotate_token: bool,
     store_path: Option<String>,
+    postgres_url: Option<String>,
     mut gcp_parent: Option<String>,
     mut gcp_billing_account: Option<String>,
     gcp_default_region: String,
@@ -71,7 +72,14 @@ pub async fn serve(
         }
     };
 
-    let store: Arc<dyn StateStore> = if ephemeral {
+    let store: Arc<dyn StateStore> = if let Some(url) = postgres_url {
+        println!("Connecting to PostgreSQL store…");
+        Arc::new(
+            PostgresStore::connect(&url)
+                .await
+                .context("Failed to connect to PostgreSQL")?,
+        )
+    } else if ephemeral {
         println!("Using in-memory (ephemeral) store — state will be lost on server stop");
         Arc::new(InMemoryStore::new())
     } else {

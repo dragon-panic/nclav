@@ -14,6 +14,10 @@ chrono       = { workspace = true }
 uuid         = { workspace = true }
 sha2         = { workspace = true }
 redb         = "2"
+sqlx         = { version = "0.8", features = [
+    "runtime-tokio", "tls-rustls", "postgres",
+    "uuid", "chrono", "json",
+] }
 
 [dev-dependencies]
 tempfile = "3"
