@@ -59,17 +59,11 @@ resource "google_project_iam_member" "nclav_editor" {
   member  = "serviceAccount:${google_service_account.nclav.email}"
 }
 
-resource "google_project_iam_member" "nclav_resourcemanager" {
-  project = var.project_id
-  role    = "roles/resourcemanager.projectCreator"
-  member  = "serviceAccount:${google_service_account.nclav.email}"
-}
 
-resource "google_project_iam_member" "nclav_billing_user" {
-  project = var.project_id
-  role    = "roles/billing.user"
-  member  = "serviceAccount:${google_service_account.nclav.email}"
-}
+# roles/resourcemanager.projectCreator and roles/billing.user must be granted
+# at the folder/org and billing-account level respectively — not the platform
+# project.  Run `terraform output iam_setup_commands` after apply and send the
+# printed gcloud commands to your GCP admin.
 
 # ── GCS bucket for redb state ─────────────────────────────────────────────────
 
@@ -123,6 +117,11 @@ resource "google_secret_manager_secret_iam_member" "nclav_token_access" {
 
 locals {
   gcp_prefix_flag = var.gcp_project_prefix != "" ? ["--gcp-project-prefix", var.gcp_project_prefix] : []
+
+  # Detect whether gcp_parent is a folder or an organization so we can emit
+  # the correct gcloud command family in the iam_setup_commands output.
+  _parent_is_folder   = startswith(var.gcp_parent, "folders/")
+  _gcloud_parent_bind = local._parent_is_folder ? "gcloud resource-manager folders add-iam-policy-binding ${trimprefix(var.gcp_parent, "folders/")}" : "gcloud organizations add-iam-policy-binding ${trimprefix(var.gcp_parent, "organizations/")}"
 }
 
 resource "google_cloud_run_v2_service" "nclav" {
@@ -197,11 +196,13 @@ resource "google_cloud_run_v2_service" "nclav" {
   ]
 }
 
-# Allow the Cloud Run service to be invoked (requires auth by default).
-# Operators connect via the nclav CLI which sends the Bearer token.
-resource "google_cloud_run_service_iam_member" "invoker" {
+# Allow unauthenticated invocations so the nclav CLI (running locally) can
+# reach the Cloud Run service.  Application-level authentication is handled by
+# nclav's own Bearer token middleware — GCP IAM auth is not used here.
+resource "google_cloud_run_v2_service_iam_member" "public_invoker" {
+  project  = var.project_id
   location = google_cloud_run_v2_service.nclav.location
-  service  = google_cloud_run_v2_service.nclav.name
+  name     = google_cloud_run_v2_service.nclav.name
   role     = "roles/run.invoker"
-  member   = "serviceAccount:${google_service_account.nclav.email}"
+  member   = "allUsers"
 }

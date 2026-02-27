@@ -42,6 +42,118 @@ cargo run -p nclav-cli -- apply ./enclaves
 cargo run -p nclav-cli -- graph --output text
 ```
 
+## Hosted deployment (GCP)
+
+For a persistent, cloud-hosted nclav API run the Terraform bootstrap in
+`bootstrap/gcp/`. This provisions a Cloud Run service backed by a GCS volume
+for state — no local process required after setup.
+
+**What it creates:**
+
+| Resource | Name | Purpose |
+|---|---|---|
+| Service Account | `nclav-server@{project}.iam.gserviceaccount.com` | Identity for the Cloud Run service |
+| GCS Bucket | `{project}-nclav-state` | Persistent storage for the redb state file (GCS volume mount) |
+| Secret Manager secret | `nclav-api-token` | Bearer token for CLI authentication |
+| Cloud Run service | `nclav-api` | The nclav API server |
+
+### Prerequisites
+
+- A GCP project for the nclav platform (not an enclave project — a dedicated ops project)
+- A GCP folder or organization under which enclave projects will be created
+- A billing account for enclave projects
+- Docker and `make` installed locally
+- Terraform or OpenTofu installed locally
+- ADC with billing scope:
+  ```bash
+  gcloud auth application-default login \
+    --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/cloud-billing
+  ```
+
+### Step 1 — Build and push the container image
+
+```bash
+# Authenticate to GHCR (needs a PAT with write:packages scope)
+export GITHUB_ORG=your-github-org-or-username
+export GITHUB_TOKEN=ghp_...
+make login-ghcr
+
+# Build for linux/amd64 (Cloud Run target) and push
+make push TAG=latest
+```
+
+The image is published to `ghcr.io/$GITHUB_ORG/nclav:latest`. It bundles the
+`nclav` binary, Terraform, and OpenTofu. To override IaC tool versions:
+
+```bash
+make push TERRAFORM_VERSION=1.10.0 TOFU_VERSION=1.9.0
+```
+
+### Step 2 — Deploy with Terraform
+
+```bash
+cd bootstrap/gcp
+
+cat > terraform.tfvars <<EOF
+project_id         = "my-platform-project"
+region             = "us-central1"
+nclav_image        = "ghcr.io/your-org/nclav:latest"
+gcp_parent         = "folders/123456789"
+billing_account    = "XXXXXX-YYYYYY-ZZZZZZ"
+gcp_project_prefix = "myorg"
+EOF
+
+terraform init
+terraform apply
+```
+
+### Step 3 — Grant folder-level IAM (admin step)
+
+Terraform cannot grant folder/org-level IAM on your behalf without admin
+credentials. After `terraform apply`, print the required `gcloud` commands and
+send them to your GCP admin:
+
+```bash
+terraform output iam_setup_commands
+```
+
+The output is a ready-to-run block of `gcloud` commands that grant
+`nclav-server` the roles it needs (`projectCreator`, `iam.serviceAccountAdmin`,
+`compute.networkAdmin`, etc.) at the folder or org level, plus `billing.user`
+on the billing account. These are one-time grants — they do not need to be
+repeated for each enclave.
+
+### Step 4 — Connect the CLI
+
+```bash
+export NCLAV_REMOTE=$(terraform output -raw api_url)
+export NCLAV_TOKEN=$(terraform output -raw token_fetch_command | bash)
+
+nclav status
+nclav apply enclaves/
+```
+
+Add these exports to your shell profile to avoid repeating them. The token is
+stored in Secret Manager; the CLI uses `NCLAV_TOKEN` directly (no
+`~/.nclav/token` file is written when the env var is set).
+
+### Token rotation
+
+```bash
+terraform apply -replace=random_bytes.api_token
+
+# Restart Cloud Run to pick up the new token
+gcloud run services update nclav-api \
+  --region us-central1 \
+  --project my-platform-project \
+  --update-env-vars NCLAV_RESTART=$(date +%s)
+
+# Re-export the new token
+export NCLAV_TOKEN=$(cd bootstrap/gcp && terraform output -raw token_fetch_command | bash)
+```
+
+---
+
 ## CLI reference
 
 ```
@@ -87,9 +199,7 @@ gcloud auth application-default login \
   --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/cloud-billing
 ```
 
-**Hosted deployment:** To run nclav on Cloud Run instead of a local process, use
-the `bootstrap/gcp/` Terraform module. See [BOOTSTRAP.md](docs/prd/BOOTSTRAP.md)
-and [bootstrap/gcp/README.md](bootstrap/gcp/README.md).
+For a persistent, cloud-hosted deployment see [Hosted deployment (GCP)](#hosted-deployment-gcp) above.
 
 ### `nclav diff <enclaves-dir>`
 

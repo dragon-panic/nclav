@@ -17,3 +17,29 @@ output "service_account" {
   description = "Service account email used by the nclav Cloud Run service."
   value       = google_service_account.nclav.email
 }
+
+output "iam_setup_commands" {
+  description = "Send these gcloud commands to your GCP folder/org admin. They grant nclav-server the roles it needs to create and manage enclave projects. Run once after terraform apply."
+  value       = <<-EOT
+
+    # ── Send to your GCP admin — run once after terraform apply ──────────────
+    # These bind nclav-server to folder/org-level roles so it can create GCP
+    # projects for each enclave and manage resources within them.
+
+    SA="${google_service_account.nclav.email}"
+
+    # Folder / org level:
+    ${local._gcloud_parent_bind} --member="serviceAccount:${google_service_account.nclav.email}" --role="roles/resourcemanager.projectCreator"
+    ${local._gcloud_parent_bind} --member="serviceAccount:${google_service_account.nclav.email}" --role="roles/iam.serviceAccountAdmin"
+    ${local._gcloud_parent_bind} --member="serviceAccount:${google_service_account.nclav.email}" --role="roles/iam.serviceAccountTokenCreator"
+    ${local._gcloud_parent_bind} --member="serviceAccount:${google_service_account.nclav.email}" --role="roles/compute.networkAdmin"
+    ${local._gcloud_parent_bind} --member="serviceAccount:${google_service_account.nclav.email}" --role="roles/dns.admin"
+    ${local._gcloud_parent_bind} --member="serviceAccount:${google_service_account.nclav.email}" --role="roles/run.admin"
+    ${local._gcloud_parent_bind} --member="serviceAccount:${google_service_account.nclav.email}" --role="roles/pubsub.admin"
+    ${local._gcloud_parent_bind} --member="serviceAccount:${google_service_account.nclav.email}" --role="roles/cloudasset.viewer"
+
+    # Billing account (attach billing to new enclave projects):
+    gcloud billing accounts add-iam-policy-binding ${var.billing_account} --member="serviceAccount:${google_service_account.nclav.email}" --role="roles/billing.user"
+
+  EOT
+}
