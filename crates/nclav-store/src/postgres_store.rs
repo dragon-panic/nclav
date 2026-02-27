@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use nclav_domain::{EnclaveId, PartitionId};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::PgPool;
+use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::error::StoreError;
@@ -62,7 +64,21 @@ impl PostgresStore {
     /// - `postgres://user:pass@localhost:5432/nclav`
     /// - `postgres://nclav:pwd@/nclav?host=/cloudsql/project:region:instance`  (Cloud SQL socket)
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
-        let pool = PgPool::connect(url)
+        let opts = PgConnectOptions::from_str(url)
+            .map_err(|e| StoreError::Internal(format!("postgres URL parse: {e}")))?;
+
+        // Default to Disable SSL so that connections to local Docker and
+        // Cloud SQL Unix sockets work without certificate configuration.
+        // Users who need network-level TLS should add ?sslmode=require (or
+        // verify-full) to their connection URL — sqlx will respect it.
+        let opts = if url.contains("sslmode=") {
+            opts
+        } else {
+            opts.ssl_mode(PgSslMode::Disable)
+        };
+
+        let pool = PgPoolOptions::new()
+            .connect_with(opts)
             .await
             .map_err(|e| StoreError::Internal(format!("postgres connect: {e}")))?;
         let store = Self { pool };
@@ -73,10 +89,28 @@ impl PostgresStore {
     /// Run all DDL migrations.  Safe to call on every startup — all statements
     /// use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`.
     async fn migrate(&self) -> Result<(), StoreError> {
-        sqlx::query(MIGRATIONS)
-            .execute(&self.pool)
+        // Acquire a single connection and hold an advisory lock for the entire
+        // migration so that parallel callers (e.g. concurrent test runs) don't
+        // collide on `CREATE INDEX IF NOT EXISTS` catalog entries.
+        let mut conn = self.pool.acquire().await
+            .map_err(|e| StoreError::Internal(format!("migration acquire: {e}")))?;
+
+        sqlx::raw_sql("SELECT pg_advisory_lock(8675309)")
+            .execute(&mut *conn)
             .await
-            .map_err(|e| StoreError::Internal(format!("migration: {e}")))?;
+            .map_err(|e| StoreError::Internal(format!("migration lock: {e}")))?;
+
+        let result = sqlx::raw_sql(MIGRATIONS)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| StoreError::Internal(format!("migration: {e}")));
+
+        // Always release — connection return also drops session locks, but be explicit.
+        let _ = sqlx::raw_sql("SELECT pg_advisory_unlock(8675309)")
+            .execute(&mut *conn)
+            .await;
+
+        result?;
         Ok(())
     }
 }
