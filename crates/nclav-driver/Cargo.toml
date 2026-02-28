@@ -17,6 +17,9 @@ gcp_auth     = { workspace = true }
 base64       = { workspace = true }
 chrono       = { workspace = true }
 uuid         = { workspace = true }
+sha2         = { workspace = true }
+hmac         = { workspace = true }
+quick-xml    = { version = "0.37", features = ["serialize"] }
 
 [dev-dependencies]
 wiremock     = "0.6"

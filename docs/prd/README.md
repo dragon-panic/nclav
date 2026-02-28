@@ -7,7 +7,8 @@
 | [PARTITIONS.md](PARTITIONS.md) | Terraform/OpenTofu backends, input templating, workspace layout, state backend, and IaC run logs |
 | [GCP.md](GCP.md) | GCP driver reference: concept → primitive mapping, API call sequences, PSC wiring, IAM, and idempotency |
 | [AZURE.md](AZURE.md) | Azure driver reference: concept → primitive mapping, API call sequences, Private Link wiring, RBAC, and idempotency |
-| [BOOTSTRAP.md](BOOTSTRAP.md) | Platform bootstrap options (local vs. Cloud Run vs. Container Apps), state store choices, and the driver registry |
+| [AWS.md](AWS.md) | AWS driver reference: concept → primitive mapping, Organizations, SigV4, cross-account IAM, and idempotency |
+| [BOOTSTRAP.md](BOOTSTRAP.md) | Platform bootstrap options (local vs. Cloud Run vs. Container Apps vs. ECS Fargate), state store choices, and the driver registry |
 
 ---
 
@@ -155,6 +156,8 @@ nclav defaults to an **isolated topology**: each enclave has a private network w
 
 This model holds for workloads built on catalog services — managed databases, serverless containers, managed queues, object storage. For workloads that require wire protocols with embedded addressing (Kafka, Cassandra) or high-density N×M cross-enclave routing, a **hub-spoke topology** (shared routing plane with firewall enforcement) is planned as a future nclav mode.
 
+Cross-enclave connectivity uses the cloud-native private networking primitive appropriate for each cloud: GCP Private Service Connect, Azure Private Link, or AWS PrivateLink (via VPC Endpoint Services). Terraform inside each partition manages the endpoint resources; nclav manages the IAM and orchestration.
+
 See [ISOLATION.md](ISOLATION.md) for the full service catalog, the topology decision guide, and the isolated vs. hub-spoke tradeoff analysis.
 
 ---
@@ -202,7 +205,7 @@ DriverInterface
       ├── LocalDriver     (v1 — no credentials, in-process state)
       ├── GcpDriver       (v1 — Cloud Run, Pub/Sub, VPC, IAM)
       ├── AzureDriver     (v1 — Container Apps, Private Link, Subscriptions, RBAC)
-      └── AwsDriver       (future)
+      └── AwsDriver       (v1 — ECS/Fargate, Organizations, STS cross-account, VPC, IAM)
 ```
 
 The domain model describes intent. Drivers produce cloud-specific handles — opaque receipts stored in state so the driver can locate its resources on subsequent reconciles. The reconciler never reads inside handles. Only the driver that produced them reads them.
@@ -535,6 +538,7 @@ default.
 Local dev: `nclav serve --cloud local` starts the API as a local process.
 Hosted on GCP: the `bootstrap/gcp/` Terraform module deploys nclav to Cloud Run.
 Hosted on Azure: the `bootstrap/azure/` Terraform module deploys nclav to Container Apps.
+Hosted on AWS: the `bootstrap/aws/` Terraform module deploys nclav to ECS Fargate.
 
 See [BOOTSTRAP.md](BOOTSTRAP.md) for the full bootstrap reference.
 
@@ -562,13 +566,13 @@ nclav orphans                # Scan for cloud resources from destroyed partition
 - **Language:** Rust
 - **Database:** Postgres
 - **IaC:** Terraform
-- **Clouds (v1):** Local, GCP, Azure
+- **Clouds (v1):** Local, GCP, Azure, AWS
 
 ---
 
 ## Non-Goals (v1)
 
-- AWS driver (abstraction layer is built; driver is future)
+- GovCloud / AWS China regions
 - Org-level policy enforcement and compliance controls
 - Template and mixin system
 - Intra-enclave NSG enforcement (declarations generated, compliance not verified)

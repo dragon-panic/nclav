@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use nclav_domain::CloudTarget;
-use nclav_driver::{AzureDriver, AzureDriverConfig, DriverRegistry, GcpDriver, GcpDriverConfig, LocalDriver};
+use nclav_driver::{AwsDriver, AwsDriverConfig, AzureDriver, AzureDriverConfig, DriverRegistry, GcpDriver, GcpDriverConfig, LocalDriver};
 use nclav_store::{EnclaveState, InMemoryStore, PostgresStore, RedbStore, StateStore};
 use uuid::Uuid;
 
@@ -34,6 +34,12 @@ pub async fn serve(
     azure_subscription_prefix: Option<String>,
     azure_client_id: Option<String>,
     azure_client_secret: Option<String>,
+    mut aws_org_unit_id: Option<String>,
+    mut aws_email_domain: Option<String>,
+    aws_default_region: String,
+    aws_account_prefix: Option<String>,
+    aws_cross_account_role: String,
+    aws_role_arn: Option<String>,
     port: u16,
     bind: String,
 ) -> Result<()> {
@@ -175,6 +181,25 @@ pub async fn serve(
                 println!("Initialised Azure driver (tenant: {})", tenant_id_display);
                 registry.register(CloudTarget::Azure, Arc::new(driver));
             }
+            CloudArg::Aws => {
+                let org_unit_id = aws_org_unit_id.take()
+                    .context("--aws-org-unit-id (or NCLAV_AWS_ORG_UNIT_ID) is required for the aws driver")?;
+                let email_domain = aws_email_domain.take()
+                    .context("--aws-email-domain (or NCLAV_AWS_EMAIL_DOMAIN) is required for the aws driver")?;
+                let config = AwsDriverConfig {
+                    org_unit_id,
+                    email_domain,
+                    default_region: aws_default_region.clone(),
+                    account_prefix: aws_account_prefix.clone(),
+                    cross_account_role: aws_cross_account_role.clone(),
+                    role_arn: aws_role_arn.clone(),
+                };
+                let driver = AwsDriver::new(config)
+                    .await
+                    .context("Failed to initialise AWS driver")?;
+                println!("Initialised AWS driver (region: {})", aws_default_region);
+                registry.register(CloudTarget::Aws, Arc::new(driver));
+            }
         }
     }
 
@@ -201,8 +226,9 @@ pub async fn serve(
 fn cloud_arg_to_target(arg: &CloudArg) -> CloudTarget {
     match arg {
         CloudArg::Local => CloudTarget::Local,
-        CloudArg::Gcp => CloudTarget::Gcp,
+        CloudArg::Gcp   => CloudTarget::Gcp,
         CloudArg::Azure => CloudTarget::Azure,
+        CloudArg::Aws   => CloudTarget::Aws,
     }
 }
 

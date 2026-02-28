@@ -1,3 +1,4 @@
+pub mod aws;
 pub mod azure;
 pub mod driver;
 pub mod error;
@@ -6,6 +7,7 @@ pub mod local;
 pub mod registry;
 pub mod terraform;
 
+pub use aws::{AwsDriver, AwsDriverConfig};
 pub use azure::{AzureDriver, AzureDriverConfig};
 pub use driver::{Driver, ObservedState, OrphanedResource, ProvisionResult};
 pub use error::DriverError;

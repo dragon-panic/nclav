@@ -284,6 +284,131 @@ eval $(make connect-azure)
 
 ---
 
+## Hosted deployment (AWS)
+
+For a persistent, cloud-hosted nclav API run the Terraform bootstrap in
+`bootstrap/aws/`. This provisions an ECS Fargate service backed by RDS
+PostgreSQL and an Application Load Balancer — no local process required after
+setup.
+
+**What it creates:**
+
+| Resource | Name | Purpose |
+|---|---|---|
+| ECR Repository | `nclav` | Hosts the nclav container image |
+| RDS PostgreSQL | `nclav-state-{suffix}` | Persistent state store |
+| Secrets Manager | `nclav-api-token` | Bearer token for CLI authentication |
+| Secrets Manager | `nclav-db-url` | Postgres connection URL for ECS task |
+| IAM Role | `nclav-server` | ECS task role (Organizations + STS + Secrets Manager) |
+| ECS Cluster + Service | `nclav` / `nclav-api` | Fargate compute |
+| ALB | `nclav-api` | Public HTTP endpoint |
+
+**No NAT Gateway required.** ECS tasks run in public subnets with
+`assign_public_ip=ENABLED` and reach AWS APIs directly via the Internet
+Gateway. This saves ~$32/month versus a typical VPC setup.
+
+### Prerequisites
+
+- AWS CLI configured (`aws configure` or environment variables)
+- AWS Organizations: must be run from the **management account** (or a delegated
+  admin with Organizations permissions)
+- An OU ID where new account enclaves will be placed
+- A domain you control for new account email registration
+- Terraform or OpenTofu installed locally
+- Docker installed (to build and push the nclav image)
+
+### Step 1 — Configure and deploy
+
+Copy the vars template and fill in your values:
+
+```bash
+cp bootstrap/aws/terraform.tfvars.example bootstrap/aws/terraform.tfvars
+# edit bootstrap/aws/terraform.tfvars
+```
+
+Then run the full bootstrap in one command:
+
+```bash
+make bootstrap-aws AWS_ACCOUNT=123456789012
+```
+
+This creates the ECR repository, builds and pushes the container image, then
+deploys the ECS service, RDS database, and ALB. Terraform will prompt for plan
+approval twice.
+
+**Doing it manually** (if you prefer to see each step):
+
+```bash
+cd bootstrap/aws
+terraform init
+# Phase 1: ECR repo (image must exist before ECS service starts)
+terraform apply -target=aws_ecr_repository.nclav
+# Build and push the image
+cd ../..
+make push-ecr AWS_ACCOUNT=123456789012
+# Phase 2: everything else
+cd bootstrap/aws
+terraform apply
+```
+
+### Step 2 — Grant IAM permissions
+
+The `nclav-server` ECS task role is created by Terraform with the permissions
+needed for account lifecycle management. After `terraform apply`, check the
+IAM setup output:
+
+```bash
+cd bootstrap/aws && terraform output iam_setup_commands
+```
+
+This shows any additional steps needed (e.g. enabling Organizations policy
+types). **If you are the AWS org admin, run them yourself.** Otherwise send
+them to whoever manages your AWS organization. These are one-time grants and
+do not need to be repeated per enclave.
+
+### Step 3 — Connect the CLI
+
+The ALB exposes a public HTTP endpoint secured by the nclav bearer token. One
+command sets the required env vars:
+
+```bash
+eval $(make connect-aws)
+nclav status
+nclav apply enclaves/
+```
+
+`make connect-aws` fetches the ALB URL and API token from Terraform outputs and
+Secrets Manager. Add the exported vars to your shell profile:
+
+```bash
+export NCLAV_URL=http://nclav-api-123456789.us-east-1.elb.amazonaws.com
+export NCLAV_TOKEN=$(aws secretsmanager get-secret-value \
+  --secret-id nclav-api-token --query SecretString --output text)
+```
+
+### Token rotation
+
+```bash
+# Generate a new token
+NEW_TOKEN=$(openssl rand -hex 32)
+
+# Update the secret
+aws secretsmanager put-secret-value \
+  --secret-id nclav-api-token \
+  --secret-string "$NEW_TOKEN"
+
+# Force a new ECS task deployment (picks up the new secret)
+aws ecs update-service \
+  --cluster nclav \
+  --service nclav-api \
+  --force-new-deployment
+
+# Export the new token
+export NCLAV_TOKEN=$NEW_TOKEN
+```
+
+---
+
 ## CLI reference
 
 ```
@@ -315,6 +440,11 @@ nclav serve --cloud azure \
   --azure-billing-account-name $BILLING_ACCOUNT \
   --azure-billing-profile-name $BILLING_PROFILE \
   --azure-invoice-section-name $INVOICE_SECTION
+
+# AWS as default cloud for enclaves
+nclav serve --cloud aws \
+  --aws-org-unit-id $ORG_UNIT_ID \
+  --aws-email-domain $EMAIL_DOMAIN
 ```
 
 Every driver must be explicitly requested — `--cloud` registers the default driver, `--enable-cloud` adds more. Binds `http://127.0.0.1:8080` by default; use `--bind 0.0.0.0` / `NCLAV_BIND` to expose on all interfaces, `--port` / `NCLAV_PORT` to change the port.
@@ -356,6 +486,21 @@ For a persistent, cloud-hosted deployment see [Hosted deployment (GCP)](#hosted-
 Azure auth is selected automatically: SP credentials → IMDS (Managed Identity) → Azure CLI fallback. No explicit credential flag is needed when running on Azure (e.g. the Container App bootstrap uses the managed identity).
 
 For a persistent, cloud-hosted deployment see [Hosted deployment (Azure)](#hosted-deployment-azure) above.
+
+**AWS flags / env vars:**
+
+| Flag | Env var | Required | Description |
+|---|---|:---:|---|
+| `--aws-org-unit-id` | `NCLAV_AWS_ORG_UNIT_ID` | yes | OU ID where new account enclaves are placed |
+| `--aws-email-domain` | `NCLAV_AWS_EMAIL_DOMAIN` | yes | Email domain for new account registration |
+| `--aws-default-region` | `NCLAV_AWS_DEFAULT_REGION` | no | Default AWS region (default: `us-east-1`) |
+| `--aws-account-prefix` | `NCLAV_AWS_ACCOUNT_PREFIX` | no | Prefix for account names: `myorg` → `myorg-product-a-dev` |
+| `--aws-cross-account-role` | `NCLAV_AWS_CROSS_ACCOUNT_ROLE` | no | IAM role assumed in enclave accounts (default: `OrganizationAccountAccessRole`) |
+| `--aws-role-arn` | `NCLAV_AWS_ROLE_ARN` | no | IAM role ARN assumed for management API calls |
+
+AWS credentials are resolved automatically: env vars (`AWS_ACCESS_KEY_ID`) → ECS task credentials → EC2 IMDSv2 → AWS CLI fallback. No explicit credential flag is needed when running on ECS Fargate (the bootstrap uses the ECS task role).
+
+For a persistent, cloud-hosted deployment see [Hosted deployment (AWS)](#hosted-deployment-aws) above.
 
 ### `nclav diff <enclaves-dir>`
 
@@ -505,7 +650,7 @@ enclaves/
 ```yaml
 id: product-a-dev
 name: Product A (Development)
-cloud: local          # local | gcp | azure  — optional; omit to use the API's default cloud
+cloud: local          # local | gcp | azure | aws  — optional; omit to use the API's default cloud
 region: local-1
 identity: product-a-dev-identity
 
@@ -613,7 +758,7 @@ crates/
   nclav-config/       YAML parsing, Raw* -> domain conversion
   nclav-graph/        Petgraph validation: dangling imports, access control, cycles, topo sort
   nclav-store/        StateStore trait + InMemoryStore + RedbStore (persistent local)
-  nclav-driver/       Driver trait + DriverRegistry + LocalDriver + GcpDriver + TerraformBackend
+  nclav-driver/       Driver trait + DriverRegistry + LocalDriver + GcpDriver + AzureDriver + AwsDriver + TerraformBackend
   nclav-reconciler/   Reconcile loop: diff -> provision -> persist
   nclav-api/          Axum HTTP server (bearer token auth)
   nclav-cli/          Clap binary
@@ -643,8 +788,6 @@ RUST_LOG=nclav::iac=debug cargo run -p nclav-cli -- apply ./enclaves
 
 ## What's not implemented yet
 
-- **Azure driver** — the `Driver` trait is defined; the Azure implementation is deferred
-- **AWS driver**
 - **IaC drift detection** — `terraform plan` on a schedule to detect out-of-band changes
 - **Live log streaming** — IaC run logs are currently stored as a single blob after completion; streaming via SSE is future work
 - **Web UI**

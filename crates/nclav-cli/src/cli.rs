@@ -133,6 +133,43 @@ pub enum Command {
         #[arg(long, env = "NCLAV_AZURE_CLIENT_SECRET")]
         azure_client_secret: Option<String>,
 
+        // ── AWS flags ─────────────────────────────────────────────────────────
+
+        /// AWS Organizations OU ID where new accounts are placed (e.g. "ou-xxxx-yyyyyyyy").
+        /// Required when aws is the default or an additional driver.
+        /// Env: NCLAV_AWS_ORG_UNIT_ID
+        #[arg(long, env = "NCLAV_AWS_ORG_UNIT_ID")]
+        aws_org_unit_id: Option<String>,
+
+        /// Email domain for new account registration (e.g. "myorg.com").
+        /// New accounts get address: aws+{name}@{domain}.
+        /// Required when aws is the default or an additional driver.
+        /// Env: NCLAV_AWS_EMAIL_DOMAIN
+        #[arg(long, env = "NCLAV_AWS_EMAIL_DOMAIN")]
+        aws_email_domain: Option<String>,
+
+        /// Default AWS region for new resources. Env: NCLAV_AWS_DEFAULT_REGION
+        #[arg(long, env = "NCLAV_AWS_DEFAULT_REGION", default_value = "us-east-1")]
+        aws_default_region: String,
+
+        /// Optional prefix prepended to every AWS account name.
+        /// Env: NCLAV_AWS_ACCOUNT_PREFIX
+        #[arg(long, env = "NCLAV_AWS_ACCOUNT_PREFIX")]
+        aws_account_prefix: Option<String>,
+
+        /// IAM role name to assume in each enclave account.
+        /// Env: NCLAV_AWS_CROSS_ACCOUNT_ROLE
+        #[arg(
+            long, env = "NCLAV_AWS_CROSS_ACCOUNT_ROLE",
+            default_value = "OrganizationAccountAccessRole"
+        )]
+        aws_cross_account_role: String,
+
+        /// ARN of an IAM role to assume for management API calls (optional).
+        /// Env: NCLAV_AWS_ROLE_ARN
+        #[arg(long, env = "NCLAV_AWS_ROLE_ARN")]
+        aws_role_arn: Option<String>,
+
         /// TCP port to bind the HTTP API server on. Env: NCLAV_PORT
         #[arg(long, env = "NCLAV_PORT", default_value = "8080")]
         port: u16,
@@ -253,6 +290,7 @@ pub enum CloudArg {
     Local,
     Gcp,
     Azure,
+    Aws,
 }
 
 #[derive(Debug, Clone, ValueEnum)]

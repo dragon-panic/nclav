@@ -1,0 +1,39 @@
+# bootstrap/aws/terraform.tfvars.example
+#
+# Copy to terraform.tfvars and fill in your values:
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# Then run:
+#   make bootstrap-aws AWS_ACCOUNT=123456789012
+
+# ── AWS region ─────────────────────────────────────────────────────────────────
+
+aws_region = "us-east-1"
+
+# ── nclav AWS driver configuration ────────────────────────────────────────────
+
+# AWS Organizations OU ID where new account enclaves will be placed.
+# Find it in: AWS Console → Organizations → Organizational units
+aws_org_unit_id = "ou-xxxx-yyyyyyyy"
+
+# Email domain for new account registration.
+# nclav creates addresses like: aws+myorg-product-a-dev@myorg.com
+aws_email_domain = "myorg.com"
+
+# Optional prefix prepended to every account name (avoids name collisions).
+# Leave empty to use just the enclave ID.
+aws_account_prefix = "myorg"
+
+# IAM role assumed by nclav in each enclave account.
+# Default (OrganizationAccountAccessRole) is auto-created by AWS Organizations.
+# aws_cross_account_role = "OrganizationAccountAccessRole"
+
+# ── Image configuration ────────────────────────────────────────────────────────
+
+nclav_image_tag = "latest"
+
+# ── Infrastructure sizing (adjust for your load) ───────────────────────────────
+
+rds_instance_class = "db.t4g.micro"
+task_cpu           = 256
+task_memory        = 512

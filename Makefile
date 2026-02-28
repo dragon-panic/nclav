@@ -19,19 +19,23 @@
 #   make push-acr  AZURE_ACR=...   TAG=v0.1.0
 #   make push-ar   GCP_PROJECT=... TERRAFORM_VERSION=1.10.0 TOFU_VERSION=1.9.0
 
-GCP_PROJECT ?=
-AR_REGION   ?= us-central1
-AZURE_ACR   ?=
-TAG         ?= latest
+GCP_PROJECT  ?=
+AR_REGION    ?= us-central1
+AZURE_ACR    ?=
+AWS_ACCOUNT  ?=
+AWS_REGION   ?= us-east-1
+TAG          ?= latest
 
 TERRAFORM_VERSION ?= 1.9.8
 TOFU_VERSION      ?= 1.8.3
 
 AR_IMAGE  := $(AR_REGION)-docker.pkg.dev/$(GCP_PROJECT)/nclav/nclav
 ACR_IMAGE := $(AZURE_ACR).azurecr.io/nclav
+ECR_IMAGE := $(AWS_ACCOUNT).dkr.ecr.$(AWS_REGION).amazonaws.com/nclav
 
 .PHONY: push-ar bootstrap-gcp connect _check-gcp-project \
-        push-acr bootstrap-azure connect-azure _check-azure-acr
+        push-acr bootstrap-azure connect-azure _check-azure-acr \
+        push-ecr bootstrap-aws connect-aws _check-aws-account
 
 _check-gcp-project:
 	@test -n "$(GCP_PROJECT)" || \
@@ -111,3 +115,42 @@ connect-azure:
 	APP_FQDN=$$(cd bootstrap/azure && terraform output -raw app_fqdn) && \
 	echo "export NCLAV_URL=https://$$APP_FQDN" && \
 	echo "export NCLAV_TOKEN=$$(az keyvault secret show --vault-name $$VAULT_NAME --name nclav-api-token --query value -o tsv)"
+
+# ── AWS targets ────────────────────────────────────────────────────────────────
+
+_check-aws-account:
+	@test -n "$(AWS_ACCOUNT)" || \
+	  (echo "ERROR: AWS_ACCOUNT is not set.  Run: make <target> AWS_ACCOUNT=123456789012" && exit 1)
+
+## Build and push to AWS ECR (aws CLI must be configured).
+## Usage: make push-ecr AWS_ACCOUNT=123456789012 [AWS_REGION=us-east-1] [TAG=latest]
+push-ecr: _check-aws-account
+	aws ecr get-login-password --region $(AWS_REGION) | \
+	  docker login --username AWS --password-stdin $(AWS_ACCOUNT).dkr.ecr.$(AWS_REGION).amazonaws.com
+	docker build \
+	  --platform linux/amd64 \
+	  --build-arg TERRAFORM_VERSION=$(TERRAFORM_VERSION) \
+	  --build-arg TOFU_VERSION=$(TOFU_VERSION) \
+	  -t $(ECR_IMAGE):$(TAG) \
+	  .
+	docker push $(ECR_IMAGE):$(TAG)
+
+## Full AWS bootstrap: create ECR → build+push image → deploy ECS + RDS.
+## Requires bootstrap/aws/terraform.tfvars (copy from terraform.tfvars.example and fill in values).
+## Terraform will prompt for approval twice. AWS_ACCOUNT must match the Terraform caller's account ID.
+## Usage: make bootstrap-aws AWS_ACCOUNT=123456789012 [AWS_REGION=us-east-1]
+bootstrap-aws: _check-aws-account
+	cd bootstrap/aws && terraform init
+	cd bootstrap/aws && terraform apply -target=aws_ecr_repository.nclav
+	$(MAKE) push-ecr AWS_ACCOUNT=$(AWS_ACCOUNT) AWS_REGION=$(AWS_REGION)
+	cd bootstrap/aws && terraform apply
+
+## Print env vars for the nclav CLI (fetches token from Secrets Manager).
+## Usage: eval $(make connect-aws)
+## Then run: nclav status
+connect-aws:
+	@SECRET_ARN=$$(cd bootstrap/aws && terraform output -raw api_token_secret_arn) && \
+	ALB_URL=$$(cd bootstrap/aws && terraform output -raw alb_url) && \
+	echo "export NCLAV_URL=$$ALB_URL" && \
+	echo "export NCLAV_TOKEN=$$(aws secretsmanager get-secret-value \
+	  --secret-id $$SECRET_ARN --query SecretString --output text)"

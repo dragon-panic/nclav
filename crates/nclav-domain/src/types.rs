@@ -49,6 +49,7 @@ pub enum CloudTarget {
     Local,
     Gcp,
     Azure,
+    Aws,
 }
 
 impl std::fmt::Display for CloudTarget {
@@ -57,6 +58,7 @@ impl std::fmt::Display for CloudTarget {
             CloudTarget::Local => write!(f, "local"),
             CloudTarget::Gcp => write!(f, "gcp"),
             CloudTarget::Azure => write!(f, "azure"),
+            CloudTarget::Aws => write!(f, "aws"),
         }
     }
 }

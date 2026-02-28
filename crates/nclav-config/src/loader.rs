@@ -271,6 +271,7 @@ fn parse_cloud(s: &str, path: &Path) -> Result<CloudTarget, ConfigError> {
         "local" => Ok(CloudTarget::Local),
         "gcp"   => Ok(CloudTarget::Gcp),
         "azure" => Ok(CloudTarget::Azure),
+        "aws"   => Ok(CloudTarget::Aws),
         other => Err(ConfigError::Conversion {
             path: path.display().to_string(),
             message: format!("unknown cloud target '{}'", other),
