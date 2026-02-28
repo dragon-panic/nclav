@@ -1,5 +1,15 @@
 # nclav — PRD v2
 
+| Document | What it covers |
+|---|---|
+| **PRD (this file)** | Problem statement, design principles, core primitives, state model, and architecture overview |
+| [ISOLATION.md](ISOLATION.md) | Service catalog, isolated vs. hub-spoke topology, and the wrap pattern for non-catalog services |
+| [PARTITIONS.md](PARTITIONS.md) | Terraform/OpenTofu backends, input templating, workspace layout, state backend, and IaC run logs |
+| [GCP.md](GCP.md) | GCP driver reference: concept → primitive mapping, API call sequences, PSC wiring, IAM, and idempotency |
+| [BOOTSTRAP.md](BOOTSTRAP.md) | Platform bootstrap options (local vs. Cloud Run), state store choices, and the driver registry |
+
+---
+
 ## The Problem
 
 Cloud environments accumulate shared state. Developers stomp on each other's resources, costs are invisible until the bill arrives, and networking is either locked down so hard nothing works or open so wide nothing is safe. The fix is usually a platform team writing bespoke automation that only they understand.

@@ -12,6 +12,8 @@ Cloud infrastructure orchestration via a YAML-driven reconcile loop. nclav manag
 | **Import** | A reference to another enclave's export, given a local alias used for template substitution. |
 | **Reconcile** | The loop that diffs desired state (YAML) against actual state (store), then provisions/tears down in dependency order. |
 
+> For the theory behind the isolation model, state machine, driver architecture, and design decisions, see the [design documents](docs/prd/README.md).
+
 ## Requirements
 
 - Rust 1.75+ (the workspace uses async traits and the 2021 edition)
