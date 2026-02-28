@@ -74,34 +74,7 @@ local process required after setup.
   gcloud auth application-default login \
     --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/cloud-billing
   ```
-- A container image for the nclav server — either use a pre-built image or build your own (see below)
-
-### Step 1 — Get a container image
-
-**Option A — Use a pre-built image (recommended for most users)**
-
-Set `nclav_image` in your `terraform.tfvars` to a published image URI and skip ahead to Step 2. No Docker or GitHub account required.
-
-**Option B — Build and publish your own image**
-
-This is only needed if you want to run a custom or private build. It requires Docker, `make`, and a GitHub account.
-
-```bash
-# Create a GitHub PAT: Settings → Developer Settings → Personal access tokens
-# → Tokens (classic) → write:packages scope. Your GITHUB_ORG is your GitHub
-# username or org slug (the part after github.com/).
-export GITHUB_ORG=your-github-org-or-username
-export GITHUB_TOKEN=ghp_...
-make login-ghcr
-
-# Build for linux/amd64 (Cloud Run target) and push
-make push TAG=latest
-# Image is published to ghcr.io/$GITHUB_ORG/nclav:latest
-```
-
-To override bundled IaC tool versions: `make push TERRAFORM_VERSION=1.10.0 TOFU_VERSION=1.9.0`
-
-### Step 2 — Deploy with Terraform
+### Step 1 — Deploy with Terraform
 
 ```bash
 cd bootstrap/gcp
@@ -109,13 +82,32 @@ cd bootstrap/gcp
 cat > terraform.tfvars <<EOF
 project_id         = "my-platform-project"
 region             = "us-central1"
-nclav_image        = "ghcr.io/your-org/nclav:latest"
 gcp_parent         = "folders/123456789"
 billing_account    = "XXXXXX-YYYYYY-ZZZZZZ"
 gcp_project_prefix = "myorg"
 EOF
 
 terraform init
+# Phase 1: create the Artifact Registry repo first
+terraform apply -target=google_artifact_registry_repository.nclav \
+                -target=google_project_service.apis
+```
+
+### Step 2 — Build and push the container image
+
+The bootstrap creates an Artifact Registry repo in your platform project.
+Build and push from the repo root:
+
+```bash
+make push-ar GCP_PROJECT=my-platform-project AR_REGION=us-central1
+```
+
+To override bundled IaC tool versions: `make push-ar GCP_PROJECT=... TERRAFORM_VERSION=1.10.0 TOFU_VERSION=1.9.0`
+
+Then complete the terraform apply:
+
+```bash
+cd bootstrap/gcp
 terraform apply
 ```
 
@@ -137,17 +129,24 @@ repeated for each enclave.
 
 ### Step 4 — Connect the CLI
 
+The Cloud Run service is private by default. Use `gcloud run services proxy`
+to open an authenticated local tunnel:
+
 ```bash
-export NCLAV_REMOTE=$(terraform output -raw api_url)
-export NCLAV_TOKEN=$(terraform output -raw token_fetch_command | bash)
+# Terminal 1 — keep this running:
+gcloud run services proxy nclav-api --project=my-platform-project --region=us-central1 --port=8080
+
+# Terminal 2 — use the CLI normally via localhost:
+export NCLAV_URL=http://localhost:8080
+export NCLAV_TOKEN=$(gcloud secrets versions access latest \
+  --secret=nclav-api-token --project=my-platform-project)
 
 nclav status
 nclav apply enclaves/
 ```
 
-Add these exports to your shell profile to avoid repeating them. The token is
-stored in Secret Manager; the CLI uses `NCLAV_TOKEN` directly (no
-`~/.nclav/token` file is written when the env var is set).
+Add the `export` lines to your shell profile to avoid repeating them. The
+token is stored in Secret Manager and never written to disk locally.
 
 ### Token rotation
 
@@ -500,7 +499,6 @@ RUST_LOG=nclav::iac=debug cargo run -p nclav-cli -- apply ./enclaves
 
 - **Azure driver** — the `Driver` trait is defined; the Azure implementation is deferred
 - **AWS driver**
-- **Postgres store** — `StateStore` is designed for it; feature-flag planned
 - **IaC drift detection** — `terraform plan` on a schedule to detect out-of-band changes
 - **Live log streaming** — IaC run logs are currently stored as a single blob after completion; streaming via SSE is future work
 - **Web UI**
