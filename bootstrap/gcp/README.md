@@ -95,11 +95,11 @@ to open an authenticated local tunnel:
 
 ```sh
 # Terminal 1 — keep this running:
-$(terraform output -raw proxy_command)
+gcloud run services proxy nclav-api --project=my-platform-project --region=us-central1 --port=8080
 
 # Terminal 2 — use the CLI normally via localhost:
 export NCLAV_URL=http://localhost:8080
-export NCLAV_TOKEN=$(terraform output -raw token_fetch_command | bash)
+export NCLAV_TOKEN=$(gcloud secrets versions access latest --secret=nclav-api-token --project=my-platform-project)
 
 nclav status
 nclav apply enclaves/
