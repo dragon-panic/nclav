@@ -74,93 +74,96 @@ local process required after setup.
   gcloud auth application-default login \
     --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/cloud-billing
   ```
-### Step 1 — Deploy with Terraform
+### Step 1 — Configure and deploy
+
+Copy the vars template and fill in your values:
+
+```bash
+cp bootstrap/gcp/terraform.tfvars.example bootstrap/gcp/terraform.tfvars
+# edit bootstrap/gcp/terraform.tfvars
+```
+
+Then run the full bootstrap in one command:
+
+```bash
+make bootstrap-gcp GCP_PROJECT=my-platform-project
+```
+
+This handles the two-phase Terraform apply (APIs + AR repo first, then Cloud Run + Cloud SQL) and builds and pushes the container image in between. Terraform will prompt for plan approval twice.
+
+**Doing it manually** (if you prefer to see each step):
 
 ```bash
 cd bootstrap/gcp
-
-cat > terraform.tfvars <<EOF
-project_id         = "my-platform-project"
-region             = "us-central1"
-gcp_parent         = "folders/123456789"
-billing_account    = "XXXXXX-YYYYYY-ZZZZZZ"
-gcp_project_prefix = "myorg"
-EOF
-
 terraform init
-# Phase 1: create the Artifact Registry repo first
+# Phase 1: AR repo + APIs
 terraform apply -target=google_artifact_registry_repository.nclav \
                 -target=google_project_service.apis
-```
-
-### Step 2 — Build and push the container image
-
-The bootstrap creates an Artifact Registry repo in your platform project.
-Build and push from the repo root:
-
-```bash
+# Build and push the image
+cd ../..
 make push-ar GCP_PROJECT=my-platform-project AR_REGION=us-central1
-```
-
-To override bundled IaC tool versions: `make push-ar GCP_PROJECT=... TERRAFORM_VERSION=1.10.0 TOFU_VERSION=1.9.0`
-
-Then complete the terraform apply:
-
-```bash
+# Phase 2: everything else
 cd bootstrap/gcp
 terraform apply
 ```
 
-### Step 3 — Grant folder-level IAM (admin step)
+### Step 2 — Grant folder-level IAM
 
-Terraform cannot grant folder/org-level IAM on your behalf without admin
-credentials. After `terraform apply`, print the required `gcloud` commands and
-send them to your GCP admin:
+Terraform cannot grant folder/org-level IAM without admin credentials. After
+`terraform apply`, print the required `gcloud` commands:
 
 ```bash
-terraform output iam_setup_commands
+cd bootstrap/gcp && terraform output -raw iam_setup_commands
 ```
 
-The output is a ready-to-run block of `gcloud` commands that grant
-`nclav-server` the roles it needs (`projectCreator`, `iam.serviceAccountAdmin`,
-`compute.networkAdmin`, etc.) at the folder or org level, plus `billing.user`
-on the billing account. These are one-time grants — they do not need to be
-repeated for each enclave.
+These grant `nclav-server` the roles it needs (`projectCreator`,
+`iam.serviceAccountAdmin`, `compute.networkAdmin`, etc.) at the folder or org
+level, plus `billing.user` on the billing account. **If you are the org admin,
+run them yourself.** Otherwise send them to whoever manages your GCP org.
+These are one-time grants and do not need to be repeated per enclave.
 
-### Step 4 — Connect the CLI
+### Step 3 — Connect the CLI
 
-The Cloud Run service is private by default. Use `gcloud run services proxy`
-to open an authenticated local tunnel:
+The Cloud Run service is private by default. One command starts the proxy and
+sets the required env vars:
 
 ```bash
-# Terminal 1 — keep this running:
-gcloud run services proxy nclav-api --project=my-platform-project --region=us-central1 --port=8080
-
-# Terminal 2 — use the CLI normally via localhost:
-export NCLAV_URL=http://localhost:8080
-export NCLAV_TOKEN=$(gcloud secrets versions access latest \
-  --secret=nclav-api-token --project=my-platform-project)
-
+eval $(make connect GCP_PROJECT=my-platform-project)
 nclav status
 nclav apply enclaves/
 ```
 
-Add the `export` lines to your shell profile to avoid repeating them. The
-token is stored in Secret Manager and never written to disk locally.
+`make connect` runs `gcloud run services proxy` in the background (logs to
+`/tmp/nclav-proxy.log`) and fetches the API token from Secret Manager. Add the
+exported vars to your shell profile to avoid re-running after the proxy is
+already up:
+
+```bash
+export NCLAV_URL=http://localhost:8080
+export NCLAV_TOKEN=$(gcloud secrets versions access latest \
+  --secret=nclav-api-token --project=my-platform-project)
+```
+
+To stop the proxy: `pkill -f 'gcloud run services proxy'`
 
 ### Token rotation
 
 ```bash
+cd bootstrap/gcp
+
+# Generate a new token and update the Secret Manager version
 terraform apply -replace=random_bytes.api_token
 
-# Restart Cloud Run to pick up the new token
+# Cloud Run reads secrets at revision creation time, so force a new revision.
+# Updating an env var is the standard way to trigger this without redeploying.
 gcloud run services update nclav-api \
-  --region us-central1 \
-  --project my-platform-project \
-  --update-env-vars NCLAV_RESTART=$(date +%s)
+  --project=my-platform-project \
+  --region=us-central1 \
+  --update-env-vars=_RESTART=$(date +%s)
 
-# Re-export the new token
-export NCLAV_TOKEN=$(cd bootstrap/gcp && terraform output -raw token_fetch_command | bash)
+# Fetch the new token
+export NCLAV_TOKEN=$(gcloud secrets versions access latest \
+  --secret=nclav-api-token --project=my-platform-project)
 ```
 
 ---

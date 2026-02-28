@@ -1,0 +1,39 @@
+# bootstrap/gcp/terraform.tfvars.example
+# Copy to terraform.tfvars and fill in your values:
+#   cp terraform.tfvars.example terraform.tfvars
+
+# ── Required ──────────────────────────────────────────────────────────────────
+
+# GCP project to deploy nclav into (the platform project, not an enclave project).
+# Create one if needed:
+#   gcloud projects create myorg-nclav --organization=ORGANIZATION_ID
+#   gcloud billing projects link myorg-nclav --billing-account=XXXXXX-YYYYYY-ZZZZZZ
+project_id = "myorg-nclav"
+
+# Resource parent for new enclave projects.
+# Use your folder ID or organization ID:
+#   gcloud organizations list
+#   gcloud resource-manager folders list --organization=ORGANIZATION_ID
+gcp_parent = "folders/123456789"
+
+# Billing account to attach to every new enclave project.
+# Find yours: gcloud billing accounts list
+# Use the ID without the "billingAccounts/" prefix.
+billing_account = "XXXXXX-YYYYYY-ZZZZZZ"
+
+# ── Optional ──────────────────────────────────────────────────────────────────
+
+# GCP region for Cloud Run, Cloud SQL, and Artifact Registry.
+# region = "us-central1"
+
+# Prefix prepended to every GCP project ID derived from an enclave ID.
+# Avoids global project ID collisions: "myorg" + "product-a-dev" → "myorg-product-a-dev"
+# gcp_project_prefix = "myorg"
+
+# Cloud SQL machine tier. db-f1-micro is the cheapest option.
+# cloud_sql_tier = "db-f1-micro"
+
+# IAM members granted direct invoker access to the Cloud Run service.
+# Leave empty to use gcloud proxy (default). Set to your email for direct access
+# if your org permits allUsers, or to a CI service account for automated use.
+# allowed_invokers = ["user:you@example.com"]
