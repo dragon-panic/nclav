@@ -82,6 +82,57 @@ pub enum Command {
         #[arg(long, env = "NCLAV_GCP_PROJECT_PREFIX")]
         gcp_project_prefix: Option<String>,
 
+        // ── Azure flags ───────────────────────────────────────────────────────
+
+        /// Azure tenant ID (GUID). Required when azure is the default or an additional driver.
+        /// Env: NCLAV_AZURE_TENANT_ID
+        #[arg(long, env = "NCLAV_AZURE_TENANT_ID")]
+        azure_tenant_id: Option<String>,
+
+        /// Azure management group ID where new subscription enclaves will be placed.
+        /// Required when azure is the default or an additional driver.
+        /// Env: NCLAV_AZURE_MANAGEMENT_GROUP_ID
+        #[arg(long, env = "NCLAV_AZURE_MANAGEMENT_GROUP_ID")]
+        azure_management_group_id: Option<String>,
+
+        /// MCA billing account name (long GUID form).
+        /// Required when azure is the default or an additional driver.
+        /// Env: NCLAV_AZURE_BILLING_ACCOUNT_NAME
+        #[arg(long, env = "NCLAV_AZURE_BILLING_ACCOUNT_NAME")]
+        azure_billing_account_name: Option<String>,
+
+        /// MCA billing profile name.
+        /// Required when azure is the default or an additional driver.
+        /// Env: NCLAV_AZURE_BILLING_PROFILE_NAME
+        #[arg(long, env = "NCLAV_AZURE_BILLING_PROFILE_NAME")]
+        azure_billing_profile_name: Option<String>,
+
+        /// MCA invoice section name.
+        /// Required when azure is the default or an additional driver.
+        /// Env: NCLAV_AZURE_INVOICE_SECTION_NAME
+        #[arg(long, env = "NCLAV_AZURE_INVOICE_SECTION_NAME")]
+        azure_invoice_section_name: Option<String>,
+
+        /// Default Azure region for new resources (e.g. "eastus2").
+        /// Env: NCLAV_AZURE_DEFAULT_LOCATION
+        #[arg(long, env = "NCLAV_AZURE_DEFAULT_LOCATION", default_value = "eastus2")]
+        azure_default_location: String,
+
+        /// Optional prefix prepended to every subscription alias.
+        /// Env: NCLAV_AZURE_SUBSCRIPTION_PREFIX
+        #[arg(long, env = "NCLAV_AZURE_SUBSCRIPTION_PREFIX")]
+        azure_subscription_prefix: Option<String>,
+
+        /// Azure service principal client ID (optional; falls back to managed identity / Azure CLI).
+        /// Env: NCLAV_AZURE_CLIENT_ID
+        #[arg(long, env = "NCLAV_AZURE_CLIENT_ID")]
+        azure_client_id: Option<String>,
+
+        /// Azure service principal client secret (optional; falls back to managed identity / Azure CLI).
+        /// Env: NCLAV_AZURE_CLIENT_SECRET
+        #[arg(long, env = "NCLAV_AZURE_CLIENT_SECRET")]
+        azure_client_secret: Option<String>,
+
         /// TCP port to bind the HTTP API server on. Env: NCLAV_PORT
         #[arg(long, env = "NCLAV_PORT", default_value = "8080")]
         port: u16,

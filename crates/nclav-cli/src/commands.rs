@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use nclav_domain::CloudTarget;
-use nclav_driver::{DriverRegistry, GcpDriver, GcpDriverConfig, LocalDriver};
+use nclav_driver::{AzureDriver, AzureDriverConfig, DriverRegistry, GcpDriver, GcpDriverConfig, LocalDriver};
 use nclav_store::{EnclaveState, InMemoryStore, PostgresStore, RedbStore, StateStore};
 use uuid::Uuid;
 
@@ -25,6 +25,15 @@ pub async fn serve(
     mut gcp_billing_account: Option<String>,
     gcp_default_region: String,
     gcp_project_prefix: Option<String>,
+    mut azure_tenant_id: Option<String>,
+    mut azure_management_group_id: Option<String>,
+    mut azure_billing_account_name: Option<String>,
+    mut azure_billing_profile_name: Option<String>,
+    mut azure_invoice_section_name: Option<String>,
+    azure_default_location: String,
+    azure_subscription_prefix: Option<String>,
+    azure_client_id: Option<String>,
+    azure_client_secret: Option<String>,
     port: u16,
     bind: String,
 ) -> Result<()> {
@@ -139,7 +148,32 @@ pub async fn serve(
                 registry.register(CloudTarget::Gcp, Arc::new(driver));
             }
             CloudArg::Azure => {
-                anyhow::bail!("Azure driver not yet implemented");
+                let tenant_id = azure_tenant_id.take()
+                    .context("--azure-tenant-id (or NCLAV_AZURE_TENANT_ID) is required for the azure driver")?;
+                let tenant_id_display = tenant_id.clone();
+                let management_group_id = azure_management_group_id.take()
+                    .context("--azure-management-group-id (or NCLAV_AZURE_MANAGEMENT_GROUP_ID) is required for the azure driver")?;
+                let billing_account_name = azure_billing_account_name.take()
+                    .context("--azure-billing-account-name (or NCLAV_AZURE_BILLING_ACCOUNT_NAME) is required for the azure driver")?;
+                let billing_profile_name = azure_billing_profile_name.take()
+                    .context("--azure-billing-profile-name (or NCLAV_AZURE_BILLING_PROFILE_NAME) is required for the azure driver")?;
+                let invoice_section_name = azure_invoice_section_name.take()
+                    .context("--azure-invoice-section-name (or NCLAV_AZURE_INVOICE_SECTION_NAME) is required for the azure driver")?;
+                let config = AzureDriverConfig {
+                    tenant_id,
+                    management_group_id,
+                    billing_account_name,
+                    billing_profile_name,
+                    invoice_section_name,
+                    default_location: azure_default_location.clone(),
+                    subscription_prefix: azure_subscription_prefix.clone(),
+                    client_id: azure_client_id.clone(),
+                    client_secret: azure_client_secret.clone(),
+                };
+                let driver = AzureDriver::new(config)
+                    .context("Failed to initialise Azure driver")?;
+                println!("Initialised Azure driver (tenant: {})", tenant_id_display);
+                registry.register(CloudTarget::Azure, Arc::new(driver));
             }
         }
     }

@@ -1,3 +1,4 @@
+pub mod azure;
 pub mod driver;
 pub mod error;
 pub mod gcp;
@@ -5,6 +6,7 @@ pub mod local;
 pub mod registry;
 pub mod terraform;
 
+pub use azure::{AzureDriver, AzureDriverConfig};
 pub use driver::{Driver, ObservedState, OrphanedResource, ProvisionResult};
 pub use error::DriverError;
 pub use gcp::{GcpDriver, GcpDriverConfig};
