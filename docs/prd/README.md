@@ -6,7 +6,8 @@
 | [ISOLATION.md](ISOLATION.md) | Service catalog, isolated vs. hub-spoke topology, and the wrap pattern for non-catalog services |
 | [PARTITIONS.md](PARTITIONS.md) | Terraform/OpenTofu backends, input templating, workspace layout, state backend, and IaC run logs |
 | [GCP.md](GCP.md) | GCP driver reference: concept → primitive mapping, API call sequences, PSC wiring, IAM, and idempotency |
-| [BOOTSTRAP.md](BOOTSTRAP.md) | Platform bootstrap options (local vs. Cloud Run), state store choices, and the driver registry |
+| [AZURE.md](AZURE.md) | Azure driver reference: concept → primitive mapping, API call sequences, Private Link wiring, RBAC, and idempotency |
+| [BOOTSTRAP.md](BOOTSTRAP.md) | Platform bootstrap options (local vs. Cloud Run vs. Container Apps), state store choices, and the driver registry |
 
 ---
 
@@ -200,7 +201,7 @@ Reconciler (domain)
 DriverInterface
       ├── LocalDriver     (v1 — no credentials, in-process state)
       ├── GcpDriver       (v1 — Cloud Run, Pub/Sub, VPC, IAM)
-      ├── AzureDriver     (future)
+      ├── AzureDriver     (v1 — Container Apps, Private Link, Subscriptions, RBAC)
       └── AwsDriver       (future)
 ```
 
@@ -256,7 +257,7 @@ It runs the full reconcile loop — YAML parsing, graph validation, import/expor
 
 If the YAML requires changes to run locally vs on Azure, the abstraction has leaked. Local driver parity is a hard requirement.
 
-See [GCP.md](GCP.md) for the GCP driver reference — provisioning model, PSC wiring, IAM, Cloud Run, Cloud SQL, and all design decisions specific to the GCP target.
+See [GCP.md](GCP.md) for the GCP driver reference and [AZURE.md](AZURE.md) for the Azure driver reference.
 
 ---
 
@@ -532,7 +533,8 @@ Azure simultaneously. Enclaves omitting `cloud:` inherit the API's configured
 default.
 
 Local dev: `nclav serve --cloud local` starts the API as a local process.
-Hosted: the `bootstrap/gcp/` Terraform module deploys nclav to Cloud Run.
+Hosted on GCP: the `bootstrap/gcp/` Terraform module deploys nclav to Cloud Run.
+Hosted on Azure: the `bootstrap/azure/` Terraform module deploys nclav to Container Apps.
 
 See [BOOTSTRAP.md](BOOTSTRAP.md) for the full bootstrap reference.
 
@@ -550,7 +552,7 @@ nclav destroy <id>           # Tear down an enclave and all its infrastructure
 nclav destroy <id> --partition <part>  # Tear down a single partition
 nclav iac runs <enc> <part>  # List IaC run history for a partition
 nclav iac logs <enc> <part>  # Print logs from the latest (or a specific) IaC run
-nclav orphans                # Scan for GCP resources from destroyed partitions
+nclav orphans                # Scan for cloud resources from destroyed partitions
 ```
 
 ---
@@ -560,13 +562,13 @@ nclav orphans                # Scan for GCP resources from destroyed partitions
 - **Language:** Rust
 - **Database:** Postgres
 - **IaC:** Terraform
-- **Clouds (v1):** Local, GCP
+- **Clouds (v1):** Local, GCP, Azure
 
 ---
 
 ## Non-Goals (v1)
 
-- Azure and AWS drivers (abstraction layer is built; drivers are future)
+- AWS driver (abstraction layer is built; driver is future)
 - Org-level policy enforcement and compliance controls
 - Template and mixin system
 - Intra-enclave NSG enforcement (declarations generated, compliance not verified)

@@ -1,0 +1,49 @@
+# bootstrap/azure/terraform.tfvars.example
+# Copy to terraform.tfvars and fill in your values:
+#   cp terraform.tfvars.example terraform.tfvars
+
+# ── Required ──────────────────────────────────────────────────────────────────
+
+# Azure subscription ID for the nclav platform (not an enclave subscription).
+# Create a dedicated subscription or use an existing ops subscription:
+#   az account show --query id -o tsv
+platform_subscription_id = "00000000-0000-0000-0000-000000000000"
+
+# Azure tenant ID.
+#   az account show --query tenantId -o tsv
+azure_tenant_id = "00000000-0000-0000-0000-000000000000"
+
+# Management group ID where new subscription enclaves will be placed.
+#   az account management-group list --query "[].{name:name}" -o table
+azure_management_group_id = "my-management-group"
+
+# MCA billing account name (long GUID form with colon separator).
+#   az billing account list --query "[].name" -o table
+azure_billing_account_name = "00000000-0000-0000-0000-000000000000:00000000-0000-0000-0000-000000000000_2019-05-31"
+
+# MCA billing profile name.
+#   az billing profile list --account-name <billing_account_name> --query "[].name" -o table
+azure_billing_profile_name = "XXXX-XXXX-XXX-XXX"
+
+# MCA invoice section name.
+#   az billing invoice section list --account-name <billing_account_name> --profile-name <profile_name> --query "[].name" -o table
+azure_invoice_section_name = "XXXX-XXXX-XXX-XXX-XXX"
+
+# Globally unique ACR name (alphanumeric only, 5-50 chars).
+# This becomes the push target: {acr_name}.azurecr.io/nclav
+acr_name = "myorgnclav"
+
+# Globally unique Key Vault name (3-24 chars, alphanumeric + hyphens).
+key_vault_name = "myorg-nclav-kv"
+
+# ── Optional ──────────────────────────────────────────────────────────────────
+
+# Azure region for Container App, PostgreSQL, and Key Vault.
+# location = "eastus2"
+
+# Prefix prepended to every subscription alias derived from an enclave ID.
+# Avoids alias collisions: "myorg" + "product-a-dev" → "myorg-product-a-dev"
+# azure_subscription_prefix = "myorg"
+
+# PostgreSQL Flexible Server SKU. B_Standard_B1ms is the cheapest burstable option.
+# postgresql_sku = "B_Standard_B1ms"

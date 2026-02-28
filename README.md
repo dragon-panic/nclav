@@ -170,6 +170,120 @@ export NCLAV_TOKEN=$(gcloud secrets versions access latest \
 
 ---
 
+## Hosted deployment (Azure)
+
+For a persistent, cloud-hosted nclav API run the Terraform bootstrap in
+`bootstrap/azure/`. This provisions a Container App backed by PostgreSQL
+Flexible Server — no local process required after setup.
+
+**What it creates:**
+
+| Resource | Name | Purpose |
+|---|---|---|
+| User-Assigned Identity | `nclav-server` | Identity for the Container App |
+| Container Registry | `{acr_name}` | Hosts the nclav container image |
+| Key Vault | `{key_vault_name}` | Bearer token for CLI authentication |
+| PostgreSQL Flexible Server | `nclav-state-{suffix}` | Persistent state store |
+| Container App | `nclav-api` | The nclav API server |
+
+### Prerequisites
+
+- An Azure subscription for the nclav platform (dedicated ops subscription)
+- A management group under which subscription enclaves will be created
+- An MCA billing account with a billing profile and invoice section
+- Azure CLI installed and authenticated (`az login`)
+- Terraform or OpenTofu installed locally
+- Docker installed (to push the nclav image to ACR)
+- Required resource providers registered:
+  ```bash
+  az provider register --namespace Microsoft.App
+  az provider register --namespace Microsoft.DBforPostgreSQL
+  az provider register --namespace Microsoft.KeyVault
+  ```
+
+### Step 1 — Configure and deploy
+
+Copy the vars template and fill in your values:
+
+```bash
+cp bootstrap/azure/terraform.tfvars.example bootstrap/azure/terraform.tfvars
+# edit bootstrap/azure/terraform.tfvars
+```
+
+Then run the full bootstrap in one command:
+
+```bash
+make bootstrap-azure AZURE_ACR=myorgnclav
+```
+
+This creates the ACR repo, builds and pushes the container image, then deploys
+the PostgreSQL server, Key Vault, and Container App. Terraform will prompt for
+plan approval twice.
+
+**Doing it manually** (if you prefer to see each step):
+
+```bash
+cd bootstrap/azure
+terraform init
+# Phase 1: ACR repo (image must exist before Container App starts)
+terraform apply -target=azurerm_resource_group.nclav \
+                -target=azurerm_container_registry.nclav
+# Build and push the image
+cd ../..
+make push-acr AZURE_ACR=myorgnclav
+# Phase 2: everything else
+cd bootstrap/azure
+terraform apply
+```
+
+### Step 2 — Grant management group IAM
+
+Terraform cannot grant management group or billing roles without admin
+credentials. After `terraform apply`, print the required `az` commands:
+
+```bash
+cd bootstrap/azure && terraform output -raw iam_setup_commands
+```
+
+These grant `nclav-server` the roles it needs (`Owner` on the management group
+and `Invoice Section Contributor` on the MCA invoice section). **If you are the
+Azure admin, run them yourself.** Otherwise send them to whoever manages your
+Azure tenant. These are one-time grants and do not need to be repeated per enclave.
+
+### Step 3 — Connect the CLI
+
+The Container App exposes a public HTTPS endpoint secured by the nclav Bearer
+token. One command sets the required env vars:
+
+```bash
+eval $(make connect-azure)
+nclav status
+nclav apply enclaves/
+```
+
+`make connect-azure` fetches the app URL and API token from Terraform outputs
+and Key Vault. Add the exported vars to your shell profile:
+
+```bash
+export NCLAV_URL=https://nclav-api.{region}.azurecontainerapps.io
+export NCLAV_TOKEN=$(az keyvault secret show \
+  --vault-name myorg-nclav-kv --name nclav-api-token --query value -o tsv)
+```
+
+### Token rotation
+
+```bash
+cd bootstrap/azure
+
+# Generate a new token (updates Key Vault secret and ACA secret)
+terraform apply -replace=random_bytes.api_token
+
+# Fetch the new token
+eval $(make connect-azure)
+```
+
+---
+
 ## CLI reference
 
 ```
@@ -193,6 +307,14 @@ nclav serve --cloud local --ephemeral
 nclav serve --cloud gcp \
   --gcp-parent folders/123456789 \
   --gcp-billing-account billingAccounts/XXXX-YYYY-ZZZZ
+
+# Azure as default cloud for enclaves
+nclav serve --cloud azure \
+  --azure-tenant-id $TENANT_ID \
+  --azure-management-group-id $MG_ID \
+  --azure-billing-account-name $BILLING_ACCOUNT \
+  --azure-billing-profile-name $BILLING_PROFILE \
+  --azure-invoice-section-name $INVOICE_SECTION
 ```
 
 Every driver must be explicitly requested — `--cloud` registers the default driver, `--enable-cloud` adds more. Binds `http://127.0.0.1:8080` by default; use `--bind 0.0.0.0` / `NCLAV_BIND` to expose on all interfaces, `--port` / `NCLAV_PORT` to change the port.
@@ -216,6 +338,24 @@ gcloud auth application-default login \
 ```
 
 For a persistent, cloud-hosted deployment see [Hosted deployment (GCP)](#hosted-deployment-gcp) above.
+
+**Azure flags / env vars:**
+
+| Flag | Env var | Required | Description |
+|---|---|:---:|---|
+| `--azure-tenant-id` | `NCLAV_AZURE_TENANT_ID` | yes | Azure tenant ID |
+| `--azure-management-group-id` | `NCLAV_AZURE_MANAGEMENT_GROUP_ID` | yes | Management group for enclave subscriptions |
+| `--azure-billing-account-name` | `NCLAV_AZURE_BILLING_ACCOUNT_NAME` | yes | MCA billing account name |
+| `--azure-billing-profile-name` | `NCLAV_AZURE_BILLING_PROFILE_NAME` | yes | MCA billing profile name |
+| `--azure-invoice-section-name` | `NCLAV_AZURE_INVOICE_SECTION_NAME` | yes | MCA invoice section name |
+| `--azure-default-location` | `NCLAV_AZURE_DEFAULT_LOCATION` | no | Default Azure region (default: `eastus2`) |
+| `--azure-subscription-prefix` | `NCLAV_AZURE_SUBSCRIPTION_PREFIX` | no | Prefix for subscription aliases: `myorg` → `myorg-product-a-dev` |
+| `--azure-client-id` | `NCLAV_AZURE_CLIENT_ID` | no | SP client ID (falls back to Managed Identity / Azure CLI) |
+| `--azure-client-secret` | `NCLAV_AZURE_CLIENT_SECRET` | no | SP client secret |
+
+Azure auth is selected automatically: SP credentials → IMDS (Managed Identity) → Azure CLI fallback. No explicit credential flag is needed when running on Azure (e.g. the Container App bootstrap uses the managed identity).
+
+For a persistent, cloud-hosted deployment see [Hosted deployment (Azure)](#hosted-deployment-azure) above.
 
 ### `nclav diff <enclaves-dir>`
 
@@ -274,8 +414,9 @@ This is the imperative escape hatch. The declarative equivalent is to remove the
 
 ### `nclav orphans [--enclave <id>]`
 
-Scan GCP enclave projects for resources labeled `nclav-managed=true` whose
-`nclav-partition` label does not match any active partition in nclav state.
+Scan enclave cloud projects for resources tagged `nclav-managed=true` whose
+`nclav-partition` tag/label does not match any active partition in nclav state.
+Queries Cloud Asset Inventory (GCP) or Azure Resource Graph (Azure).
 Useful after a failed destroy to surface what was left behind.
 
 Exit 0 if no orphans found; exit 1 if any are reported (CI-friendly).
