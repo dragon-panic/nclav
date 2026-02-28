@@ -166,7 +166,10 @@ resource "google_secret_manager_secret_iam_member" "nclav_token_access" {
 # ── Database URL secret ───────────────────────────────────────────────────────
 
 locals {
-  db_url          = "postgres://nclav:${random_password.db_password.result}@/nclav?host=/cloudsql/${google_sql_database_instance.nclav.connection_name}"
+  # sqlx requires a non-empty host in the URL authority; "localhost" is a
+  # placeholder — the "host=" query parameter overrides it with the Cloud SQL
+  # Auth Proxy Unix socket path, so no TCP connection to localhost is made.
+  db_url          = "postgres://nclav:${random_password.db_password.result}@localhost/nclav?host=/cloudsql/${google_sql_database_instance.nclav.connection_name}"
   gcp_prefix_flag = var.gcp_project_prefix != "" ? ["--gcp-project-prefix", var.gcp_project_prefix] : []
 
   # Effective container image: use the caller-supplied image if given, otherwise
