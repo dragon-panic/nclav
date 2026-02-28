@@ -39,9 +39,20 @@ resource "google_project_service" "apis" {
     "cloudresourcemanager.googleapis.com",
     "sqladmin.googleapis.com",
     "servicenetworking.googleapis.com",
+    "artifactregistry.googleapis.com",
   ])
   service            = each.key
   disable_on_destroy = false
+}
+
+# ── Artifact Registry ─────────────────────────────────────────────────────────
+
+resource "google_artifact_registry_repository" "nclav" {
+  location      = var.region
+  repository_id = "nclav"
+  format        = "DOCKER"
+  description   = "nclav container images"
+  depends_on    = [google_project_service.apis]
 }
 
 # ── Service account for the nclav server ──────────────────────────────────────
@@ -57,6 +68,15 @@ resource "google_project_iam_member" "nclav_editor" {
   project = var.project_id
   role    = "roles/editor"
   member  = "serviceAccount:${google_service_account.nclav.email}"
+}
+
+# Pull images from the nclav Artifact Registry repository
+resource "google_artifact_registry_repository_iam_member" "nclav_ar_reader" {
+  project    = var.project_id
+  location   = var.region
+  repository = google_artifact_registry_repository.nclav.repository_id
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.nclav.email}"
 }
 
 # Cloud SQL client — allows the Cloud Run service to connect via socket
@@ -149,6 +169,11 @@ locals {
   db_url          = "postgres://nclav:${random_password.db_password.result}@/nclav?host=/cloudsql/${google_sql_database_instance.nclav.connection_name}"
   gcp_prefix_flag = var.gcp_project_prefix != "" ? ["--gcp-project-prefix", var.gcp_project_prefix] : []
 
+  # Effective container image: use the caller-supplied image if given, otherwise
+  # default to the Artifact Registry repo created in this module.
+  ar_image       = "${var.region}-docker.pkg.dev/${var.project_id}/nclav/nclav:latest"
+  nclav_image    = var.nclav_image != "" ? var.nclav_image : local.ar_image
+
   # Detect whether gcp_parent is a folder or an organization so we can emit
   # the correct gcloud command family in the iam_setup_commands output.
   _parent_is_folder   = startswith(var.gcp_parent, "folders/")
@@ -194,7 +219,7 @@ resource "google_cloud_run_v2_service" "nclav" {
     }
 
     containers {
-      image = var.nclav_image
+      image = local.nclav_image
 
       args = concat(
         [

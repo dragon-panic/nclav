@@ -1,3 +1,18 @@
+output "image_push_command" {
+  description = "Commands to build and push the nclav image to the Artifact Registry repo created by this module."
+  value       = <<-EOT
+    # Authenticate Docker to Artifact Registry (once per session):
+    gcloud auth configure-docker ${var.region}-docker.pkg.dev --quiet
+
+    # Build and push from the repo root:
+    make push-ar GCP_PROJECT=${var.project_id} AR_REGION=${var.region}
+
+    # Or manually:
+    docker build --platform linux/amd64 -t ${local.ar_image} .
+    docker push ${local.ar_image}
+  EOT
+}
+
 output "api_url" {
   description = "The Cloud Run service URL for the nclav API."
   value       = google_cloud_run_v2_service.nclav.uri

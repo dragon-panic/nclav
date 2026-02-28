@@ -10,8 +10,9 @@ variable "region" {
 }
 
 variable "nclav_image" {
-  description = "Container image for the nclav API server, e.g. 'ghcr.io/your-org/nclav:latest'."
+  description = "Container image for the nclav API server. Defaults to the Artifact Registry repo created by this module ({region}-docker.pkg.dev/{project}/nclav/nclav:latest). Override to use a custom image."
   type        = string
+  default     = ""
 }
 
 variable "gcp_parent" {
