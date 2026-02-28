@@ -289,13 +289,21 @@ resource "google_cloud_run_v2_service" "nclav" {
   ]
 }
 
-# Allow unauthenticated invocations so the nclav CLI (running locally) can
-# reach the Cloud Run service.  Application-level authentication is handled by
-# nclav's own Bearer token middleware — GCP IAM auth is not used here.
-resource "google_cloud_run_v2_service_iam_member" "public_invoker" {
+# Grant Cloud Run invoker to each member in var.allowed_invokers.
+#
+# The default "allUsers" makes the API publicly reachable (application-level
+# auth is handled by nclav's own Bearer token middleware).  If your GCP org
+# enforces iam.allowedPolicyMemberTypes (Domain Restricted Sharing), allUsers
+# will be rejected — set allowed_invokers to your own account instead:
+#
+#   allowed_invokers = ["user:you@example.com"]
+#
+# You can still use `gcloud run services proxy` as a zero-config alternative.
+resource "google_cloud_run_v2_service_iam_member" "invokers" {
+  for_each = toset(var.allowed_invokers)
   project  = var.project_id
   location = google_cloud_run_v2_service.nclav.location
   name     = google_cloud_run_v2_service.nclav.name
   role     = "roles/run.invoker"
-  member   = "allUsers"
+  member   = each.value
 }

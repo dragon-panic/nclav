@@ -90,12 +90,26 @@ terraform output -raw token_fetch_command | bash
 
 ## Connecting the CLI
 
+The Cloud Run service is private by default. Use `gcloud run services proxy`
+to open an authenticated local tunnel:
+
 ```sh
-export NCLAV_REMOTE=$(terraform output -raw api_url)
+# Terminal 1 — keep this running:
+$(terraform output -raw proxy_command)
+
+# Terminal 2 — use the CLI normally via localhost:
+export NCLAV_URL=http://localhost:8080
 export NCLAV_TOKEN=$(terraform output -raw token_fetch_command | bash)
 
 nclav status
 nclav apply enclaves/
+```
+
+To grant direct access to specific users instead of using the proxy, add to
+`terraform.tfvars`:
+
+```hcl
+allowed_invokers = ["user:you@example.com", "serviceAccount:ci@project.iam.gserviceaccount.com"]
 ```
 
 ## IAM setup (folder/org admin required)

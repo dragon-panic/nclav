@@ -36,3 +36,9 @@ variable "cloud_sql_tier" {
   type        = string
   default     = "db-f1-micro"
 }
+
+variable "allowed_invokers" {
+  description = "IAM members granted roles/run.invoker on the Cloud Run service. Defaults to empty (private — access via gcloud run services proxy). Set to [\"user:you@example.com\"] or [\"allUsers\"] to allow direct access."
+  type        = list(string)
+  default     = []
+}

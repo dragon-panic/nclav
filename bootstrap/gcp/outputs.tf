@@ -13,6 +13,11 @@ output "image_push_command" {
   EOT
 }
 
+output "proxy_command" {
+  description = "Run this in a background terminal to reach the private Cloud Run service locally."
+  value       = "gcloud run services proxy nclav-api --project=${var.project_id} --region=${var.region} --port=8080"
+}
+
 output "api_url" {
   description = "The Cloud Run service URL for the nclav API."
   value       = google_cloud_run_v2_service.nclav.uri
