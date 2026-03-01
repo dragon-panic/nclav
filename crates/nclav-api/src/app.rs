@@ -245,4 +245,257 @@ mod tests {
             .unwrap();
         assert!(resp.status().is_client_error() || resp.status().is_server_error());
     }
+
+    // ── Terraform HTTP state backend ──────────────────────────────────────────
+    //
+    // Verifies that the /terraform/state/:enc/:part routes implement the
+    // Terraform HTTP backend protocol correctly:
+    //   GET  → 204 No Content (no state yet) or 200 OK (with blob)
+    //   POST → 200 OK (store blob)
+    //   DEL  → 200 OK (clear blob)
+    //   POST /lock  → 200 OK (acquired) or 409 Conflict (already locked)
+    //   DEL  /lock  → 200 OK (released)
+
+    const STATE_URL: &str = "/terraform/state/enc/part";
+    const LOCK_URL:  &str = "/terraform/state/enc/part/lock";
+
+    fn tf_state_blob() -> serde_json::Value {
+        serde_json::json!({ "version": 4, "serial": 1, "lineage": "abc" })
+    }
+
+    fn lock_info(id: &str) -> serde_json::Value {
+        serde_json::json!({ "ID": id, "Operation": "OperationTypeApply", "Who": "tester" })
+    }
+
+    #[tokio::test]
+    async fn tf_state_get_returns_no_content_when_empty() {
+        let app = test_app();
+        let resp = app
+            .oneshot(authed(Request::builder().uri(STATE_URL)).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn tf_state_post_stores_blob_and_get_retrieves_it() {
+        let app = test_app();
+        let blob = tf_state_blob().to_string();
+
+        // POST to store.
+        let post_resp = app
+            .clone()
+            .oneshot(
+                authed(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(STATE_URL)
+                        .header("content-type", "application/json"),
+                )
+                .body(Body::from(blob.clone()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_resp.status(), StatusCode::OK);
+
+        // GET to retrieve.
+        let get_resp = app
+            .oneshot(authed(Request::builder().uri(STATE_URL)).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body_bytes, blob.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn tf_state_delete_clears_stored_state() {
+        let app = test_app();
+
+        // Store something first.
+        app.clone()
+            .oneshot(
+                authed(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(STATE_URL)
+                        .header("content-type", "application/json"),
+                )
+                .body(Body::from(tf_state_blob().to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Delete it.
+        let del_resp = app
+            .clone()
+            .oneshot(
+                authed(Request::builder().method(Method::DELETE).uri(STATE_URL))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_resp.status(), StatusCode::OK);
+
+        // GET should now be 204.
+        let get_resp = app
+            .oneshot(authed(Request::builder().uri(STATE_URL)).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn tf_state_lock_returns_200_on_first_acquire() {
+        let app = test_app();
+        let info = lock_info("lock-id-1").to_string();
+
+        let resp = app
+            .oneshot(
+                authed(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(LOCK_URL)
+                        .header("content-type", "application/json"),
+                )
+                .body(Body::from(info))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tf_state_lock_conflict_returns_409_with_holder_info() {
+        let app = test_app();
+        let info = lock_info("lock-id-1").to_string();
+
+        // First acquire — should succeed.
+        app.clone()
+            .oneshot(
+                authed(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(LOCK_URL)
+                        .header("content-type", "application/json"),
+                )
+                .body(Body::from(info.clone()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Second acquire — should conflict.
+        let conflict = app
+            .oneshot(
+                authed(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(LOCK_URL)
+                        .header("content-type", "application/json"),
+                )
+                .body(Body::from(lock_info("lock-id-2").to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+        // Body should contain the existing lock holder info so the operator
+        // knows who holds the lock (this is what Terraform shows on conflict).
+        let body_bytes = axum::body::to_bytes(conflict.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["ID"], "lock-id-1");
+    }
+
+    #[tokio::test]
+    async fn tf_state_unlock_releases_lock_and_allows_reacquire() {
+        let app = test_app();
+        let info = lock_info("lock-id-1").to_string();
+
+        // Acquire.
+        app.clone()
+            .oneshot(
+                authed(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(LOCK_URL)
+                        .header("content-type", "application/json"),
+                )
+                .body(Body::from(info.clone()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Release via DELETE /lock with lock ID in body.
+        let unlock_body = serde_json::json!({ "ID": "lock-id-1" }).to_string();
+        let unlock_resp = app
+            .clone()
+            .oneshot(
+                authed(Request::builder().method(Method::DELETE).uri(LOCK_URL))
+                    .body(Body::from(unlock_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlock_resp.status(), StatusCode::OK);
+
+        // Re-acquire should now succeed (no 409).
+        let relock = app
+            .oneshot(
+                authed(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(LOCK_URL)
+                        .header("content-type", "application/json"),
+                )
+                .body(Body::from(lock_info("lock-id-2").to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(relock.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tf_state_independent_keys_do_not_share_state() {
+        let app = test_app();
+        let blob = tf_state_blob().to_string();
+
+        // POST to enc/part.
+        app.clone()
+            .oneshot(
+                authed(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(STATE_URL)
+                        .header("content-type", "application/json"),
+                )
+                .body(Body::from(blob.clone()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // A different partition key should still be empty.
+        let other_resp = app
+            .oneshot(
+                authed(Request::builder().uri("/terraform/state/enc/other-part"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other_resp.status(), StatusCode::NO_CONTENT);
+    }
 }

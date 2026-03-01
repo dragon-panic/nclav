@@ -122,6 +122,7 @@ pub async fn delete_enclave(
         auth_token: state.auth_token.clone(),
         store: state.store.clone(),
         test_mode: false,
+        workspace_root: None,
     };
 
     let mut errors: Vec<String> = Vec::new();
@@ -199,10 +200,11 @@ pub async fn delete_partition(
     let mut errors: Vec<String> = Vec::new();
 
     let tf_backend = TerraformBackend {
-        api_base:   (*state.api_base).clone(),
-        auth_token: state.auth_token.clone(),
-        store:      state.store.clone(),
-        test_mode:  false,
+        api_base:       (*state.api_base).clone(),
+        auth_token:     state.auth_token.clone(),
+        store:          state.store.clone(),
+        test_mode:      false,
+        workspace_root: None,
     };
     let auth_env = existing
         .enclave_handle

@@ -12,6 +12,7 @@ pub enum StoreError {
     Internal(String),
 
     /// Returned when a TF state lock is already held by another holder.
-    #[error("state lock conflict: already locked by {holder}")]
-    LockConflict { holder: String },
+    /// `holder` is the full lock-info JSON as stored (Terraform displays it on conflict).
+    #[error("state lock conflict")]
+    LockConflict { holder: serde_json::Value },
 }

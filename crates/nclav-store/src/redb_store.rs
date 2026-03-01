@@ -223,8 +223,7 @@ impl StateStore for RedbStore {
                 .map(|g| g.value().to_vec());
             if let Some(bytes) = existing_bytes {
                 let existing: serde_json::Value = serde_json::from_slice(&bytes)?;
-                let holder = existing["ID"].as_str().unwrap_or("unknown").to_string();
-                return Err(StoreError::LockConflict { holder });
+                return Err(StoreError::LockConflict { holder: existing });
             }
             let bytes = serde_json::to_vec(&lock_info)?;
             table.insert(key, bytes.as_slice()).map_err(|e| StoreError::Internal(e.to_string()))?;

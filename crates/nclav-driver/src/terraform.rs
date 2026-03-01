@@ -35,6 +35,10 @@ pub struct TerraformBackend {
     /// When true, skip all subprocess invocations and return stubbed outputs.
     /// Used in tests to avoid requiring a terraform binary.
     pub test_mode: bool,
+    /// Override the workspace root directory. `None` uses `~/.nclav`.
+    /// Set to a `TempDir` path in tests to avoid writing to the real home directory
+    /// and to ensure parallel tests do not stomp each other's workspaces.
+    pub workspace_root: Option<PathBuf>,
 }
 
 impl TerraformBackend {
@@ -307,12 +311,11 @@ impl TerraformBackend {
     // ── Workspace helpers ─────────────────────────────────────────────────────
 
     fn workspace_dir(&self, enclave_id: &str, partition_id: &str) -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home)
-            .join(".nclav")
-            .join("workspaces")
-            .join(enclave_id)
-            .join(partition_id)
+        let base = self.workspace_root.clone().unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".nclav")
+        });
+        base.join("workspaces").join(enclave_id).join(partition_id)
     }
 
     /// Symlink all `.tf` files from `source_dir` into `workspace`.
@@ -684,4 +687,368 @@ fn write_outputs_tf(workspace: &Path, declared_outputs: &[String]) -> Result<(),
     std::fs::write(workspace.join("nclav_outputs.tf"), hcl)
         .map_err(|e| DriverError::Internal(format!("write nclav_outputs.tf: {}", e)))?;
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nclav_store::InMemoryStore;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn minimal_backend(workspace_root: &TempDir) -> TerraformBackend {
+        TerraformBackend {
+            api_base:       "http://localhost:8080".into(),
+            auth_token:     Arc::new("tok".into()),
+            store:          Arc::new(InMemoryStore::new()),
+            test_mode:      false,
+            workspace_root: Some(workspace_root.path().to_path_buf()),
+        }
+    }
+
+    // ── tfvar() ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tfvar_basic_assignment() {
+        assert_eq!(tfvar("key", "value"), "key = \"value\"\n");
+    }
+
+    #[test]
+    fn tfvar_escapes_backslash() {
+        // A single backslash in the value must become \\ in HCL.
+        assert_eq!(tfvar("k", "a\\b"), "k = \"a\\\\b\"\n");
+    }
+
+    #[test]
+    fn tfvar_escapes_double_quote() {
+        // A double-quote in the value must be escaped to \" in HCL.
+        assert_eq!(tfvar("k", "say \"hi\""), "k = \"say \\\"hi\\\"\"\n");
+    }
+
+    #[test]
+    fn tfvar_empty_value() {
+        assert_eq!(tfvar("k", ""), "k = \"\"\n");
+    }
+
+    // ── write_tfvars ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn write_tfvars_preamble_and_sorted_inputs() {
+        let dir = TempDir::new().unwrap();
+        let inputs: HashMap<String, String> = [
+            ("zz_var".to_string(), "last".to_string()),
+            ("aa_var".to_string(), "first".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        write_tfvars(dir.path(), "my-enc", "my-part", &inputs).unwrap();
+
+        let content =
+            fs::read_to_string(dir.path().join("nclav_context.auto.tfvars")).unwrap();
+
+        // Preamble always present.
+        assert!(content.contains("nclav_enclave = \"my-enc\""));
+        assert!(content.contains("nclav_partition = \"my-part\""));
+
+        // Inputs sorted alphabetically: aa before zz.
+        let aa_pos = content.find("aa_var =").unwrap();
+        let zz_pos = content.find("zz_var =").unwrap();
+        assert!(aa_pos < zz_pos, "inputs should be sorted alphabetically");
+    }
+
+    #[test]
+    fn write_tfvars_empty_inputs_writes_preamble_only() {
+        let dir = TempDir::new().unwrap();
+        write_tfvars(dir.path(), "enc", "part", &HashMap::new()).unwrap();
+
+        let content =
+            fs::read_to_string(dir.path().join("nclav_context.auto.tfvars")).unwrap();
+
+        assert!(content.contains("nclav_enclave = \"enc\""));
+        assert!(content.contains("nclav_partition = \"part\""));
+        // No partition inputs section when inputs is empty.
+        assert!(!content.contains("# Partition inputs"));
+    }
+
+    #[test]
+    fn write_tfvars_escapes_special_chars_in_value() {
+        let dir = TempDir::new().unwrap();
+        let inputs: HashMap<String, String> =
+            [("path".to_string(), r#"C:\Users\"admin""#.to_string())]
+                .into_iter()
+                .collect();
+
+        write_tfvars(dir.path(), "e", "p", &inputs).unwrap();
+
+        let content =
+            fs::read_to_string(dir.path().join("nclav_context.auto.tfvars")).unwrap();
+        // Backslash → \\\\ ; double-quote → \\\"
+        assert!(content.contains(r#"path = "C:\\Users\\\"admin\"""#));
+    }
+
+    // ── write_module_tf ───────────────────────────────────────────────────────
+
+    #[test]
+    fn write_module_tf_with_inputs() {
+        let dir = TempDir::new().unwrap();
+        let inputs: HashMap<String, String> =
+            [("db_name".to_string(), "mydb".to_string())]
+                .into_iter()
+                .collect();
+
+        write_module_tf(dir.path(), "git::https://example.com/mod.git//postgres", &inputs)
+            .unwrap();
+
+        let content = fs::read_to_string(dir.path().join("nclav_module.tf")).unwrap();
+        assert!(content.contains("module \"nclav_partition\""));
+        assert!(content.contains(r#"source = "git::https://example.com/mod.git//postgres""#));
+        assert!(content.contains("db_name = \"mydb\""));
+    }
+
+    #[test]
+    fn write_module_tf_no_inputs() {
+        let dir = TempDir::new().unwrap();
+        write_module_tf(dir.path(), "git::https://example.com/mod.git", &HashMap::new())
+            .unwrap();
+
+        let content = fs::read_to_string(dir.path().join("nclav_module.tf")).unwrap();
+        assert!(content.contains("module \"nclav_partition\""));
+        // Only the source line and closing brace — no extra variable assignments.
+        let extra_assignments = content
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("source") && l.contains(" = "))
+            .count();
+        assert_eq!(extra_assignments, 0);
+    }
+
+    // ── write_outputs_tf ──────────────────────────────────────────────────────
+
+    #[test]
+    fn write_outputs_tf_forwards_declared_outputs() {
+        let dir = TempDir::new().unwrap();
+        let outputs = vec!["hostname".to_string(), "port".to_string()];
+
+        write_outputs_tf(dir.path(), &outputs).unwrap();
+
+        let content = fs::read_to_string(dir.path().join("nclav_outputs.tf")).unwrap();
+        assert!(content.contains(r#"output "hostname""#));
+        assert!(content.contains("module.nclav_partition.hostname"));
+        assert!(content.contains(r#"output "port""#));
+        assert!(content.contains("module.nclav_partition.port"));
+    }
+
+    #[test]
+    fn write_outputs_tf_empty_produces_header_only() {
+        let dir = TempDir::new().unwrap();
+        write_outputs_tf(dir.path(), &[]).unwrap();
+
+        let content = fs::read_to_string(dir.path().join("nclav_outputs.tf")).unwrap();
+        assert!(content.contains("# Generated by nclav"));
+        assert!(!content.contains("output "));
+    }
+
+    // ── write_backend_tf ──────────────────────────────────────────────────────
+
+    #[test]
+    fn write_backend_tf_produces_http_backend_block() {
+        let root = TempDir::new().unwrap();
+        let backend = minimal_backend(&root);
+        let dir = TempDir::new().unwrap();
+
+        backend.write_backend_tf(dir.path()).unwrap();
+
+        let content = fs::read_to_string(dir.path().join("nclav_backend.tf")).unwrap();
+        assert!(content.contains("# Generated by nclav"));
+        assert!(content.contains("backend \"http\""));
+    }
+
+    // ── symlink_tf_files ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn symlink_tf_creates_links_for_tf_files() {
+        let root = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+
+        fs::write(source.path().join("main.tf"), "resource \"null_resource\" \"x\" {}").unwrap();
+        fs::write(source.path().join("config.yml"), "id: test").unwrap();
+
+        let backend = minimal_backend(&root);
+        backend
+            .symlink_tf_files(workspace.path(), source.path())
+            .await
+            .unwrap();
+
+        let link = workspace.path().join("main.tf");
+        assert!(link.exists(), "main.tf symlink should exist in workspace");
+        #[cfg(unix)]
+        assert!(
+            link.symlink_metadata().unwrap().file_type().is_symlink(),
+            "should be a symlink, not a copy"
+        );
+        assert!(
+            !workspace.path().join("config.yml").exists(),
+            "non-.tf files must not appear in workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn symlink_tf_replaces_stale_link() {
+        let root = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+
+        let tf_file = source.path().join("main.tf");
+        fs::write(&tf_file, "# v1").unwrap();
+        let link = workspace.path().join("main.tf");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&tf_file, &link).unwrap();
+
+        // Update source then re-run symlink_tf_files — should not error.
+        fs::write(&tf_file, "# v2").unwrap();
+        let backend = minimal_backend(&root);
+        backend
+            .symlink_tf_files(workspace.path(), source.path())
+            .await
+            .unwrap();
+
+        assert!(link.exists(), "link should still exist after replacement");
+        assert_eq!(fs::read_to_string(&link).unwrap(), "# v2");
+    }
+
+    #[tokio::test]
+    async fn symlink_tf_skips_non_tf_extensions() {
+        let root = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+
+        fs::write(source.path().join("vars.tfvars"), "x = 1").unwrap();
+        fs::write(source.path().join("notes.md"), "# notes").unwrap();
+
+        let backend = minimal_backend(&root);
+        backend
+            .symlink_tf_files(workspace.path(), source.path())
+            .await
+            .unwrap();
+
+        let entries: Vec<_> = fs::read_dir(workspace.path())
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "workspace should be empty when source has no .tf files"
+        );
+    }
+
+    // ── check_no_tf_files ─────────────────────────────────────────────────────
+
+    #[test]
+    fn check_no_tf_files_ok_for_empty_directory() {
+        let dir = TempDir::new().unwrap();
+        assert!(check_no_tf_files(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn check_no_tf_files_ok_for_nonexistent_directory() {
+        assert!(check_no_tf_files(Path::new("/no/such/path/xyz_nclav_test")).is_ok());
+    }
+
+    #[test]
+    fn check_no_tf_files_rejects_tf_file_in_directory() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.tf"), "").unwrap();
+
+        let err = check_no_tf_files(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, DriverError::TfFilesWithModuleSource { .. }),
+            "expected TfFilesWithModuleSource, got: {:?}",
+            err
+        );
+    }
+
+    // ── cleanup helpers ───────────────────────────────────────────────────────
+
+    #[test]
+    fn cleanup_raw_removes_symlinks_and_tfvars_but_not_regular_tf() {
+        let source = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+
+        // Create a symlinked .tf file.
+        let tf_src = source.path().join("main.tf");
+        fs::write(&tf_src, "").unwrap();
+        let link = workspace.path().join("main.tf");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&tf_src, &link).unwrap();
+
+        // Create the generated tfvars.
+        fs::write(workspace.path().join("nclav_context.auto.tfvars"), "").unwrap();
+
+        // Create a regular (non-symlink) .tf file — should survive.
+        fs::write(workspace.path().join("nclav_backend.tf"), "").unwrap();
+
+        cleanup_raw_tf_artifacts(workspace.path()).unwrap();
+
+        assert!(!link.exists(), "symlinked .tf should be removed");
+        assert!(
+            !workspace.path().join("nclav_context.auto.tfvars").exists(),
+            "tfvars should be removed"
+        );
+        assert!(
+            workspace.path().join("nclav_backend.tf").exists(),
+            "regular .tf file should not be removed"
+        );
+    }
+
+    #[test]
+    fn cleanup_module_removes_module_and_outputs_tf() {
+        let workspace = TempDir::new().unwrap();
+
+        fs::write(workspace.path().join("nclav_module.tf"), "").unwrap();
+        fs::write(workspace.path().join("nclav_outputs.tf"), "").unwrap();
+        // Backend tf should be untouched by module cleanup.
+        fs::write(workspace.path().join("nclav_backend.tf"), "").unwrap();
+
+        cleanup_module_artifacts(workspace.path()).unwrap();
+
+        assert!(!workspace.path().join("nclav_module.tf").exists());
+        assert!(!workspace.path().join("nclav_outputs.tf").exists());
+        assert!(
+            workspace.path().join("nclav_backend.tf").exists(),
+            "nclav_backend.tf should survive cleanup_module"
+        );
+    }
+
+    // ── workspace_dir ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn workspace_dir_uses_injected_root() {
+        let root = TempDir::new().unwrap();
+        let backend = minimal_backend(&root);
+
+        let ws = backend.workspace_dir("my-enc", "my-part");
+
+        assert_eq!(
+            ws,
+            root.path().join("workspaces").join("my-enc").join("my-part")
+        );
+    }
+
+    #[test]
+    fn workspace_dir_falls_back_to_home_nclav_when_no_root() {
+        let backend = TerraformBackend {
+            api_base:       "http://localhost:8080".into(),
+            auth_token:     Arc::new("tok".into()),
+            store:          Arc::new(InMemoryStore::new()),
+            test_mode:      false,
+            workspace_root: None,
+        };
+        let ws = backend.workspace_dir("enc", "part");
+        // Should contain .nclav/workspaces/enc/part.
+        assert!(ws.to_string_lossy().contains(".nclav"));
+        assert!(ws.ends_with("workspaces/enc/part"));
+    }
 }

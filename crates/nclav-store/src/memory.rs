@@ -141,11 +141,7 @@ impl StateStore for InMemoryStore {
     ) -> Result<(), StoreError> {
         let mut guard = self.inner.write().await;
         if let Some(existing) = guard.tf_locks.get(key) {
-            let holder = existing["ID"]
-                .as_str()
-                .unwrap_or("unknown")
-                .to_string();
-            return Err(StoreError::LockConflict { holder });
+            return Err(StoreError::LockConflict { holder: existing.clone() });
         }
         guard.tf_locks.insert(key.to_string(), lock_info);
         Ok(())

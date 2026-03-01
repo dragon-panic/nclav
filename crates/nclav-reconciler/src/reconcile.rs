@@ -25,6 +25,7 @@ pub async fn reconcile(
         auth_token: req.auth_token.clone(),
         store: store.clone(),
         test_mode: req.test_mode,
+        workspace_root: None,
     });
     let mut report = ReconcileReport::new(req.dry_run);
 

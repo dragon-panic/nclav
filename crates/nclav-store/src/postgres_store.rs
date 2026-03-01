@@ -323,11 +323,7 @@ impl StateStore for PostgresStore {
                     .fetch_one(&self.pool)
                     .await
                     .map_err(|e| StoreError::Internal(e.to_string()))?;
-            let holder = row.0["ID"]
-                .as_str()
-                .unwrap_or("unknown")
-                .to_string();
-            return Err(StoreError::LockConflict { holder });
+            return Err(StoreError::LockConflict { holder: row.0 });
         }
         Ok(())
     }
@@ -593,7 +589,9 @@ mod tests {
 
         let err = store.lock_tf_state(&key, lock2).await.unwrap_err();
         match err {
-            StoreError::LockConflict { holder } => assert_eq!(holder, "lock-aaa"),
+            StoreError::LockConflict { holder } => {
+                assert_eq!(holder["ID"].as_str().unwrap(), "lock-aaa")
+            }
             other => panic!("expected LockConflict, got {other:?}"),
         }
 
